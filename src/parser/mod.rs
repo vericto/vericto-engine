@@ -23,7 +23,7 @@ pub enum Dialect {
 }
 
 impl Dialect {
-    pub fn from_str(s: &str) -> Result<Self> {
+    pub fn parse_dialect(s: &str) -> Result<Self> {
         match s.to_ascii_lowercase().as_str() {
             "postgres" | "postgresql" => Ok(Dialect::Postgres),
             "mysql" => Ok(Dialect::Mysql),

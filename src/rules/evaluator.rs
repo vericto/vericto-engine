@@ -180,7 +180,7 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         .map(|s| {
             let fname = s.function_name.as_deref().unwrap_or("sleep");
             let mut v = violation(rule, s, None);
-            v.ast_node_path = format!("FunctionCall > {}()", fname);
+            v.ast_node_path = format!("FunctionCall > {fname}()");
             v
         }),
 
@@ -341,7 +341,7 @@ fn evaluate_custom(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn find<'a, F>(stmts: &'a [StatementInfo], pred: F) -> Option<&'a StatementInfo>
+fn find<F>(stmts: &[StatementInfo], pred: F) -> Option<&StatementInfo>
 where
     F: Fn(&StatementInfo) -> bool,
 {
