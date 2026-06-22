@@ -622,6 +622,23 @@ mod tests {
     }
 
     #[test]
+    fn vetro_050_allows_parameterized_select_with_where_and_limit() {
+        // Regression lock for the vetro-regression suite case
+        // (tests/proxy/allow-safe-queries.spec.ts): a parameterized SELECT with
+        // explicit columns, a WHERE, and a LIMIT must NOT be flagged by
+        // VETRO-050. This mirrors the exact query the proxy receives over the
+        // extended protocol ($1 is parsed as a ParamRef by pg_query).
+        let p = parse(
+            "SELECT user_id, email FROM users WHERE email = $1 LIMIT 1",
+            Dialect::Postgres,
+        );
+        assert!(
+            evaluate_rule(&make_rule("VETRO-050"), &p).is_none(),
+            "SELECT with explicit LIMIT must not trigger VETRO-050"
+        );
+    }
+
+    #[test]
     fn vetro_050_flags_select_without_limit() {
         let p = parse("SELECT id FROM users WHERE id = 1", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VETRO-050"), &p).is_some());
