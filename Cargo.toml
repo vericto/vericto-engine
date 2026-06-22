@@ -1,0 +1,40 @@
+[package]
+name = "vetro-engine"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Vetro — Deterministic SQL AST evaluation engine (open core)"
+license = "Elastic-2.0"
+repository = "https://github.com/donkan168/vetro-engine"
+readme = "README.md"
+keywords = ["sql", "security", "ast", "parser", "llm"]
+categories = ["database", "parser-implementations"]
+
+[lib]
+name = "vetro_engine"
+path = "src/lib.rs"
+
+[dependencies]
+# SQL parsing — AST engine
+pg_query = "5.1"
+sqlparser = "0.52"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Observability
+tracing = "0.1"
+
+# Utilities
+thiserror = "1.0"
+anyhow = "1.0"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
