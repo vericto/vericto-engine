@@ -265,3 +265,84 @@ impl RuleEngine {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::{parser_for, Dialect};
+
+    /// Destructive-critical rule codes that MUST resolve to BLOCK under the
+    /// default policy (R9.1 / R13 table). These are the engine-side mirror of
+    /// the Reglas_Destructivas_Criticas set.
+    const DESTRUCTIVE_CRITICAL_CODES: &[&str] = &[
+        "VETRO-001", "VETRO-003", "VETRO-010", "VETRO-011", "VETRO-012",
+        "VETRO-030", "VETRO-042", "VETRO-090",
+    ];
+
+    /// R4.1 / R13: the default policy maps Critical/High → Block,
+    /// Medium → Flag, Low/Informational → Monitor.
+    #[test]
+    fn default_policy_resolves_each_severity_to_r13_action() {
+        let policy = EnforcementPolicy::default();
+        assert_eq!(policy.action_for(Severity::Critical), EnforcementAction::Block);
+        assert_eq!(policy.action_for(Severity::High), EnforcementAction::Block);
+        assert_eq!(policy.action_for(Severity::Medium), EnforcementAction::Flag);
+        assert_eq!(policy.action_for(Severity::Low), EnforcementAction::Monitor);
+        assert_eq!(
+            policy.action_for(Severity::Informational),
+            EnforcementAction::Monitor
+        );
+    }
+
+    /// R9.1: every destructive-critical rule carries `Severity::Critical`, and
+    /// the default policy resolves a Critical violation to BLOCK. Asserting the
+    /// invariant per-code documents the Reglas_Destructivas_Criticas set at the
+    /// engine level (the rule catalogue itself lives in the proxy's
+    /// `default_ruleset()` and the DB seed).
+    #[test]
+    fn destructive_critical_rules_resolve_to_block_under_default_policy() {
+        let policy = EnforcementPolicy::default();
+        for &code in DESTRUCTIVE_CRITICAL_CODES {
+            let action = policy.action_for(Severity::Critical);
+            assert_eq!(
+                action,
+                EnforcementAction::Block,
+                "{code} (Critical) must resolve to BLOCK under the default policy"
+            );
+            assert!(action.blocks(), "{code} resolved action must block the query");
+            assert_eq!(
+                Decision::from_action(action),
+                Decision::Block,
+                "{code} must produce a Block decision"
+            );
+        }
+    }
+
+    /// End-to-end R9.1: a representative destructive query evaluated against a
+    /// Critical rule with the default policy yields `Decision::Block`, with the
+    /// resolved action and severity populated in the outcome.
+    #[test]
+    fn destructive_query_blocks_end_to_end_under_default_policy() {
+        let parsed = parser_for(Dialect::Postgres)
+            .parse("DELETE FROM users")
+            .expect("must parse");
+        let rule = Rule {
+            rule_id: "VETRO-001".to_string(),
+            code: "VETRO-001".to_string(),
+            severity: Severity::Critical,
+            default_action: EnforcementAction::Block,
+            rule_type: RuleType::Standard,
+            ast_condition_yaml: None,
+        };
+        let outcome =
+            RuleEngine::evaluate(&parsed, std::slice::from_ref(&rule), &EnforcementPolicy::default());
+        assert_eq!(outcome.decision, Decision::Block);
+        assert_eq!(outcome.action, Some(EnforcementAction::Block));
+        assert_eq!(outcome.severity, Some(Severity::Critical));
+        assert_eq!(outcome.rule_code.as_deref(), Some("VETRO-001"));
+    }
+}
