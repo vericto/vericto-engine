@@ -5,21 +5,51 @@ use serde::{Deserialize, Serialize};
 use crate::parser::ParsedQuery;
 use crate::rules::evaluator;
 
-/// Rule severity. Order matters: Critical > High > Medium.
+/// Canonical CVSS-based severity taxonomy.
+///
+/// `Ord` is derived from declaration order, so the ordering is
+/// `Informational < Low < Medium < High < Critical` (R1.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
+    Informational,
+    Low,
     Medium,
     High,
     Critical,
 }
 
 impl Severity {
+    /// Stable, unique textual representation (R1.8).
     pub fn as_str(&self) -> &'static str {
         match self {
             Severity::Critical => "critical",
             Severity::High => "high",
             Severity::Medium => "medium",
+            Severity::Low => "low",
+            Severity::Informational => "informational",
+        }
+    }
+
+    /// Deterministic mapping from BOTH legacy vocabularies (R2):
+    ///   - API/DB legacy:  critical→Critical, warning→High, info→Low
+    ///   - Engine legacy:  medium→Medium, high→High, critical→Critical
+    ///   - Canonical:      informational/low/medium/high/critical → themselves
+    ///
+    /// Unknown values log the original and fall back to `Medium` (R2.7).
+    pub fn from_legacy(raw: &str) -> Severity {
+        match raw.to_ascii_lowercase().as_str() {
+            "critical" => Severity::Critical,
+            "high" => Severity::High,
+            "warning" => Severity::High, // legacy API
+            "medium" => Severity::Medium,
+            "low" => Severity::Low,
+            "info" => Severity::Low, // legacy API
+            "informational" => Severity::Informational,
+            other => {
+                tracing::warn!(severity = other, "unknown severity, defaulting to medium");
+                Severity::Medium
+            }
         }
     }
 }
