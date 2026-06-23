@@ -1,6 +1,6 @@
 [package]
 name = "vetro-engine"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Vetro — Deterministic SQL AST evaluation engine (open core)"
