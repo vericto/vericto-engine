@@ -177,7 +177,9 @@ pub enum Decision {
 }
 
 impl Decision {
-    fn from_action(action: EnforcementAction) -> Decision {
+    /// Maps an enforcement action to the final decision. `pub(crate)` so the
+    /// property tests (Property 7) can assert the mapping directly.
+    pub(crate) fn from_action(action: EnforcementAction) -> Decision {
         match action {
             EnforcementAction::Block => Decision::Block,
             EnforcementAction::Flag => Decision::Flag,
