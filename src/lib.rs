@@ -9,22 +9,28 @@
 //!
 //! ```toml
 //! [dependencies]
-//! vetro-engine = { git = "https://github.com/donkan168/vetro-engine", tag = "v1.0.0" }
+//! vetro-engine = { git = "https://github.com/donkan168/vetro-engine", tag = "v2.0.0" }
 //! ```
 //!
 //! ```rust
-//! use vetro_engine::{evaluate, Rule, RuleType, Severity, Dialect};
+//! use vetro_engine::{
+//!     evaluate, Decision, EnforcementAction, EnforcementPolicy, Rule, RuleType, Severity, Dialect,
+//! };
 //!
 //! let rules = vec![Rule {
 //!     rule_id: "r1".into(),
 //!     code: "VETRO-001".into(),
 //!     severity: Severity::Critical,
+//!     default_action: EnforcementAction::Block,
 //!     rule_type: RuleType::Standard,
 //!     ast_condition_yaml: None,
 //! }];
 //!
-//! let result = evaluate("DELETE FROM users", Dialect::Postgres, &rules);
-//! assert!(result.decision == vetro_engine::Decision::Blocked);
+//! // The host injects the workspace enforcement policy; `default()` maps
+//! // Critical/High → BLOCK, Medium → FLAG, Low/Informational → MONITOR.
+//! let policy = EnforcementPolicy::default();
+//! let result = evaluate("DELETE FROM users", Dialect::Postgres, &rules, &policy);
+//! assert!(result.decision == Decision::Block);
 //! ```
 
 pub mod error;
@@ -34,18 +40,34 @@ pub mod rules;
 // Re-export the most commonly used types at the crate root for ergonomics.
 pub use error::{ProxyError, Result};
 pub use parser::Dialect;
-pub use rules::engine::{Decision, EvaluationOutcome, Rule, RuleEngine, RuleType, Severity};
+pub use rules::engine::{
+    Decision, EnforcementAction, EnforcementPolicy, EvaluationOutcome, ParseErrorAction, Rule,
+    RuleEngine, RuleType, Severity,
+};
 
 /// Convenience function: parse + evaluate in one call.
-pub fn evaluate(sql: &str, dialect: Dialect, rules: &[Rule]) -> EvaluationOutcome {
+///
+/// On parse error, resolves the decision from `policy.parse_error`
+/// (R5.5/R5.6) instead of failing closed unconditionally.
+pub fn evaluate(
+    sql: &str,
+    dialect: Dialect,
+    rules: &[Rule],
+    policy: &EnforcementPolicy,
+) -> EvaluationOutcome {
     let parser = parser::parser_for(dialect);
     match parser.parse(sql) {
-        Ok(parsed) => RuleEngine::evaluate(&parsed, rules),
+        Ok(parsed) => RuleEngine::evaluate(&parsed, rules, policy),
         Err(e) => EvaluationOutcome {
-            decision: Decision::Blocked,
+            decision: policy.parse_error_decision(),
+            action: Some(match policy.parse_error {
+                ParseErrorAction::Block => EnforcementAction::Block,
+                ParseErrorAction::AllowReport => EnforcementAction::Flag,
+            }),
+            // Parse-error telemetry severity is Medium by product decision (R8.6).
+            severity: Some(Severity::Medium),
             rule_id: None,
             rule_code: Some("VETRO-PARSE-ERROR".to_string()),
-            severity: Some(Severity::Critical),
             ast_node_path: Some(format!("PARSE_ERROR: {e}")),
             estimated_rows_affected: None,
             suggested_safe_query: None,

@@ -54,6 +54,94 @@ impl Severity {
     }
 }
 
+/// What to do about a violation (policy decision).
+///
+/// `Ord` derived: `Monitor < Flag < Block` (used by the reclassification-safety
+/// invariant: monitor_mode never *increases* blocking).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnforcementAction {
+    Monitor,
+    Flag,
+    Block,
+}
+
+impl EnforcementAction {
+    /// True only for `Block` — the single action that rejects the query.
+    pub fn blocks(&self) -> bool {
+        matches!(self, EnforcementAction::Block)
+    }
+}
+
+/// What to do with a query that cannot be parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParseErrorAction {
+    /// Fail-open default: forward + report (R4.8).
+    AllowReport,
+    /// Fail-closed opt-in: reject with SQLSTATE 42501 (R4.9).
+    Block,
+}
+
+/// Per-workspace enforcement policy injected by the host into the engine (R4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnforcementPolicy {
+    pub critical: EnforcementAction,
+    pub high: EnforcementAction,
+    pub medium: EnforcementAction,
+    pub low: EnforcementAction,
+    pub informational: EnforcementAction,
+    pub parse_error: ParseErrorAction,
+    /// Global dry-run: forces every blocking action to a non-blocking one (R4.4).
+    pub monitor_mode: bool,
+}
+
+impl Default for EnforcementPolicy {
+    /// Default mapping (R4.1): Critical/High → BLOCK, Medium → FLAG, Low → MONITOR.
+    /// Informational → MONITOR. parse_error → AllowReport (R4.8). monitor_mode off.
+    fn default() -> Self {
+        Self {
+            critical: EnforcementAction::Block,
+            high: EnforcementAction::Block,
+            medium: EnforcementAction::Flag,
+            low: EnforcementAction::Monitor,
+            informational: EnforcementAction::Monitor,
+            parse_error: ParseErrorAction::AllowReport,
+            monitor_mode: false,
+        }
+    }
+}
+
+impl EnforcementPolicy {
+    /// Resolves the effective action for a severity, applying monitor_mode.
+    ///
+    /// monitor_mode downgrades any `Block` to `Flag` (never blocks, but still
+    /// records and alerts so the admin sees what *would* have been blocked —
+    /// R4.4/R4.6). Non-blocking actions are unchanged.
+    pub fn action_for(&self, severity: Severity) -> EnforcementAction {
+        let base = match severity {
+            Severity::Critical => self.critical,
+            Severity::High => self.high,
+            Severity::Medium => self.medium,
+            Severity::Low => self.low,
+            Severity::Informational => self.informational,
+        };
+        if self.monitor_mode && base == EnforcementAction::Block {
+            EnforcementAction::Flag
+        } else {
+            base
+        }
+    }
+
+    /// Resolves the parse-error decision (R5.5/R5.6).
+    pub fn parse_error_decision(&self) -> Decision {
+        match self.parse_error {
+            ParseErrorAction::AllowReport => Decision::Flag, // allow + report (R8.6)
+            ParseErrorAction::Block => Decision::Block,
+        }
+    }
+}
+
 /// Rule type: standard (built-in) or custom (user-defined in YAML).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleType {
@@ -67,26 +155,46 @@ pub struct Rule {
     pub rule_id: String,
     pub code: String,
     pub severity: Severity,
+    /// Built-in recommended action per the R13 table. Seeds the DB / UI default
+    /// and satisfies R5.8/R13.2 (default_ruleset carries severity AND action).
+    /// Action *resolution* at evaluation time always goes through the policy.
+    pub default_action: EnforcementAction,
     pub rule_type: RuleType,
     /// YAML condition for custom rules.
     pub ast_condition_yaml: Option<String>,
 }
 
-/// Final decision on a query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// Final three-valued decision on a query (R3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Decision {
-    Allowed,
-    Blocked,
+    /// Forward silently (no violation, or a Monitor action).
+    Allow,
+    /// Forward, but record + alert (Flag action).
+    Flag,
+    /// Reject the query (Block action).
+    Block,
 }
 
-/// Result of evaluating a query against the active ruleset.
+impl Decision {
+    fn from_action(action: EnforcementAction) -> Decision {
+        match action {
+            EnforcementAction::Block => Decision::Block,
+            EnforcementAction::Flag => Decision::Flag,
+            EnforcementAction::Monitor => Decision::Allow,
+        }
+    }
+}
+
+/// Result of evaluating a query against the active ruleset (R3.5, R3.7).
 #[derive(Debug, Clone)]
 pub struct EvaluationOutcome {
     pub decision: Decision,
+    /// Resolved action of the winning violation (None when no rule matched).
+    pub action: Option<EnforcementAction>,
+    pub severity: Option<Severity>,
     pub rule_id: Option<String>,
     pub rule_code: Option<String>,
-    pub severity: Option<Severity>,
     pub ast_node_path: Option<String>,
     pub estimated_rows_affected: Option<i64>,
     pub suggested_safe_query: Option<String>,
@@ -95,10 +203,11 @@ pub struct EvaluationOutcome {
 impl EvaluationOutcome {
     pub fn allowed() -> Self {
         Self {
-            decision: Decision::Allowed,
+            decision: Decision::Allow,
+            action: None,
+            severity: None,
             rule_id: None,
             rule_code: None,
-            severity: None,
             ast_node_path: None,
             estimated_rows_affected: None,
             suggested_safe_query: None,
@@ -107,14 +216,23 @@ impl EvaluationOutcome {
 }
 
 /// The rule engine. Evaluates a parsed query against the active rules and
-/// returns the highest-severity violation (or ALLOWED if none is violated).
+/// returns the highest-severity violation (or ALLOW if none is violated).
 pub struct RuleEngine;
 
 impl RuleEngine {
-    /// Evaluates `parsed` against `rules`. All rules are evaluated; the
-    /// highest-severity violation wins. AST parsing has already guaranteed the
-    /// query is syntactically valid.
-    pub fn evaluate(parsed: &ParsedQuery, rules: &[Rule]) -> EvaluationOutcome {
+    /// Evaluates `parsed` against `rules`, resolving the winning violation's
+    /// action via `policy`.
+    ///
+    /// - No match            → Decision::Allow, action None (R3.2).
+    /// - One or more matches → highest-severity violation wins (R3.3); its
+    ///   action is `policy.action_for(severity)` (R3.4); decision derived from
+    ///   the action (R3.6). Severity, action, rule_id, rule_code, ast_node_path
+    ///   and suggested_safe_query are populated (R3.5, R3.7).
+    pub fn evaluate(
+        parsed: &ParsedQuery,
+        rules: &[Rule],
+        policy: &EnforcementPolicy,
+    ) -> EvaluationOutcome {
         let mut best: Option<(Severity, evaluator::Violation)> = None;
 
         for rule in rules {
@@ -131,15 +249,19 @@ impl RuleEngine {
 
         match best {
             None => EvaluationOutcome::allowed(),
-            Some((severity, v)) => EvaluationOutcome {
-                decision: Decision::Blocked,
-                rule_id: Some(v.rule_id),
-                rule_code: Some(v.rule_code),
-                severity: Some(severity),
-                ast_node_path: Some(v.ast_node_path),
-                estimated_rows_affected: v.estimated_rows_affected,
-                suggested_safe_query: v.suggested_safe_query,
-            },
+            Some((severity, v)) => {
+                let action = policy.action_for(severity);
+                EvaluationOutcome {
+                    decision: Decision::from_action(action),
+                    action: Some(action),
+                    severity: Some(severity),
+                    rule_id: Some(v.rule_id),
+                    rule_code: Some(v.rule_code),
+                    ast_node_path: Some(v.ast_node_path),
+                    estimated_rows_affected: v.estimated_rows_affected,
+                    suggested_safe_query: v.suggested_safe_query,
+                }
+            }
         }
     }
 }

@@ -409,17 +409,21 @@ fn suggest_migration() -> String {
 mod tests {
     use super::*;
     use crate::parser::{parser_for, Dialect, ParsedQuery};
-    use crate::rules::engine::{Rule, RuleType, Severity};
+    use crate::rules::engine::{EnforcementPolicy, Rule, RuleType, Severity};
 
     fn parse(sql: &str, dialect: Dialect) -> ParsedQuery {
         parser_for(dialect).parse(sql).expect("must parse")
     }
 
     fn make_rule(code: &str) -> Rule {
+        let severity = Severity::Critical;
         Rule {
             rule_id: code.to_string(),
             code: code.to_string(),
-            severity: Severity::Critical,
+            severity,
+            // Derive the built-in action from the default policy so test rules
+            // stay consistent with the severity→action mapping (R13).
+            default_action: EnforcementPolicy::default().action_for(severity),
             rule_type: RuleType::Standard,
             ast_condition_yaml: None,
         }
