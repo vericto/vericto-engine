@@ -365,10 +365,16 @@ mod examples {
             low: EnforcementAction::Flag,
             ..EnforcementPolicy::default()
         };
-        assert_eq!(custom.action_for(Severity::Medium), EnforcementAction::Block);
+        assert_eq!(
+            custom.action_for(Severity::Medium),
+            EnforcementAction::Block
+        );
         assert_eq!(custom.action_for(Severity::Low), EnforcementAction::Flag);
         // Untouched levels keep the default mapping.
-        assert_eq!(custom.action_for(Severity::Critical), EnforcementAction::Block);
+        assert_eq!(
+            custom.action_for(Severity::Critical),
+            EnforcementAction::Block
+        );
         assert_eq!(
             custom.action_for(Severity::Informational),
             EnforcementAction::Monitor
@@ -430,8 +436,11 @@ mod examples {
             .parse("SELECT id FROM users")
             .expect("must parse");
         let r = rule("VETRO-050", Severity::Medium, EnforcementAction::Flag);
-        let outcome =
-            RuleEngine::evaluate(&parsed, std::slice::from_ref(&r), &EnforcementPolicy::default());
+        let outcome = RuleEngine::evaluate(
+            &parsed,
+            std::slice::from_ref(&r),
+            &EnforcementPolicy::default(),
+        );
 
         assert_eq!(outcome.decision, Decision::Flag);
         assert_eq!(outcome.action, Some(EnforcementAction::Flag));
@@ -448,8 +457,11 @@ mod examples {
             .parse("SELECT id FROM users LIMIT 10")
             .expect("must parse");
         let r = rule("VETRO-050", Severity::Medium, EnforcementAction::Flag);
-        let outcome =
-            RuleEngine::evaluate(&parsed, std::slice::from_ref(&r), &EnforcementPolicy::default());
+        let outcome = RuleEngine::evaluate(
+            &parsed,
+            std::slice::from_ref(&r),
+            &EnforcementPolicy::default(),
+        );
 
         assert_eq!(outcome.decision, Decision::Allow);
         assert_eq!(outcome.action, None);

@@ -281,8 +281,14 @@ mod tests {
     /// default policy (R9.1 / R13 table). These are the engine-side mirror of
     /// the Reglas_Destructivas_Criticas set.
     const DESTRUCTIVE_CRITICAL_CODES: &[&str] = &[
-        "VETRO-001", "VETRO-003", "VETRO-010", "VETRO-011", "VETRO-012",
-        "VETRO-030", "VETRO-042", "VETRO-090",
+        "VETRO-001",
+        "VETRO-003",
+        "VETRO-010",
+        "VETRO-011",
+        "VETRO-012",
+        "VETRO-030",
+        "VETRO-042",
+        "VETRO-090",
     ];
 
     /// R4.1 / R13: the default policy maps Critical/High → Block,
@@ -290,7 +296,10 @@ mod tests {
     #[test]
     fn default_policy_resolves_each_severity_to_r13_action() {
         let policy = EnforcementPolicy::default();
-        assert_eq!(policy.action_for(Severity::Critical), EnforcementAction::Block);
+        assert_eq!(
+            policy.action_for(Severity::Critical),
+            EnforcementAction::Block
+        );
         assert_eq!(policy.action_for(Severity::High), EnforcementAction::Block);
         assert_eq!(policy.action_for(Severity::Medium), EnforcementAction::Flag);
         assert_eq!(policy.action_for(Severity::Low), EnforcementAction::Monitor);
@@ -315,7 +324,10 @@ mod tests {
                 EnforcementAction::Block,
                 "{code} (Critical) must resolve to BLOCK under the default policy"
             );
-            assert!(action.blocks(), "{code} resolved action must block the query");
+            assert!(
+                action.blocks(),
+                "{code} resolved action must block the query"
+            );
             assert_eq!(
                 Decision::from_action(action),
                 Decision::Block,
@@ -340,8 +352,11 @@ mod tests {
             rule_type: RuleType::Standard,
             ast_condition_yaml: None,
         };
-        let outcome =
-            RuleEngine::evaluate(&parsed, std::slice::from_ref(&rule), &EnforcementPolicy::default());
+        let outcome = RuleEngine::evaluate(
+            &parsed,
+            std::slice::from_ref(&rule),
+            &EnforcementPolicy::default(),
+        );
         assert_eq!(outcome.decision, Decision::Block);
         assert_eq!(outcome.action, Some(EnforcementAction::Block));
         assert_eq!(outcome.severity, Some(Severity::Critical));
