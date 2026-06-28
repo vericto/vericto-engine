@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! vetro-engine = { git = "https://github.com/donkan168/vetro-engine", tag = "v2.0.0" }
+//! vetro-engine = { git = "https://github.com/donkan168/vetro-engine", tag = "v2.1.0" }
 //! ```
 //!
 //! ```rust

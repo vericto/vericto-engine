@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-06-27
+
+Closes the rule-coverage gaps tracked internally as ENG-001 … ENG-010. All
+changes are additive: existing rule behaviour is unchanged except where it was a
+false positive (ENG-001) or a missed detection.
+
+### Added
+
+- **8 new standard rules:**
+  - `VETRO-017` (High) — `ALTER TABLE … DROP CONSTRAINT` / `DROP PRIMARY KEY`.
+  - `VETRO-018` (High) — `ALTER TABLE … ALTER COLUMN … TYPE …` (table rewrite).
+  - `VETRO-019` (High) — `ALTER TABLE … DISABLE TRIGGER` / `DISABLE ROW LEVEL SECURITY`.
+  - `VETRO-080` (Critical) — `COPY … TO/FROM PROGRAM` (server-side RCE / exfiltration).
+  - `VETRO-081` (Critical) — `DO $$ … $$` anonymous PL/pgSQL block.
+  - `VETRO-082` (High) — `GRANT` / `REVOKE`.
+  - `VETRO-083` (High) — `MERGE INTO …`.
+  - `VETRO-084` (High) — `CREATE TABLE … AS SELECT …` / `SELECT … INTO`.
+- New `StatementKind` variants (`Copy`, `DoBlock`, `Grant`, `Merge`,
+  `CreateTableAs`), `AlterTableKind` variants (`DropConstraint`,
+  `AlterColumnType`, `DisableTrigger`), `DropObjectKind::Database`, and the
+  `StatementInfo.copy_is_program` attribute. (Additive enum/struct changes.)
+- Regression suite under `tests/` (`audit`, `rule_catalogue_sync`,
+  `readme_examples`) locking in every closed gap.
+
+### Fixed
+
+- **ENG-001** — `walk.rs` ignored `LIMIT`, so every non-Postgres SELECT tripped
+  `VETRO-050`. Row-bound is now resolved from `LIMIT` / `FETCH FIRST` / `TOP`.
+- **ENG-002 / ENG-003** — Postgres `INSERT` now sets `insert_has_select`
+  (→ `VETRO-040`) and counts `VALUES` tuples (→ `VETRO-061`).
+- **ENG-004** — `DROP DATABASE` is now detected on Postgres (`DropdbStmt`).
+- **ENG-005** — SELECT-based rules now see nested SELECTs (subqueries, CTE
+  bodies, joins, sub-links) on Postgres; `VETRO-050` scoped to the top-level
+  read to avoid false positives.
+- **ENG-006** — `VETRO-070` now fires for `pg_sleep`/`sleep` in the projection
+  (both parsers) and for schema-qualified `pg_catalog.pg_sleep`.
+- **ENG-007** — dangerous statement types (COPY PROGRAM, DO, GRANT, MERGE,
+  CREATE TABLE AS) are no longer silently allowed on Postgres.
+- **ENG-008** — ALTER TABLE detection extended beyond DROP COLUMN / RENAME.
+- **ENG-009** — `is_always_true` deepened: `<const> <cmp> <const>`, column
+  self-equality (`id = id`), `NOT FALSE`, truthy numeric literals.
+- **ENG-010** — `VETRO-010` now excludes `SCHEMA` so `DROP SCHEMA` matches only
+  `VETRO-012`.
+
+### Docs
+
+- README now documents the complete 28-rule catalogue grouped by severity, with
+  the API examples updated to the v2.x signature (`evaluate(… , &policy)`,
+  `Decision::Block/Allow`, `Rule.default_action`). A compile-checked test
+  (`tests/readme_examples.rs`) and a catalogue-sync test
+  (`tests/rule_catalogue_sync.rs`) keep the docs from drifting.
+
 ## [2.0.0] — 2025-06
 
 ### Changed (breaking)
