@@ -142,7 +142,7 @@ fn walk_statement(
             name, operations, ..
         } => {
             for op in operations {
-                use sqlparser::ast::AlterTableOperation;
+                use sqlparser::ast::{AlterColumnOperation, AlterTableOperation};
                 let (kind, path) = match op {
                     AlterTableOperation::DropColumn { .. } => {
                         (AlterTableKind::DropColumn, "AlterTableStmt > DropColumn")
@@ -151,6 +151,26 @@ fn walk_statement(
                     | AlterTableOperation::RenameColumn { .. } => {
                         (AlterTableKind::Rename, "AlterTableStmt > Rename")
                     }
+                    AlterTableOperation::DropConstraint { .. }
+                    | AlterTableOperation::DropPrimaryKey => (
+                        AlterTableKind::DropConstraint,
+                        "AlterTableStmt > DropConstraint",
+                    ),
+                    // Only a TYPE change rewrites/relocates data; SET/DROP
+                    // DEFAULT and NULL-ability changes are comparatively benign,
+                    // so they are intentionally not flagged.
+                    AlterTableOperation::AlterColumn {
+                        op: AlterColumnOperation::SetDataType { .. },
+                        ..
+                    } => (
+                        AlterTableKind::AlterColumnType,
+                        "AlterTableStmt > AlterColumnType",
+                    ),
+                    AlterTableOperation::DisableTrigger { .. }
+                    | AlterTableOperation::DisableRowLevelSecurity => (
+                        AlterTableKind::DisableTrigger,
+                        "AlterTableStmt > DisableTrigger",
+                    ),
                     _ => continue,
                 };
                 out.push(StatementInfo {
@@ -204,13 +224,55 @@ fn walk_statement(
             }
         }
 
+        // ── COPY … TO/FROM PROGRAM (VETRO-080) ─────────────────────────────
+        // The PROGRAM target/source runs a shell command on the server (RCE /
+        // exfiltration). Non-program forms are still recorded for telemetry.
+        Statement::Copy { target, .. } => {
+            use sqlparser::ast::CopyTarget;
+            out.push(StatementInfo {
+                kind: StatementKind::Copy,
+                is_nested,
+                ast_node_path: if matches!(target, CopyTarget::Program { .. }) {
+                    "CopyStmt > PROGRAM".to_string()
+                } else {
+                    "CopyStmt".to_string()
+                },
+                copy_is_program: matches!(target, CopyTarget::Program { .. }),
+                ..Default::default()
+            });
+        }
+
+        // ── GRANT / REVOKE (VETRO-082) ─────────────────────────────────────
+        Statement::Grant { .. } | Statement::Revoke { .. } => {
+            out.push(StatementInfo {
+                kind: StatementKind::Grant,
+                is_nested,
+                ast_node_path: "GrantStmt".to_string(),
+                ..Default::default()
+            });
+        }
+
+        // ── MERGE (VETRO-083) ──────────────────────────────────────────────
+        Statement::Merge { table, .. } => {
+            out.push(StatementInfo {
+                kind: StatementKind::Merge,
+                relation: relation_from_table_factor(table),
+                is_nested,
+                ast_node_path: "MergeStmt".to_string(),
+                ..Default::default()
+            });
+        }
+
         // ── SELECT ─────────────────────────────────────────────────────────
         Statement::Query(query) => {
             walk_query(query.as_ref(), is_nested, depth + 1, out)?;
         }
 
         _ => {
-            // Scan expressions for function calls even in unknown statement types
+            // Other statement types are not (yet) modelled. CREATE TABLE AS is
+            // handled on the PostgreSQL (pg_query) path; sqlparser models it as
+            // a CreateTable with a `query`, which the non-PG dialects we target
+            // do not commonly emit, so it is intentionally left unflagged here.
         }
     }
 
@@ -238,13 +300,21 @@ fn walk_query(
         }
     }
 
-    walk_set_expr(query.body.as_ref(), is_nested, depth + 1, out)?;
+    // A row-bound is supplied by any of LIMIT (MySQL/PG/generic), FETCH FIRST
+    // (ANSI/Oracle 12c+), or TOP (MSSQL/Sybase — lives on the Select node). The
+    // bound belongs to the enclosing Query, so we resolve it here and thread it
+    // into the SELECT node, fixing ENG-001 (every non-PG SELECT was flagged by
+    // VETRO-050 because `select_has_limit` was hard-coded to `false`).
+    let has_limit = query.limit.is_some() || query.fetch.is_some();
+
+    walk_set_expr(query.body.as_ref(), is_nested, has_limit, depth + 1, out)?;
     Ok(())
 }
 
 fn walk_set_expr(
     set_expr: &SetExpr,
     is_nested: bool,
+    has_limit: bool,
     depth: usize,
     out: &mut Vec<StatementInfo>,
 ) -> Result<()> {
@@ -260,8 +330,8 @@ fn walk_set_expr(
                 .iter()
                 .any(|item| matches!(item, SelectItem::Wildcard(_)));
 
-            // LIMIT detection (in the enclosing Query, but here we get it from select)
-            let has_limit = false; // limit is on Query, not Select — handled below
+            // A `TOP n` clause (MSSQL) also bounds the result set.
+            let has_limit = has_limit || select.top.is_some();
 
             // Tautological OR detection in WHERE
             let tautology = select
@@ -270,27 +340,45 @@ fn walk_set_expr(
                 .map(has_or_tautology)
                 .unwrap_or(false);
 
-            // WHERE recursion
+            // WHERE recursion (subqueries and sleep-family calls)
             if let Some(expr) = select.selection.as_ref() {
                 walk_expr(expr, depth + 1, out)?;
             }
 
-            if !is_nested {
-                out.push(StatementInfo {
-                    kind: StatementKind::Select,
-                    is_nested: false,
-                    ast_node_path: "SelectStmt".to_string(),
-                    select_is_star: is_star,
-                    select_has_limit: has_limit,
-                    has_or_tautology: tautology,
-                    where_presence: match select.selection.as_ref() {
-                        None => WherePresence::Absent,
-                        Some(e) if is_always_true(e) => WherePresence::AlwaysTrue,
-                        Some(_) => WherePresence::Present,
-                    },
-                    ..Default::default()
-                });
+            // Projection recursion — `SELECT sleep(5)` lives here, not in WHERE
+            // (ENG-006). Without this the sqlparser path missed sleep calls that
+            // were not inside the WHERE clause.
+            for item in &select.projection {
+                match item {
+                    SelectItem::UnnamedExpr(e) => walk_expr(e, depth + 1, out)?,
+                    SelectItem::ExprWithAlias { expr, .. } => walk_expr(expr, depth + 1, out)?,
+                    _ => {}
+                }
             }
+
+            // Record EVERY select, nested or not (ENG-005). A `SELECT *` or an
+            // `OR 1=1` tautology hiding in a subquery / CTE body must be seen by
+            // VETRO-051 / VETRO-090. `is_nested` is preserved so VETRO-050
+            // (unbounded read) can stay scoped to the client-visible top-level
+            // query and not flag every inner scan as missing a LIMIT.
+            out.push(StatementInfo {
+                kind: StatementKind::Select,
+                is_nested,
+                ast_node_path: if is_nested {
+                    "SubSelect > SelectStmt".to_string()
+                } else {
+                    "SelectStmt".to_string()
+                },
+                select_is_star: is_star,
+                select_has_limit: has_limit,
+                has_or_tautology: tautology,
+                where_presence: match select.selection.as_ref() {
+                    None => WherePresence::Absent,
+                    Some(e) if is_always_true(e) => WherePresence::AlwaysTrue,
+                    Some(_) => WherePresence::Present,
+                },
+                ..Default::default()
+            });
 
             // Recurse into FROM subqueries
             for twj in &select.from {
@@ -305,17 +393,15 @@ fn walk_set_expr(
             walk_query(query.as_ref(), true, depth + 1, out)?;
         }
         SetExpr::SetOperation { left, right, .. } => {
-            walk_set_expr(left.as_ref(), is_nested, depth + 1, out)?;
-            walk_set_expr(right.as_ref(), is_nested, depth + 1, out)?;
+            // A LIMIT on the outer query bounds the whole set-operation result.
+            walk_set_expr(left.as_ref(), is_nested, has_limit, depth + 1, out)?;
+            walk_set_expr(right.as_ref(), is_nested, has_limit, depth + 1, out)?;
         }
         _ => {}
     }
 
     Ok(())
 }
-
-// Patch SELECT statements after the full walk to set select_has_limit from Query.limit
-// This is done by the caller (walk_query) once we have the Query context.
 
 fn walk_table_factor(
     factor: &TableFactor,
@@ -414,19 +500,121 @@ fn where_presence(selection: Option<&Expr>) -> WherePresence {
     }
 }
 
+/// Detect trivially-true predicates (see the pg_ast.rs counterpart for the full
+/// rationale — ENG-009). Recognises boolean/numeric truthy literals, constant
+/// comparisons under any of `= <> != < <= > >=`, column self-equality
+/// (`id = id`), `NOT <always_false>`, and AND/OR combinations thereof.
 fn is_always_true(expr: &Expr) -> bool {
+    use sqlparser::ast::{BinaryOperator, UnaryOperator};
     match expr {
         Expr::Value(Value::Boolean(true)) => true,
+        // Bare truthy numeric literal: `WHERE 1`.
+        Expr::Value(Value::Number(n, _)) => n.parse::<f64>().map(|v| v != 0.0).unwrap_or(false),
         Expr::Nested(inner) => is_always_true(inner),
-        Expr::BinaryOp { left, op, right } => {
-            use sqlparser::ast::BinaryOperator;
-            match op {
-                BinaryOperator::Eq => literal_eq(left, right),
-                BinaryOperator::Or => is_always_true(left) || is_always_true(right),
-                BinaryOperator::And => is_always_true(left) && is_always_true(right),
-                _ => false,
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: inner,
+        } => is_always_false(inner),
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::Eq if same_column(left, right) => true,
+            BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq => const_cmp_true(left, op, right),
+            BinaryOperator::Or => is_always_true(left) || is_always_true(right),
+            BinaryOperator::And => is_always_true(left) && is_always_true(right),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Dual of `is_always_true` for evaluating `NOT (…)`. Conservative.
+fn is_always_false(expr: &Expr) -> bool {
+    use sqlparser::ast::{BinaryOperator, UnaryOperator};
+    match expr {
+        Expr::Value(Value::Boolean(false)) => true,
+        Expr::Value(Value::Number(n, _)) => n.parse::<f64>().map(|v| v == 0.0).unwrap_or(false),
+        Expr::Nested(inner) => is_always_false(inner),
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: inner,
+        } => is_always_true(inner),
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq => {
+                is_literal(left) && is_literal(right) && !const_cmp_true(left, op, right)
             }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// True when both expressions are the same (qualified) column identifier.
+fn same_column(left: &Expr, right: &Expr) -> bool {
+    fn path(e: &Expr) -> Option<String> {
+        match e {
+            Expr::Identifier(id) => Some(id.value.to_ascii_lowercase()),
+            Expr::CompoundIdentifier(ids) => Some(
+                ids.iter()
+                    .map(|i| i.value.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            ),
+            Expr::Nested(inner) => path(inner),
+            _ => None,
         }
+    }
+    match (path(left), path(right)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn is_literal(expr: &Expr) -> bool {
+    matches!(unwrap_nested(expr), Expr::Value(_))
+}
+
+fn unwrap_nested(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Nested(inner) => unwrap_nested(inner),
+        other => other,
+    }
+}
+
+/// Statically evaluate `<const> <op> <const>`. Numbers compare numerically;
+/// other literals only by `=`/`<>` identity. `false` for any non-constant
+/// operand (never a false positive on a real predicate).
+fn const_cmp_true(left: &Expr, op: &sqlparser::ast::BinaryOperator, right: &Expr) -> bool {
+    use sqlparser::ast::BinaryOperator;
+    let (l, r) = (unwrap_nested(left), unwrap_nested(right));
+    let (Expr::Value(a), Expr::Value(b)) = (l, r) else {
+        return false;
+    };
+    if let (Value::Number(x, _), Value::Number(y, _)) = (a, b) {
+        if let (Ok(x), Ok(y)) = (x.parse::<f64>(), y.parse::<f64>()) {
+            return match op {
+                BinaryOperator::Eq => x == y,
+                BinaryOperator::NotEq => x != y,
+                BinaryOperator::Lt => x < y,
+                BinaryOperator::LtEq => x <= y,
+                BinaryOperator::Gt => x > y,
+                BinaryOperator::GtEq => x >= y,
+                _ => false,
+            };
+        }
+    }
+    let eq = format!("{a:?}") == format!("{b:?}");
+    match op {
+        BinaryOperator::Eq => eq,
+        BinaryOperator::NotEq => !eq,
         _ => false,
     }
 }
@@ -462,13 +650,6 @@ fn has_or_tautology(expr: &Expr) -> bool {
     }
 }
 
-fn literal_eq(left: &Expr, right: &Expr) -> bool {
-    match (left, right) {
-        (Expr::Value(a), Expr::Value(b)) => format!("{a:?}") == format!("{b:?}"),
-        _ => false,
-    }
-}
-
 fn expr_as_i64(expr: &Expr) -> Option<i64> {
     match expr {
         Expr::Value(Value::Number(n, _)) => n.parse().ok(),
@@ -489,7 +670,11 @@ fn relation_from_table_with_joins(twj: &TableWithJoins) -> Option<String> {
 }
 
 fn relation_from_twj(twj: &TableWithJoins) -> Option<String> {
-    match &twj.relation {
+    relation_from_table_factor(&twj.relation)
+}
+
+fn relation_from_table_factor(factor: &TableFactor) -> Option<String> {
+    match factor {
         TableFactor::Table { name, .. } => Some(name.to_string()),
         _ => None,
     }

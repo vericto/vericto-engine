@@ -47,6 +47,16 @@ pub enum StatementKind {
     AlterTable,
     /// Function call detected inside a query (SLEEP, PG_SLEEP, …)
     FunctionCall,
+    /// `COPY … TO/FROM` (PostgreSQL). `PROGRAM` form is an RCE/exfiltration vector.
+    Copy,
+    /// `DO $$ … $$` anonymous PL/pgSQL block — can hide arbitrary DML/DDL.
+    DoBlock,
+    /// `GRANT` / `REVOKE` — privilege escalation / lockout.
+    Grant,
+    /// `MERGE INTO …` — can mass-mutate rows like an UPDATE/DELETE without WHERE.
+    Merge,
+    /// `CREATE TABLE … AS SELECT …` / `SELECT … INTO` — bulk data copy.
+    CreateTableAs,
     Other,
 }
 
@@ -65,6 +75,12 @@ pub enum DropObjectKind {
 pub enum AlterTableKind {
     DropColumn,
     Rename,
+    /// `DROP CONSTRAINT` — removes a FK/PK/CHECK; silently breaks data integrity.
+    DropConstraint,
+    /// `ALTER COLUMN … TYPE …` — table rewrite, potentially lossy cast.
+    AlterColumnType,
+    /// `DISABLE TRIGGER` / `DISABLE ROW LEVEL SECURITY` — disables a protection.
+    DisableTrigger,
     Other,
 }
 
@@ -113,6 +129,10 @@ pub struct StatementInfo {
     pub select_is_star: bool,
     /// Name of a called function (for VETRO-070).
     pub function_name: Option<String>,
+    /// Whether a `COPY` statement uses the `PROGRAM` form (`COPY … TO/FROM
+    /// PROGRAM '…'`), which executes a shell command on the server (RCE /
+    /// data exfiltration). Used by VETRO-080.
+    pub copy_is_program: bool,
     /// Whether the WHERE clause contains a trivially-true OR branch
     /// (e.g. `WHERE id = 1 OR 1=1`). Used by VETRO-090 to detect
     /// SQL injection tautologies. Populated for all statement types that
@@ -138,6 +158,7 @@ impl Default for StatementInfo {
             select_has_limit: false,
             select_is_star: false,
             function_name: None,
+            copy_is_program: false,
             has_or_tautology: false,
         }
     }
