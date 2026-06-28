@@ -8,3 +8,5 @@
 .vscode/
 *.swp
 Cargo.lock
+# Internal/working docs — not versioned
+docs/
