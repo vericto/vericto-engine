@@ -46,11 +46,17 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         })
         .map(|s| violation(rule, s, suggest_delete(s))),
 
-        // VETRO-010: DROP TABLE, DROP DATABASE, DROP SCHEMA (excludes DROP INDEX,
-        // which has its own rule VETRO-013).
+        // VETRO-010: DROP TABLE / DROP DATABASE. Excludes DROP INDEX (own rule
+        // VETRO-013) and DROP SCHEMA (own rule VETRO-012) so the two no longer
+        // co-match on the same statement (ENG-010). DROP DATABASE is included
+        // here now that the PostgreSQL path emits DropObjectKind::Database
+        // (ENG-004); on MySQL it already arrived as a generic DropStmt.
         "VETRO-010" => find(stmts, |s| {
             s.kind == StatementKind::Drop
-                && !matches!(s.drop_object, Some(DropObjectKind::Index))
+                && !matches!(
+                    s.drop_object,
+                    Some(DropObjectKind::Index) | Some(DropObjectKind::Schema)
+                )
         })
         .map(|s| violation(rule, s, Some(suggest_migration()))),
 
@@ -138,6 +144,122 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
+        // VETRO-017: ALTER TABLE DROP CONSTRAINT — removes a FK/PK/CHECK and
+        // silently allows future data to violate the dropped invariant.
+        "VETRO-017" => find(stmts, |s| {
+            s.kind == StatementKind::AlterTable
+                && matches!(s.alter_table_kind, Some(AlterTableKind::DropConstraint))
+        })
+        .map(|s| {
+            let mut v = violation(
+                rule,
+                s,
+                Some("Drop constraints only via a reviewed, versioned migration".to_string()),
+            );
+            v.ast_node_path = "AlterTableStmt > DropConstraint".to_string();
+            v
+        }),
+
+        // VETRO-018: ALTER TABLE ALTER COLUMN TYPE — rewrites the table and can
+        // be a lossy/blocking cast on a large relation.
+        "VETRO-018" => find(stmts, |s| {
+            s.kind == StatementKind::AlterTable
+                && matches!(s.alter_table_kind, Some(AlterTableKind::AlterColumnType))
+        })
+        .map(|s| {
+            let mut v = violation(
+                rule,
+                s,
+                Some("Use an additive migration (new column + backfill + swap)".to_string()),
+            );
+            v.ast_node_path = "AlterTableStmt > AlterColumnType".to_string();
+            v
+        }),
+
+        // VETRO-019: ALTER TABLE DISABLE TRIGGER / DISABLE ROW LEVEL SECURITY —
+        // disables a data-integrity or access-control protection.
+        "VETRO-019" => find(stmts, |s| {
+            s.kind == StatementKind::AlterTable
+                && matches!(s.alter_table_kind, Some(AlterTableKind::DisableTrigger))
+        })
+        .map(|s| {
+            let mut v = violation(
+                rule,
+                s,
+                Some("Keep triggers / RLS enabled; scope the operation instead".to_string()),
+            );
+            v.ast_node_path = "AlterTableStmt > DisableTrigger".to_string();
+            v
+        }),
+
+        // ── Dangerous statement types (ENG-007) ────────────────────────────
+
+        // VETRO-080: COPY … TO/FROM PROGRAM — executes a shell command on the
+        // database host. Remote code execution / data-exfiltration channel.
+        "VETRO-080" => find(stmts, |s| {
+            s.kind == StatementKind::Copy && s.copy_is_program
+        })
+        .map(|s| {
+            let mut v = violation(
+                rule,
+                s,
+                Some("Use client-side \\copy or COPY … TO STDOUT, never PROGRAM".to_string()),
+            );
+            v.ast_node_path = "CopyStmt > PROGRAM".to_string();
+            v
+        }),
+
+        // VETRO-081: DO $$ … $$ anonymous code block — runs an arbitrary
+        // PL/pgSQL body that can perform any hidden DML/DDL.
+        "VETRO-081" => find(stmts, |s| s.kind == StatementKind::DoBlock)
+            .map(|s| {
+                let mut v = violation(
+                    rule,
+                    s,
+                    Some("Replace the anonymous DO block with explicit, reviewable statements".to_string()),
+                );
+                v.ast_node_path = "DoStmt".to_string();
+                v
+            }),
+
+        // VETRO-082: GRANT / REVOKE — privilege escalation or accidental lockout.
+        "VETRO-082" => find(stmts, |s| s.kind == StatementKind::Grant)
+            .map(|s| {
+                let mut v = violation(
+                    rule,
+                    s,
+                    Some("Manage privileges through your access-control / IaC pipeline".to_string()),
+                );
+                v.ast_node_path = "GrantStmt".to_string();
+                v
+            }),
+
+        // VETRO-083: MERGE — can mass-mutate the target table like an
+        // UPDATE/DELETE with no effective WHERE.
+        "VETRO-083" => find(stmts, |s| s.kind == StatementKind::Merge)
+            .map(|s| {
+                let mut v = violation(
+                    rule,
+                    s,
+                    Some("Scope the MERGE join so it cannot match the whole table".to_string()),
+                );
+                v.ast_node_path = "MergeStmt".to_string();
+                v
+            }),
+
+        // VETRO-084: CREATE TABLE AS SELECT … / SELECT … INTO — bulk data copy
+        // that can duplicate an entire table (and any sensitive data in it).
+        "VETRO-084" => find(stmts, |s| s.kind == StatementKind::CreateTableAs)
+            .map(|s| {
+                let mut v = violation(
+                    rule,
+                    s,
+                    Some("Add a WHERE/LIMIT to the source SELECT, or use a reviewed migration".to_string()),
+                );
+                v.ast_node_path = "CreateTableAsStmt".to_string();
+                v
+            }),
+
         // VETRO-031: UPDATE without WHERE nested inside a CTE.
         "VETRO-031" => find(stmts, |s| {
             s.kind == StatementKind::Update
@@ -189,8 +311,13 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         // VETRO-050: SELECT without LIMIT. Without table-size statistics in the
         // proxy we cannot distinguish large from small tables, so we flag all
         // unbounded SELECTs with MEDIUM severity (log-only by default).
+        //
+        // Scoped to the top-level (client-visible) SELECT: a bounded outer query
+        // (`SELECT … FROM (subquery) LIMIT 10`) caps the rows returned, so we do
+        // not flag every inner scan for "missing" a LIMIT it cannot carry. Inner
+        // selects are still recorded (ENG-005) for VETRO-051/090.
         "VETRO-050" => find(stmts, |s| {
-            s.kind == StatementKind::Select && !s.select_has_limit
+            s.kind == StatementKind::Select && !s.is_nested && !s.select_has_limit
         })
         .map(|s| {
             let mut v = violation(
