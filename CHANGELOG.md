@@ -1,11 +1,34 @@
 # Changelog
 
-All notable changes to `vetro-engine` are documented here.
+All notable changes to `vericto-engine` are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [3.0.0] — 2026-07-16
+
+Rebrand from **Vetro** to **Vericto**. This is a breaking release: the standard
+rule codes and the crate name changed, so any consumer that references them must
+be updated in lockstep.
+
+### Changed (breaking)
+
+- **Rule codes renamed** `VETRO-NNN` → `VERICTO-NNN` across the full standard
+  catalogue (e.g. `VETRO-001` → `VERICTO-001`). Reports, audit records, and any
+  downstream system that matches on rule codes must migrate. Rule semantics are
+  unchanged — only the code prefix changed.
+- **Crate renamed** `vetro-engine` → `vericto-engine`; library target
+  `vetro_engine` → `vericto_engine`. Update `Cargo.toml` dependencies and
+  `use vericto_engine::…` import paths.
+
+### Notes
+
+- No behavioural changes to parsing or rule evaluation.
+- Historical CHANGELOG entries below have been rewritten to use the `VERICTO-`
+  prefix for readability; those versions were originally published under the
+  `VETRO-` prefix.
 
 ## [2.1.0] — 2026-06-27
 
@@ -16,14 +39,14 @@ false positive (ENG-001) or a missed detection.
 ### Added
 
 - **8 new standard rules:**
-  - `VETRO-017` (High) — `ALTER TABLE … DROP CONSTRAINT` / `DROP PRIMARY KEY`.
-  - `VETRO-018` (High) — `ALTER TABLE … ALTER COLUMN … TYPE …` (table rewrite).
-  - `VETRO-019` (High) — `ALTER TABLE … DISABLE TRIGGER` / `DISABLE ROW LEVEL SECURITY`.
-  - `VETRO-080` (Critical) — `COPY … TO/FROM PROGRAM` (server-side RCE / exfiltration).
-  - `VETRO-081` (Critical) — `DO $$ … $$` anonymous PL/pgSQL block.
-  - `VETRO-082` (High) — `GRANT` / `REVOKE`.
-  - `VETRO-083` (High) — `MERGE INTO …`.
-  - `VETRO-084` (High) — `CREATE TABLE … AS SELECT …` / `SELECT … INTO`.
+  - `VERICTO-017` (High) — `ALTER TABLE … DROP CONSTRAINT` / `DROP PRIMARY KEY`.
+  - `VERICTO-018` (High) — `ALTER TABLE … ALTER COLUMN … TYPE …` (table rewrite).
+  - `VERICTO-019` (High) — `ALTER TABLE … DISABLE TRIGGER` / `DISABLE ROW LEVEL SECURITY`.
+  - `VERICTO-080` (Critical) — `COPY … TO/FROM PROGRAM` (server-side RCE / exfiltration).
+  - `VERICTO-081` (Critical) — `DO $$ … $$` anonymous PL/pgSQL block.
+  - `VERICTO-082` (High) — `GRANT` / `REVOKE`.
+  - `VERICTO-083` (High) — `MERGE INTO …`.
+  - `VERICTO-084` (High) — `CREATE TABLE … AS SELECT …` / `SELECT … INTO`.
 - New `StatementKind` variants (`Copy`, `DoBlock`, `Grant`, `Merge`,
   `CreateTableAs`), `AlterTableKind` variants (`DropConstraint`,
   `AlterColumnType`, `DisableTrigger`), `DropObjectKind::Database`, and the
@@ -34,22 +57,22 @@ false positive (ENG-001) or a missed detection.
 ### Fixed
 
 - **ENG-001** — `walk.rs` ignored `LIMIT`, so every non-Postgres SELECT tripped
-  `VETRO-050`. Row-bound is now resolved from `LIMIT` / `FETCH FIRST` / `TOP`.
+  `VERICTO-050`. Row-bound is now resolved from `LIMIT` / `FETCH FIRST` / `TOP`.
 - **ENG-002 / ENG-003** — Postgres `INSERT` now sets `insert_has_select`
-  (→ `VETRO-040`) and counts `VALUES` tuples (→ `VETRO-061`).
+  (→ `VERICTO-040`) and counts `VALUES` tuples (→ `VERICTO-061`).
 - **ENG-004** — `DROP DATABASE` is now detected on Postgres (`DropdbStmt`).
 - **ENG-005** — SELECT-based rules now see nested SELECTs (subqueries, CTE
-  bodies, joins, sub-links) on Postgres; `VETRO-050` scoped to the top-level
+  bodies, joins, sub-links) on Postgres; `VERICTO-050` scoped to the top-level
   read to avoid false positives.
-- **ENG-006** — `VETRO-070` now fires for `pg_sleep`/`sleep` in the projection
+- **ENG-006** — `VERICTO-070` now fires for `pg_sleep`/`sleep` in the projection
   (both parsers) and for schema-qualified `pg_catalog.pg_sleep`.
 - **ENG-007** — dangerous statement types (COPY PROGRAM, DO, GRANT, MERGE,
   CREATE TABLE AS) are no longer silently allowed on Postgres.
 - **ENG-008** — ALTER TABLE detection extended beyond DROP COLUMN / RENAME.
 - **ENG-009** — `is_always_true` deepened: `<const> <cmp> <const>`, column
   self-equality (`id = id`), `NOT FALSE`, truthy numeric literals.
-- **ENG-010** — `VETRO-010` now excludes `SCHEMA` so `DROP SCHEMA` matches only
-  `VETRO-012`.
+- **ENG-010** — `VERICTO-010` now excludes `SCHEMA` so `DROP SCHEMA` matches only
+  `VERICTO-012`.
 
 ### Docs
 
@@ -97,15 +120,15 @@ false positive (ENG-001) or a missed detection.
 - **`ParseErrorAction` enum** (`AllowReport | Block`) for fail-open / fail-closed
   handling of unparseable queries.
 - **Fail-open parse-error default.** Unparseable queries are now allowed and
-  reported by default (severity `Medium`, rule code `VETRO-PARSE-ERROR`), with
+  reported by default (severity `Medium`, rule code `VERICTO-PARSE-ERROR`), with
   opt-in fail-closed (`Block`) per workspace. This replaces the previous
   unconditional fail-closed behavior.
 - **`Rule.default_action`** — the built-in recommended action per the R13 table,
   carried alongside `severity`.
 - Built-in rule severities and default actions aligned to the canonical R13
   table. The destructive-critical rules
-  (`VETRO-001/003/010/011/012/030/042/090`) keep `Critical`/`Block`;
-  `VETRO-050` (SELECT without LIMIT) is now `Medium`/`Flag` and therefore
+  (`VERICTO-001/003/010/011/012/030/042/090`) keep `Critical`/`Block`;
+  `VERICTO-050` (SELECT without LIMIT) is now `Medium`/`Flag` and therefore
   allowed by default, fixing the original over-blocking behavior.
 - 8 property-based tests (`proptest`) covering `from_legacy` totality and
   determinism, legacy-mapping fixed points, the severity total order,
@@ -121,7 +144,7 @@ false positive (ENG-001) or a missed detection.
 - PostgreSQL parsing via `pg_query` (libpg_query) — full-fidelity protobuf AST,
   including destructive statements nested in data-modifying CTEs.
 - MySQL, Oracle, and SQL Server parsing via `sqlparser-rs`.
-- 20 built-in rules (VETRO-001 through VETRO-090) covering DELETE/UPDATE without
+- 20 built-in rules (VERICTO-001 through VERICTO-090) covering DELETE/UPDATE without
   WHERE, DROP, TRUNCATE, ALTER TABLE, dangerous function calls, and OR-tautology
   SQL injection.
 - Custom rules defined as YAML AST conditions.
@@ -133,6 +156,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/donkan168/vetro-proxy/compare/v2.0.0...HEAD
-[2.0.0]: https://github.com/donkan168/vetro-proxy/compare/v1.0.0...v2.0.0
-[1.0.0]: https://github.com/donkan168/vetro-proxy/releases/tag/v1.0.0
+[Unreleased]: https://github.com/donkan168/vericto-engine/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/donkan168/vericto-engine/compare/v2.1.0...v3.0.0
+[2.1.0]: https://github.com/donkan168/vericto-engine/compare/v2.0.0...v2.1.0
+[2.0.0]: https://github.com/donkan168/vericto-engine/compare/v1.0.0...v2.0.0
+[1.0.0]: https://github.com/donkan168/vericto-engine/releases/tag/v1.0.0

@@ -1,17 +1,17 @@
 [package]
-name = "vetro-engine"
-version = "2.1.0"
+name = "vericto-engine"
+version = "3.0.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Vetro — Deterministic SQL AST evaluation engine (open core)"
+description = "Vericto — Deterministic SQL AST evaluation engine (open core)"
 license = "Elastic-2.0"
-repository = "https://github.com/donkan168/vetro-engine"
+repository = "https://github.com/donkan168/vericto-engine"
 readme = "README.md"
 keywords = ["sql", "security", "ast", "parser", "llm"]
 categories = ["database", "parser-implementations"]
 
 [lib]
-name = "vetro_engine"
+name = "vericto_engine"
 path = "src/lib.rs"
 
 [dependencies]
