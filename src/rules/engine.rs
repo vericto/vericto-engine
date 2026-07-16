@@ -281,14 +281,14 @@ mod tests {
     /// default policy (R9.1 / R13 table). These are the engine-side mirror of
     /// the Reglas_Destructivas_Criticas set.
     const DESTRUCTIVE_CRITICAL_CODES: &[&str] = &[
-        "VETRO-001",
-        "VETRO-003",
-        "VETRO-010",
-        "VETRO-011",
-        "VETRO-012",
-        "VETRO-030",
-        "VETRO-042",
-        "VETRO-090",
+        "VERICTO-001",
+        "VERICTO-003",
+        "VERICTO-010",
+        "VERICTO-011",
+        "VERICTO-012",
+        "VERICTO-030",
+        "VERICTO-042",
+        "VERICTO-090",
     ];
 
     /// R4.1 / R13: the default policy maps Critical/High → Block,
@@ -345,8 +345,8 @@ mod tests {
             .parse("DELETE FROM users")
             .expect("must parse");
         let rule = Rule {
-            rule_id: "VETRO-001".to_string(),
-            code: "VETRO-001".to_string(),
+            rule_id: "VERICTO-001".to_string(),
+            code: "VERICTO-001".to_string(),
             severity: Severity::Critical,
             default_action: EnforcementAction::Block,
             rule_type: RuleType::Standard,
@@ -360,6 +360,6 @@ mod tests {
         assert_eq!(outcome.decision, Decision::Block);
         assert_eq!(outcome.action, Some(EnforcementAction::Block));
         assert_eq!(outcome.severity, Some(Severity::Critical));
-        assert_eq!(outcome.rule_code.as_deref(), Some("VETRO-001"));
+        assert_eq!(outcome.rule_code.as_deref(), Some("VERICTO-001"));
     }
 }

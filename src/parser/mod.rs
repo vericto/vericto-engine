@@ -127,14 +127,14 @@ pub struct StatementInfo {
     pub select_has_limit: bool,
     /// Whether SELECT target list is `*` (star).
     pub select_is_star: bool,
-    /// Name of a called function (for VETRO-070).
+    /// Name of a called function (for VERICTO-070).
     pub function_name: Option<String>,
     /// Whether a `COPY` statement uses the `PROGRAM` form (`COPY … TO/FROM
     /// PROGRAM '…'`), which executes a shell command on the server (RCE /
-    /// data exfiltration). Used by VETRO-080.
+    /// data exfiltration). Used by VERICTO-080.
     pub copy_is_program: bool,
     /// Whether the WHERE clause contains a trivially-true OR branch
-    /// (e.g. `WHERE id = 1 OR 1=1`). Used by VETRO-090 to detect
+    /// (e.g. `WHERE id = 1 OR 1=1`). Used by VERICTO-090 to detect
     /// SQL injection tautologies. Populated for all statement types that
     /// have a WHERE clause (DELETE, UPDATE, SELECT).
     pub has_or_tautology: bool,

@@ -34,24 +34,24 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
 
         // ── CRITICAL rules ─────────────────────────────────────────────────
 
-        // VETRO-001: DELETE without WHERE clause.
-        "VETRO-001" => find(stmts, |s| {
+        // VERICTO-001: DELETE without WHERE clause.
+        "VERICTO-001" => find(stmts, |s| {
             s.kind == StatementKind::Delete && s.where_presence == WherePresence::Absent
         })
         .map(|s| violation(rule, s, suggest_delete(s))),
 
-        // VETRO-003: DELETE with a trivially-true WHERE (1=1, true).
-        "VETRO-003" => find(stmts, |s| {
+        // VERICTO-003: DELETE with a trivially-true WHERE (1=1, true).
+        "VERICTO-003" => find(stmts, |s| {
             s.kind == StatementKind::Delete && s.where_presence == WherePresence::AlwaysTrue
         })
         .map(|s| violation(rule, s, suggest_delete(s))),
 
-        // VETRO-010: DROP TABLE / DROP DATABASE. Excludes DROP INDEX (own rule
-        // VETRO-013) and DROP SCHEMA (own rule VETRO-012) so the two no longer
+        // VERICTO-010: DROP TABLE / DROP DATABASE. Excludes DROP INDEX (own rule
+        // VERICTO-013) and DROP SCHEMA (own rule VERICTO-012) so the two no longer
         // co-match on the same statement (ENG-010). DROP DATABASE is included
         // here now that the PostgreSQL path emits DropObjectKind::Database
         // (ENG-004); on MySQL it already arrived as a generic DropStmt.
-        "VETRO-010" => find(stmts, |s| {
+        "VERICTO-010" => find(stmts, |s| {
             s.kind == StatementKind::Drop
                 && !matches!(
                     s.drop_object,
@@ -60,37 +60,37 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         })
         .map(|s| violation(rule, s, Some(suggest_migration()))),
 
-        // VETRO-011: TRUNCATE TABLE.
-        "VETRO-011" => find(stmts, |s| s.kind == StatementKind::Truncate)
+        // VERICTO-011: TRUNCATE TABLE.
+        "VERICTO-011" => find(stmts, |s| s.kind == StatementKind::Truncate)
             .map(|s| violation(rule, s, suggest_truncate(s))),
 
-        // VETRO-012: DROP SCHEMA specifically.
-        "VETRO-012" => find(stmts, |s| {
+        // VERICTO-012: DROP SCHEMA specifically.
+        "VERICTO-012" => find(stmts, |s| {
             s.kind == StatementKind::Drop
                 && matches!(s.drop_object, Some(DropObjectKind::Schema))
         })
         .map(|s| violation(rule, s, Some(suggest_migration()))),
 
-        // VETRO-030: UPDATE without WHERE — alias targeting 'primary tables'.
-        // Identical predicate to VETRO-042; separate code allows independent
+        // VERICTO-030: UPDATE without WHERE — alias targeting 'primary tables'.
+        // Identical predicate to VERICTO-042; separate code allows independent
         // configuration per workspace (e.g. different severity or scope).
-        "VETRO-030" => find(stmts, |s| {
+        "VERICTO-030" => find(stmts, |s| {
             s.kind == StatementKind::Update && s.where_presence != WherePresence::Present
         })
         .map(|s| violation(rule, s, suggest_update(s))),
 
-        // VETRO-042: UPDATE without WHERE clause (includes always-true WHERE).
-        "VETRO-042" => find(stmts, |s| {
+        // VERICTO-042: UPDATE without WHERE clause (includes always-true WHERE).
+        "VERICTO-042" => find(stmts, |s| {
             s.kind == StatementKind::Update && s.where_presence != WherePresence::Present
         })
         .map(|s| violation(rule, s, suggest_update(s))),
 
         // ── HIGH rules ─────────────────────────────────────────────────────
 
-        // VETRO-002: DELETE with LIMIT 0 (MySQL/SQLite). A LIMIT of 0 deletes
+        // VERICTO-002: DELETE with LIMIT 0 (MySQL/SQLite). A LIMIT of 0 deletes
         // zero rows, but it is syntactically indistinguishable from a
         // misconfigured attempt to scope a DELETE.
-        "VETRO-002" => find(stmts, |s| {
+        "VERICTO-002" => find(stmts, |s| {
             s.kind == StatementKind::Delete && s.delete_limit == Some(0)
         })
         .map(|s| {
@@ -99,10 +99,10 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
-        // VETRO-013: DROP INDEX without IF EXISTS. Without IF EXISTS the
+        // VERICTO-013: DROP INDEX without IF EXISTS. Without IF EXISTS the
         // statement will error if the index is missing, potentially breaking
         // scripts. With IF EXISTS it is idempotent.
-        "VETRO-013" => find(stmts, |s| {
+        "VERICTO-013" => find(stmts, |s| {
             s.kind == StatementKind::Drop
                 && matches!(s.drop_object, Some(DropObjectKind::Index))
                 && !s.drop_index_if_exists
@@ -113,8 +113,8 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
-        // VETRO-015: ALTER TABLE DROP COLUMN — irreversible schema change.
-        "VETRO-015" => find(stmts, |s| {
+        // VERICTO-015: ALTER TABLE DROP COLUMN — irreversible schema change.
+        "VERICTO-015" => find(stmts, |s| {
             s.kind == StatementKind::AlterTable
                 && matches!(s.alter_table_kind, Some(AlterTableKind::DropColumn))
         })
@@ -128,9 +128,9 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
-        // VETRO-016: ALTER TABLE RENAME — renames a table or column, breaking
+        // VERICTO-016: ALTER TABLE RENAME — renames a table or column, breaking
         // any code that references the old name.
-        "VETRO-016" => find(stmts, |s| {
+        "VERICTO-016" => find(stmts, |s| {
             s.kind == StatementKind::AlterTable
                 && matches!(s.alter_table_kind, Some(AlterTableKind::Rename))
         })
@@ -144,9 +144,9 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
-        // VETRO-017: ALTER TABLE DROP CONSTRAINT — removes a FK/PK/CHECK and
+        // VERICTO-017: ALTER TABLE DROP CONSTRAINT — removes a FK/PK/CHECK and
         // silently allows future data to violate the dropped invariant.
-        "VETRO-017" => find(stmts, |s| {
+        "VERICTO-017" => find(stmts, |s| {
             s.kind == StatementKind::AlterTable
                 && matches!(s.alter_table_kind, Some(AlterTableKind::DropConstraint))
         })
@@ -160,9 +160,9 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
-        // VETRO-018: ALTER TABLE ALTER COLUMN TYPE — rewrites the table and can
+        // VERICTO-018: ALTER TABLE ALTER COLUMN TYPE — rewrites the table and can
         // be a lossy/blocking cast on a large relation.
-        "VETRO-018" => find(stmts, |s| {
+        "VERICTO-018" => find(stmts, |s| {
             s.kind == StatementKind::AlterTable
                 && matches!(s.alter_table_kind, Some(AlterTableKind::AlterColumnType))
         })
@@ -176,9 +176,9 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
-        // VETRO-019: ALTER TABLE DISABLE TRIGGER / DISABLE ROW LEVEL SECURITY —
+        // VERICTO-019: ALTER TABLE DISABLE TRIGGER / DISABLE ROW LEVEL SECURITY —
         // disables a data-integrity or access-control protection.
-        "VETRO-019" => find(stmts, |s| {
+        "VERICTO-019" => find(stmts, |s| {
             s.kind == StatementKind::AlterTable
                 && matches!(s.alter_table_kind, Some(AlterTableKind::DisableTrigger))
         })
@@ -194,9 +194,9 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
 
         // ── Dangerous statement types (ENG-007) ────────────────────────────
 
-        // VETRO-080: COPY … TO/FROM PROGRAM — executes a shell command on the
+        // VERICTO-080: COPY … TO/FROM PROGRAM — executes a shell command on the
         // database host. Remote code execution / data-exfiltration channel.
-        "VETRO-080" => find(stmts, |s| {
+        "VERICTO-080" => find(stmts, |s| {
             s.kind == StatementKind::Copy && s.copy_is_program
         })
         .map(|s| {
@@ -209,9 +209,9 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
-        // VETRO-081: DO $$ … $$ anonymous code block — runs an arbitrary
+        // VERICTO-081: DO $$ … $$ anonymous code block — runs an arbitrary
         // PL/pgSQL body that can perform any hidden DML/DDL.
-        "VETRO-081" => find(stmts, |s| s.kind == StatementKind::DoBlock)
+        "VERICTO-081" => find(stmts, |s| s.kind == StatementKind::DoBlock)
             .map(|s| {
                 let mut v = violation(
                     rule,
@@ -222,8 +222,8 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
                 v
             }),
 
-        // VETRO-082: GRANT / REVOKE — privilege escalation or accidental lockout.
-        "VETRO-082" => find(stmts, |s| s.kind == StatementKind::Grant)
+        // VERICTO-082: GRANT / REVOKE — privilege escalation or accidental lockout.
+        "VERICTO-082" => find(stmts, |s| s.kind == StatementKind::Grant)
             .map(|s| {
                 let mut v = violation(
                     rule,
@@ -234,9 +234,9 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
                 v
             }),
 
-        // VETRO-083: MERGE — can mass-mutate the target table like an
+        // VERICTO-083: MERGE — can mass-mutate the target table like an
         // UPDATE/DELETE with no effective WHERE.
-        "VETRO-083" => find(stmts, |s| s.kind == StatementKind::Merge)
+        "VERICTO-083" => find(stmts, |s| s.kind == StatementKind::Merge)
             .map(|s| {
                 let mut v = violation(
                     rule,
@@ -247,9 +247,9 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
                 v
             }),
 
-        // VETRO-084: CREATE TABLE AS SELECT … / SELECT … INTO — bulk data copy
+        // VERICTO-084: CREATE TABLE AS SELECT … / SELECT … INTO — bulk data copy
         // that can duplicate an entire table (and any sensitive data in it).
-        "VETRO-084" => find(stmts, |s| s.kind == StatementKind::CreateTableAs)
+        "VERICTO-084" => find(stmts, |s| s.kind == StatementKind::CreateTableAs)
             .map(|s| {
                 let mut v = violation(
                     rule,
@@ -260,25 +260,25 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
                 v
             }),
 
-        // VETRO-031: UPDATE without WHERE nested inside a CTE.
-        "VETRO-031" => find(stmts, |s| {
+        // VERICTO-031: UPDATE without WHERE nested inside a CTE.
+        "VERICTO-031" => find(stmts, |s| {
             s.kind == StatementKind::Update
                 && s.is_nested
                 && s.where_presence != WherePresence::Present
         })
         .map(|s| violation(rule, s, suggest_update(s))),
 
-        // VETRO-033: DELETE without WHERE in a subquery or CTE.
-        "VETRO-033" => find(stmts, |s| {
+        // VERICTO-033: DELETE without WHERE in a subquery or CTE.
+        "VERICTO-033" => find(stmts, |s| {
             s.kind == StatementKind::Delete
                 && s.is_nested
                 && s.where_presence != WherePresence::Present
         })
         .map(|s| violation(rule, s, suggest_delete(s))),
 
-        // VETRO-040: INSERT INTO … SELECT without a WHERE filter on the SELECT.
+        // VERICTO-040: INSERT INTO … SELECT without a WHERE filter on the SELECT.
         // This copies every row from the source, which can be accidental.
-        "VETRO-040" => find(stmts, |s| {
+        "VERICTO-040" => find(stmts, |s| {
             s.kind == StatementKind::Insert && s.insert_has_select
         })
         .map(|s| {
@@ -294,9 +294,9 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
-        // VETRO-070: Use of SLEEP() or PG_SLEEP() — indicates intentional delays,
+        // VERICTO-070: Use of SLEEP() or PG_SLEEP() — indicates intentional delays,
         // usually for DoS or timing-based SQL injection probing.
-        "VETRO-070" => find(stmts, |s| {
+        "VERICTO-070" => find(stmts, |s| {
             s.kind == StatementKind::FunctionCall
         })
         .map(|s| {
@@ -308,15 +308,15 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
 
         // ── MEDIUM rules ───────────────────────────────────────────────────
 
-        // VETRO-050: SELECT without LIMIT. Without table-size statistics in the
+        // VERICTO-050: SELECT without LIMIT. Without table-size statistics in the
         // proxy we cannot distinguish large from small tables, so we flag all
         // unbounded SELECTs with MEDIUM severity (log-only by default).
         //
         // Scoped to the top-level (client-visible) SELECT: a bounded outer query
         // (`SELECT … FROM (subquery) LIMIT 10`) caps the rows returned, so we do
         // not flag every inner scan for "missing" a LIMIT it cannot carry. Inner
-        // selects are still recorded (ENG-005) for VETRO-051/090.
-        "VETRO-050" => find(stmts, |s| {
+        // selects are still recorded (ENG-005) for VERICTO-051/090.
+        "VERICTO-050" => find(stmts, |s| {
             s.kind == StatementKind::Select && !s.is_nested && !s.select_has_limit
         })
         .map(|s| {
@@ -329,8 +329,8 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
-        // VETRO-051: SELECT * without any WHERE clause.
-        "VETRO-051" => find(stmts, |s| {
+        // VERICTO-051: SELECT * without any WHERE clause.
+        "VERICTO-051" => find(stmts, |s| {
             s.kind == StatementKind::Select
                 && s.select_is_star
                 && s.where_presence == WherePresence::Absent
@@ -345,9 +345,9 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
-        // VETRO-060: INSERT without explicit column list. Relies on table
+        // VERICTO-060: INSERT without explicit column list. Relies on table
         // column order, which breaks on schema changes.
-        "VETRO-060" => find(stmts, |s| {
+        "VERICTO-060" => find(stmts, |s| {
             s.kind == StatementKind::Insert && !s.insert_has_columns
         })
         .map(|s| {
@@ -361,8 +361,8 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
-        // VETRO-061: INSERT … VALUES with more than 10,000 row tuples.
-        "VETRO-061" => find(stmts, |s| {
+        // VERICTO-061: INSERT … VALUES with more than 10,000 row tuples.
+        "VERICTO-061" => find(stmts, |s| {
             s.kind == StatementKind::Insert
                 && s.insert_row_count.map(|n| n > 10_000).unwrap_or(false)
         })
@@ -379,7 +379,7 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
 
         // ── SQL injection ─────────────────────────────────────────────────
 
-        // VETRO-090: SQL injection tautology — OR branch in WHERE is always true
+        // VERICTO-090: SQL injection tautology — OR branch in WHERE is always true
         // (e.g. `WHERE id = $1 OR 1=1`, `WHERE name = 'x' OR 'a'='a'`).
         //
         // Zero-false-positive guarantee: no well-behaved LLM has a legitimate
@@ -387,7 +387,7 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         // This pattern is exclusively a SQL injection bypass technique.
         //
         // Covers SELECT, DELETE, and UPDATE WHERE clauses.
-        "VETRO-090" => find(stmts, |s| {
+        "VERICTO-090" => find(stmts, |s| {
             matches!(
                 s.kind,
                 StatementKind::Select | StatementKind::Delete | StatementKind::Update
@@ -556,87 +556,87 @@ mod tests {
         }
     }
 
-    // ── VETRO-001 ──────────────────────────────────────────────────────────
+    // ── VERICTO-001 ──────────────────────────────────────────────────────────
     #[test]
     fn vetro_001_blocks_delete_without_where() {
         let p = parse("DELETE FROM users", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-001"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-001"), &p).is_some());
     }
 
     #[test]
     fn vetro_001_allows_delete_with_where() {
         let p = parse("DELETE FROM users WHERE id = 1", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-001"), &p).is_none());
+        assert!(evaluate_rule(&make_rule("VERICTO-001"), &p).is_none());
     }
 
-    // ── VETRO-003 ──────────────────────────────────────────────────────────
+    // ── VERICTO-003 ──────────────────────────────────────────────────────────
     #[test]
     fn vetro_003_blocks_delete_where_always_true() {
         let p = parse("DELETE FROM users WHERE 1 = 1", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-003"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-003"), &p).is_some());
     }
 
-    // ── VETRO-010 ──────────────────────────────────────────────────────────
+    // ── VERICTO-010 ──────────────────────────────────────────────────────────
     #[test]
     fn vetro_010_blocks_drop_table() {
         let p = parse("DROP TABLE users", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-010"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-010"), &p).is_some());
     }
 
     #[test]
     fn vetro_010_blocks_drop_database() {
         // sqlparser represents DROP DATABASE under the generic DropStmt
         let p = parse("DROP TABLE prod", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-010"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-010"), &p).is_some());
     }
 
-    // ── VETRO-011 ──────────────────────────────────────────────────────────
+    // ── VERICTO-011 ──────────────────────────────────────────────────────────
     #[test]
     fn vetro_011_blocks_truncate() {
         let p = parse("TRUNCATE TABLE orders", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-011"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-011"), &p).is_some());
     }
 
-    // ── VETRO-012 ──────────────────────────────────────────────────────────
+    // ── VERICTO-012 ──────────────────────────────────────────────────────────
     #[test]
     fn vetro_012_blocks_drop_schema() {
         let p = parse("DROP SCHEMA analytics CASCADE", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-012"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-012"), &p).is_some());
     }
 
-    // ── VETRO-013 ──────────────────────────────────────────────────────────
+    // ── VERICTO-013 ──────────────────────────────────────────────────────────
     #[test]
     fn vetro_013_blocks_drop_index_without_if_exists() {
         let p = parse("DROP INDEX idx_users_email", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-013"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-013"), &p).is_some());
     }
 
     #[test]
     fn vetro_013_allows_drop_index_with_if_exists() {
         let p = parse("DROP INDEX IF EXISTS idx_users_email", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-013"), &p).is_none());
+        assert!(evaluate_rule(&make_rule("VERICTO-013"), &p).is_none());
     }
 
-    // ── VETRO-015 ──────────────────────────────────────────────────────────
+    // ── VERICTO-015 ──────────────────────────────────────────────────────────
     #[test]
     fn vetro_015_blocks_alter_table_drop_column() {
         let p = parse("ALTER TABLE users DROP COLUMN email", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-015"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-015"), &p).is_some());
     }
 
-    // ── VETRO-016 ──────────────────────────────────────────────────────────
+    // ── VERICTO-016 ──────────────────────────────────────────────────────────
     #[test]
     fn vetro_016_blocks_alter_table_rename() {
         let p = parse("ALTER TABLE users RENAME TO accounts", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-016"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-016"), &p).is_some());
     }
 
-    // ── VETRO-030 / VETRO-042 ──────────────────────────────────────────────
+    // ── VERICTO-030 / VERICTO-042 ──────────────────────────────────────────────
     #[test]
     fn vetro_042_blocks_update_without_where() {
         let p = parse("UPDATE products SET price = 0", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-042"), &p).is_some());
-        assert!(evaluate_rule(&make_rule("VETRO-030"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-042"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-030"), &p).is_some());
     }
 
     #[test]
@@ -645,22 +645,22 @@ mod tests {
             "UPDATE products SET price = 0 WHERE id = 1",
             Dialect::Postgres,
         );
-        assert!(evaluate_rule(&make_rule("VETRO-042"), &p).is_none());
+        assert!(evaluate_rule(&make_rule("VERICTO-042"), &p).is_none());
     }
 
-    // ── VETRO-031 ──────────────────────────────────────────────────────────
+    // ── VERICTO-031 ──────────────────────────────────────────────────────────
     #[test]
     fn vetro_031_blocks_update_in_cte_without_where() {
         let sql = "WITH x AS (UPDATE sessions SET status = 'expired' RETURNING id) SELECT * FROM x";
         let p = parse(sql, Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-031"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-031"), &p).is_some());
     }
 
-    // ── VETRO-060 ──────────────────────────────────────────────────────────
+    // ── VERICTO-060 ──────────────────────────────────────────────────────────
     #[test]
     fn vetro_060_blocks_insert_without_columns() {
         let p = parse("INSERT INTO users VALUES (1, 'a')", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-060"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-060"), &p).is_some());
     }
 
     #[test]
@@ -669,15 +669,15 @@ mod tests {
             "INSERT INTO users (id, name) VALUES (1, 'a')",
             Dialect::Postgres,
         );
-        assert!(evaluate_rule(&make_rule("VETRO-060"), &p).is_none());
+        assert!(evaluate_rule(&make_rule("VERICTO-060"), &p).is_none());
     }
 
-    // ── VETRO-090: SQL injection tautology ─────────────────────────────────
+    // ── VERICTO-090: SQL injection tautology ─────────────────────────────────
 
     #[test]
     fn vetro_090_blocks_select_with_or_one_equals_one() {
         let p = parse("SELECT * FROM users WHERE id = 1 OR 1=1", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-090"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-090"), &p).is_some());
     }
 
     #[test]
@@ -686,7 +686,7 @@ mod tests {
             "SELECT * FROM users WHERE name = 'x' OR 'a'='a'",
             Dialect::Postgres,
         );
-        assert!(evaluate_rule(&make_rule("VETRO-090"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-090"), &p).is_some());
     }
 
     #[test]
@@ -695,7 +695,7 @@ mod tests {
             "DELETE FROM sessions WHERE user_id = $1 OR 1=1",
             Dialect::Postgres,
         );
-        assert!(evaluate_rule(&make_rule("VETRO-090"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-090"), &p).is_some());
     }
 
     #[test]
@@ -704,7 +704,7 @@ mod tests {
             "UPDATE users SET role = 'admin' WHERE id = 1 OR 1=1",
             Dialect::Postgres,
         );
-        assert!(evaluate_rule(&make_rule("VETRO-090"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-090"), &p).is_some());
     }
 
     #[test]
@@ -714,13 +714,13 @@ mod tests {
             "SELECT * FROM products WHERE category = 'A' OR category = 'B'",
             Dialect::Postgres,
         );
-        assert!(evaluate_rule(&make_rule("VETRO-090"), &p).is_none());
+        assert!(evaluate_rule(&make_rule("VERICTO-090"), &p).is_none());
     }
 
     #[test]
     fn vetro_090_allows_select_without_where() {
         let p = parse("SELECT * FROM config", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-090"), &p).is_none());
+        assert!(evaluate_rule(&make_rule("VERICTO-090"), &p).is_none());
     }
 
     #[test]
@@ -729,7 +729,7 @@ mod tests {
             "SELECT * FROM users WHERE id = $1 AND status = 'active'",
             Dialect::Postgres,
         );
-        assert!(evaluate_rule(&make_rule("VETRO-090"), &p).is_none());
+        assert!(evaluate_rule(&make_rule("VERICTO-090"), &p).is_none());
     }
 
     #[test]
@@ -739,17 +739,17 @@ mod tests {
             "SELECT * FROM users WHERE status = 'active' AND (role = 'user' OR 1=1)",
             Dialect::Postgres,
         );
-        assert!(evaluate_rule(&make_rule("VETRO-090"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-090"), &p).is_some());
     }
 
-    // ── VETRO-050 / VETRO-051: SELECT limit & star (Postgres path) ─────────
+    // ── VERICTO-050 / VERICTO-051: SELECT limit & star (Postgres path) ─────────
 
     #[test]
     fn vetro_050_allows_select_with_limit() {
         // Regression: `SELECT 1 LIMIT 1` was blocked because the pg_query
         // path never populated select_has_limit. It must now pass.
         let p = parse("SELECT 1 LIMIT 1", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-050"), &p).is_none());
+        assert!(evaluate_rule(&make_rule("VERICTO-050"), &p).is_none());
     }
 
     #[test]
@@ -757,33 +757,33 @@ mod tests {
         // Regression lock for the vetro-regression suite case
         // (tests/proxy/allow-safe-queries.spec.ts): a parameterized SELECT with
         // explicit columns, a WHERE, and a LIMIT must NOT be flagged by
-        // VETRO-050. This mirrors the exact query the proxy receives over the
+        // VERICTO-050. This mirrors the exact query the proxy receives over the
         // extended protocol ($1 is parsed as a ParamRef by pg_query).
         let p = parse(
             "SELECT user_id, email FROM users WHERE email = $1 LIMIT 1",
             Dialect::Postgres,
         );
         assert!(
-            evaluate_rule(&make_rule("VETRO-050"), &p).is_none(),
-            "SELECT with explicit LIMIT must not trigger VETRO-050"
+            evaluate_rule(&make_rule("VERICTO-050"), &p).is_none(),
+            "SELECT with explicit LIMIT must not trigger VERICTO-050"
         );
     }
 
     #[test]
     fn vetro_050_flags_select_without_limit() {
         let p = parse("SELECT id FROM users WHERE id = 1", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-050"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-050"), &p).is_some());
     }
 
     #[test]
     fn vetro_051_flags_select_star_without_where() {
         let p = parse("SELECT * FROM users", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-051"), &p).is_some());
+        assert!(evaluate_rule(&make_rule("VERICTO-051"), &p).is_some());
     }
 
     #[test]
     fn vetro_051_allows_select_star_with_where() {
         let p = parse("SELECT * FROM users WHERE id = 1", Dialect::Postgres);
-        assert!(evaluate_rule(&make_rule("VETRO-051"), &p).is_none());
+        assert!(evaluate_rule(&make_rule("VERICTO-051"), &p).is_none());
     }
 }

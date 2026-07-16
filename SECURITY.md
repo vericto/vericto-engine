@@ -1,6 +1,6 @@
 # Security Policy
 
-Vetro Proxy is a security product. We take vulnerabilities seriously and
+Vericto Proxy is a security product. We take vulnerabilities seriously and
 appreciate responsible disclosure.
 
 ## Reporting a vulnerability
@@ -42,4 +42,4 @@ High-priority issues for this engine include:
 Security fixes are applied to the latest released version. Older versions are
 patched at the maintainers' discretion.
 
-Thank you for helping keep Vetro and its users safe.
+Thank you for helping keep Vericto and its users safe.

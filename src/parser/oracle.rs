@@ -4,7 +4,7 @@
 //! Oracle's SQL syntax. A dedicated OracleDialect is not yet shipped in
 //! sqlparser-rs (as of 0.52), so GenericDialect covers the vast majority of
 //! DML statements (SELECT, INSERT, UPDATE, DELETE, TRUNCATE, DROP) and is
-//! sufficient for Vetro's rule evaluation.
+//! sufficient for Vericto's rule evaluation.
 //!
 //! Oracle-specific syntax that diverges from standard SQL (e.g. ROWNUM,
 //! CONNECT BY, hierarchical queries, MERGE) will parse as `PARSE_ERROR` and

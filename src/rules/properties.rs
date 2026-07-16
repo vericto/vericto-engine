@@ -393,7 +393,7 @@ mod examples {
         assert_eq!(outcome.decision, Decision::Flag);
         assert_eq!(outcome.action, Some(EnforcementAction::Flag));
         assert_eq!(outcome.severity, Some(Severity::Medium));
-        assert_eq!(outcome.rule_code.as_deref(), Some("VETRO-PARSE-ERROR"));
+        assert_eq!(outcome.rule_code.as_deref(), Some("VERICTO-PARSE-ERROR"));
     }
 
     // R5.6: parse-error fail-closed (Block) resolves to a Block decision.
@@ -435,7 +435,7 @@ mod examples {
         let parsed = parser_for(Dialect::Postgres)
             .parse("SELECT id FROM users")
             .expect("must parse");
-        let r = rule("VETRO-050", Severity::Medium, EnforcementAction::Flag);
+        let r = rule("VERICTO-050", Severity::Medium, EnforcementAction::Flag);
         let outcome = RuleEngine::evaluate(
             &parsed,
             std::slice::from_ref(&r),
@@ -445,8 +445,8 @@ mod examples {
         assert_eq!(outcome.decision, Decision::Flag);
         assert_eq!(outcome.action, Some(EnforcementAction::Flag));
         assert_eq!(outcome.severity, Some(Severity::Medium));
-        assert_eq!(outcome.rule_id.as_deref(), Some("VETRO-050"));
-        assert_eq!(outcome.rule_code.as_deref(), Some("VETRO-050"));
+        assert_eq!(outcome.rule_id.as_deref(), Some("VERICTO-050"));
+        assert_eq!(outcome.rule_code.as_deref(), Some("VERICTO-050"));
         assert!(outcome.ast_node_path.is_some());
     }
 
@@ -456,7 +456,7 @@ mod examples {
         let parsed = parser_for(Dialect::Postgres)
             .parse("SELECT id FROM users LIMIT 10")
             .expect("must parse");
-        let r = rule("VETRO-050", Severity::Medium, EnforcementAction::Flag);
+        let r = rule("VERICTO-050", Severity::Medium, EnforcementAction::Flag);
         let outcome = RuleEngine::evaluate(
             &parsed,
             std::slice::from_ref(&r),
@@ -477,7 +477,7 @@ mod examples {
         let parsed = parser_for(Dialect::Postgres)
             .parse("SELECT id FROM users")
             .expect("must parse");
-        let r = rule("VETRO-050", Severity::Medium, EnforcementAction::Flag);
+        let r = rule("VERICTO-050", Severity::Medium, EnforcementAction::Flag);
         let policy = EnforcementPolicy {
             medium: EnforcementAction::Block,
             ..EnforcementPolicy::default()

@@ -6,7 +6,7 @@
 //! statements, including those nested in data-modifying CTEs
 //! (`WITH x AS (DELETE ...)`).
 //!
-//! This guarantees full fidelity: what Vetro analyses is identical to what
+//! This guarantees full fidelity: what Vericto analyses is identical to what
 //! PostgreSQL would execute, and any query with invalid syntax is blocked as
 //! `PARSE_ERROR` before reaching the database.
 

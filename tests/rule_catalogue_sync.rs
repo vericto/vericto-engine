@@ -2,7 +2,7 @@
 //! codes actually implemented in `src/rules/evaluator.rs`.
 //!
 //! The README table is hand-maintained documentation; this test fails the build
-//! if a `VETRO-*` match arm is added/removed in the evaluator without the
+//! if a `VERICTO-*` match arm is added/removed in the evaluator without the
 //! corresponding README row (or vice-versa), so the two never silently diverge.
 //!
 //! Both files are pulled in at compile time via `include_str!`, so the test runs
@@ -13,20 +13,20 @@ use std::collections::BTreeSet;
 const EVALUATOR_SRC: &str = include_str!("../src/rules/evaluator.rs");
 const README_SRC: &str = include_str!("../README.md");
 
-/// Extract the `VETRO-NNN` token starting at `start` (assumes `bytes[start..]`
-/// begins with `VETRO-`). Returns the code and the index just past it.
+/// Extract the `VERICTO-NNN` token starting at `start` (assumes `bytes[start..]`
+/// begins with `VERICTO-`). Returns the code and the index just past it.
 fn take_code(s: &str) -> Option<&str> {
-    // `s` starts at "VETRO-"; the code is "VETRO-" followed by ASCII digits.
-    let rest = s.strip_prefix("VETRO-")?;
+    // `s` starts at "VERICTO-"; the code is "VERICTO-" followed by ASCII digits.
+    let rest = s.strip_prefix("VERICTO-")?;
     let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
     if digits == 0 {
         return None;
     }
-    Some(&s[.."VETRO-".len() + digits])
+    Some(&s[.."VERICTO-".len() + digits])
 }
 
 /// Rule codes that have a built-in match arm in `evaluate_builtin`.
-/// A match arm is a line that, trimmed, looks like `"VETRO-NNN" =>`.
+/// A match arm is a line that, trimmed, looks like `"VERICTO-NNN" =>`.
 fn codes_in_evaluator() -> BTreeSet<String> {
     EVALUATOR_SRC
         .lines()
@@ -46,7 +46,7 @@ fn codes_in_evaluator() -> BTreeSet<String> {
 }
 
 /// Rule codes documented in the README catalogue.
-/// A catalogue row is a table line that, trimmed, starts with `| VETRO-NNN `.
+/// A catalogue row is a table line that, trimmed, starts with `| VERICTO-NNN `.
 fn codes_in_readme() -> BTreeSet<String> {
     README_SRC
         .lines()

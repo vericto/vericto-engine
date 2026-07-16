@@ -1,8 +1,8 @@
 //! Walker of the `pg_query` protobuf AST (libpg_query, PostgreSQL's internal
-//! parser) into Vetro's normalized representation.
+//! parser) into Vericto's normalized representation.
 //!
 //! Unlike `walk.rs` (which uses the sqlparser-rs AST), this module operates on
-//! the exact syntax tree PostgreSQL would produce, guaranteeing that what Vetro
+//! the exact syntax tree PostgreSQL would produce, guaranteeing that what Vericto
 //! analyses is identical to what the engine would execute. It detects DELETE,
 //! UPDATE, DROP, and TRUNCATE — including those nested inside data-modifying
 //! CTEs (`WITH x AS (DELETE ...)`), which sqlparser-rs does not handle.
@@ -85,7 +85,7 @@ fn walk_node(
             });
         }
 
-        // ALTER TABLE … DROP COLUMN (VETRO-015). libpg_query emits an
+        // ALTER TABLE … DROP COLUMN (VERICTO-015). libpg_query emits an
         // AlterTableStmt whose `cmds` carry the subtype; RENAME is a separate
         // RenameStmt node handled below.
         NodeEnum::AlterTableStmt(stmt) => {
@@ -128,7 +128,7 @@ fn walk_node(
             }
         }
 
-        // ALTER TABLE … RENAME TO / RENAME COLUMN (VETRO-016). PostgreSQL
+        // ALTER TABLE … RENAME TO / RENAME COLUMN (VERICTO-016). PostgreSQL
         // models renames as a dedicated RenameStmt rather than an
         // AlterTableCmd subtype.
         NodeEnum::RenameStmt(stmt) => {
@@ -160,7 +160,7 @@ fn walk_node(
             walk_select_stmt(stmt, is_nested, depth, out)?;
         }
 
-        // ── DROP DATABASE (VETRO-010) ──────────────────────────────────────
+        // ── DROP DATABASE (VERICTO-010) ──────────────────────────────────────
         // libpg_query models `DROP DATABASE` as its own `DropdbStmt`, *not* a
         // `DropStmt`, so it previously fell through to `_ => {}` and was
         // silently allowed (ENG-004).
@@ -174,7 +174,7 @@ fn walk_node(
             });
         }
 
-        // ── COPY … TO/FROM PROGRAM (VETRO-080) ─────────────────────────────
+        // ── COPY … TO/FROM PROGRAM (VERICTO-080) ─────────────────────────────
         // `COPY t TO PROGRAM 'cmd'` / `COPY t FROM PROGRAM 'cmd'` executes a
         // shell command on the database host — remote code execution and a
         // data-exfiltration channel. The plain file/STDIN forms are recorded
@@ -200,7 +200,7 @@ fn walk_node(
             }
         }
 
-        // ── DO $$ … $$ anonymous code block (VETRO-081) ────────────────────
+        // ── DO $$ … $$ anonymous code block (VERICTO-081) ────────────────────
         // A `DO` block runs an arbitrary PL/pgSQL body that can perform any
         // DML/DDL (e.g. `DO $$ BEGIN DELETE FROM users; END $$`). The body is
         // an opaque string to the SQL parser, so we cannot see *what* it does —
@@ -214,7 +214,7 @@ fn walk_node(
             });
         }
 
-        // ── GRANT / REVOKE (VETRO-082) ─────────────────────────────────────
+        // ── GRANT / REVOKE (VERICTO-082) ─────────────────────────────────────
         // Privilege changes (escalation or accidental lockout). `is_grant`
         // distinguishes GRANT from REVOKE; both are recorded.
         NodeEnum::GrantStmt(_) => {
@@ -226,7 +226,7 @@ fn walk_node(
             });
         }
 
-        // ── MERGE (VETRO-083) ──────────────────────────────────────────────
+        // ── MERGE (VERICTO-083) ──────────────────────────────────────────────
         // `MERGE INTO t USING s … WHEN MATCHED THEN UPDATE/DELETE` can mutate
         // every row of the target, like an UPDATE/DELETE with no effective
         // WHERE. The join condition is walked so nested tautologies still trip.
@@ -241,7 +241,7 @@ fn walk_node(
             walk_with_clause(stmt.with_clause.as_ref(), depth + 1, out)?;
         }
 
-        // ── CREATE TABLE … AS SELECT … / SELECT … INTO (VETRO-084) ─────────
+        // ── CREATE TABLE … AS SELECT … / SELECT … INTO (VERICTO-084) ─────────
         // Bulk data copy that can duplicate an entire table. The inner query is
         // walked so an unbounded/`SELECT *` source is also surfaced.
         NodeEnum::CreateTableAsStmt(stmt) => {
@@ -270,8 +270,8 @@ fn walk_node(
             // `INSERT … SELECT …` as `select_stmt = Some(SelectStmt)`. The two
             // are distinguished by whether that SelectStmt is a pure VALUES list
             // (`values_lists` non-empty, no FROM/targets) or a real query.
-            //   - VALUES → count the tuples for VETRO-061 (insert_row_count).
-            //   - real SELECT → set insert_has_select for VETRO-040.
+            //   - VALUES → count the tuples for VERICTO-061 (insert_row_count).
+            //   - real SELECT → set insert_has_select for VERICTO-040.
             let mut insert_has_select = false;
             let mut insert_row_count = None;
             if let Some(sel) = stmt.select_stmt.as_deref() {
@@ -342,7 +342,7 @@ fn walk_with_clause(
 /// Previously only the top-level SELECT was recorded (`if !is_nested`), so a
 /// tautology or `SELECT *` buried in a subquery / CTE body / `INSERT … SELECT`
 /// source was never seen (ENG-005). We now push a `StatementInfo` for *every*
-/// SELECT, preserving `is_nested` so rule scoping (e.g. VETRO-050) can still
+/// SELECT, preserving `is_nested` so rule scoping (e.g. VERICTO-050) can still
 /// distinguish the client-visible top-level read from inner scans.
 fn walk_select_stmt(
     stmt: &pg_query::protobuf::SelectStmt,
@@ -386,7 +386,7 @@ fn walk_select_stmt(
 
     walk_with_clause(stmt.with_clause.as_ref(), depth + 1, out)?;
 
-    // Projection list (VETRO-070: `SELECT pg_sleep(5)`) and any expression
+    // Projection list (VERICTO-070: `SELECT pg_sleep(5)`) and any expression
     // sub-selects inside it.
     for target in &stmt.target_list {
         scan_expr(target.node.as_ref(), depth + 1, out)?;
@@ -442,7 +442,7 @@ fn scan_from_item(
 }
 
 /// Recursively scan an expression node for (a) sleep-family function calls
-/// (VETRO-070) and (b) sub-link sub-selects (so a tautology/star inside a
+/// (VERICTO-070) and (b) sub-link sub-selects (so a tautology/star inside a
 /// scalar/IN/EXISTS subquery is recorded). Bounded by `MAX_AST_DEPTH`.
 fn scan_expr(node: Option<&NodeEnum>, depth: usize, out: &mut Vec<StatementInfo>) -> Result<()> {
     if depth > MAX_AST_DEPTH {
@@ -739,7 +739,7 @@ fn column_ref_path(col: &pg_query::protobuf::ColumnRef) -> String {
 }
 
 /// Returns `true` when a WHERE predicate contains a trivially-true OR branch
-/// at any depth (e.g. `id = $1 OR 1=1`). Used by VETRO-090 to detect the
+/// at any depth (e.g. `id = $1 OR 1=1`). Used by VERICTO-090 to detect the
 /// canonical SQL injection tautology on the PostgreSQL path. Mirrors the
 /// sqlparser walker so behaviour is identical across dialects.
 fn where_has_or_tautology(where_clause: Option<&Node>) -> bool {
@@ -873,11 +873,11 @@ mod tests {
         assert!(parse_postgres("DELETE FORM users").is_err());
     }
 
-    // ── SELECT attribute population (VETRO-050 / VETRO-051) ─────────────────
+    // ── SELECT attribute population (VERICTO-050 / VERICTO-051) ─────────────────
 
     #[test]
     fn select_with_limit_sets_has_limit() {
-        // `SELECT 1 LIMIT 1` must record a LIMIT so VETRO-050 does not fire.
+        // `SELECT 1 LIMIT 1` must record a LIMIT so VERICTO-050 does not fire.
         let parsed = parse_postgres("SELECT 1 LIMIT 1").unwrap();
         let select = parsed
             .statements

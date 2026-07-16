@@ -1,4 +1,4 @@
-//! Vetro proxy error types.
+//! Vericto proxy error types.
 //!
 //! `ProxyError` covers failures in the AST evaluation path. Parse errors get
 //! special treatment: a query that does not parse is blocked as a precaution
@@ -15,25 +15,25 @@ pub const MAX_AST_DEPTH: usize = 50;
 #[derive(Debug, Error)]
 pub enum ProxyError {
     /// The SQL query has invalid or malformed syntax.
-    /// Client-facing code: `VETRO-PARSE-ERROR`.
-    #[error("VETRO-PARSE-ERROR: {0}")]
+    /// Client-facing code: `VERICTO-PARSE-ERROR`.
+    #[error("VERICTO-PARSE-ERROR: {0}")]
     ParseError(String),
 
     /// The query exceeds the maximum allowed size (64KB).
-    #[error("VETRO-QUERY-TOO-LARGE: query exceeds the {MAX_QUERY_SIZE_BYTES} byte limit")]
+    #[error("VERICTO-QUERY-TOO-LARGE: query exceeds the {MAX_QUERY_SIZE_BYTES} byte limit")]
     QueryTooLarge,
 
     /// The AST exceeds the maximum nesting depth (50 levels).
     /// Possible evasion attempt via excessive nesting.
-    #[error("VETRO-AST-TOO-DEEP: AST exceeds the maximum depth of {MAX_AST_DEPTH} levels")]
+    #[error("VERICTO-AST-TOO-DEEP: AST exceeds the maximum depth of {MAX_AST_DEPTH} levels")]
     AstTooDeep,
 
     /// Unsupported dialect.
-    #[error("VETRO-UNSUPPORTED-DIALECT: dialect '{0}' is not supported")]
+    #[error("VERICTO-UNSUPPORTED-DIALECT: dialect '{0}' is not supported")]
     UnsupportedDialect(String),
 
     /// A custom YAML rule is malformed.
-    #[error("VETRO-INVALID-RULE: invalid custom rule: {0}")]
+    #[error("VERICTO-INVALID-RULE: invalid custom rule: {0}")]
     InvalidCustomRule(String),
 }
 

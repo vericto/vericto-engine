@@ -1,4 +1,4 @@
-//! Converts `sqlparser-rs` ASTs to Vetro's normalized representation.
+//! Converts `sqlparser-rs` ASTs to Vericto's normalized representation.
 //!
 //! Walks the syntax tree in depth detecting destructive statements (DELETE,
 //! UPDATE, DROP, TRUNCATE, ALTER TABLE) at root level and nested inside
@@ -224,7 +224,7 @@ fn walk_statement(
             }
         }
 
-        // ── COPY … TO/FROM PROGRAM (VETRO-080) ─────────────────────────────
+        // ── COPY … TO/FROM PROGRAM (VERICTO-080) ─────────────────────────────
         // The PROGRAM target/source runs a shell command on the server (RCE /
         // exfiltration). Non-program forms are still recorded for telemetry.
         Statement::Copy { target, .. } => {
@@ -242,7 +242,7 @@ fn walk_statement(
             });
         }
 
-        // ── GRANT / REVOKE (VETRO-082) ─────────────────────────────────────
+        // ── GRANT / REVOKE (VERICTO-082) ─────────────────────────────────────
         Statement::Grant { .. } | Statement::Revoke { .. } => {
             out.push(StatementInfo {
                 kind: StatementKind::Grant,
@@ -252,7 +252,7 @@ fn walk_statement(
             });
         }
 
-        // ── MERGE (VETRO-083) ──────────────────────────────────────────────
+        // ── MERGE (VERICTO-083) ──────────────────────────────────────────────
         Statement::Merge { table, .. } => {
             out.push(StatementInfo {
                 kind: StatementKind::Merge,
@@ -304,7 +304,7 @@ fn walk_query(
     // (ANSI/Oracle 12c+), or TOP (MSSQL/Sybase — lives on the Select node). The
     // bound belongs to the enclosing Query, so we resolve it here and thread it
     // into the SELECT node, fixing ENG-001 (every non-PG SELECT was flagged by
-    // VETRO-050 because `select_has_limit` was hard-coded to `false`).
+    // VERICTO-050 because `select_has_limit` was hard-coded to `false`).
     let has_limit = query.limit.is_some() || query.fetch.is_some();
 
     walk_set_expr(query.body.as_ref(), is_nested, has_limit, depth + 1, out)?;
@@ -358,7 +358,7 @@ fn walk_set_expr(
 
             // Record EVERY select, nested or not (ENG-005). A `SELECT *` or an
             // `OR 1=1` tautology hiding in a subquery / CTE body must be seen by
-            // VETRO-051 / VETRO-090. `is_nested` is preserved so VETRO-050
+            // VERICTO-051 / VERICTO-090. `is_nested` is preserved so VERICTO-050
             // (unbounded read) can stay scoped to the client-visible top-level
             // query and not flag every inner scan as missing a LIMIT.
             out.push(StatementInfo {

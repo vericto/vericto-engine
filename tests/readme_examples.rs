@@ -3,13 +3,13 @@
 
 #[test]
 fn quick_example() {
-    use vetro_engine::{
+    use vericto_engine::{
         evaluate, Decision, Dialect, EnforcementAction, EnforcementPolicy, Rule, RuleType, Severity,
     };
 
     let rules = vec![Rule {
         rule_id: "r1".into(),
-        code: "VETRO-001".into(),
+        code: "VERICTO-001".into(),
         severity: Severity::Critical,
         default_action: EnforcementAction::Block,
         rule_type: RuleType::Standard,
@@ -19,7 +19,7 @@ fn quick_example() {
     let policy = EnforcementPolicy::default();
     let outcome = evaluate("DELETE FROM users", Dialect::Postgres, &rules, &policy);
     assert_eq!(outcome.decision, Decision::Block);
-    assert_eq!(outcome.rule_code.as_deref(), Some("VETRO-001"));
+    assert_eq!(outcome.rule_code.as_deref(), Some("VERICTO-001"));
     assert_eq!(
         outcome.ast_node_path.as_deref(),
         Some("DeleteStmt > WhereClause = NULL")
@@ -28,8 +28,8 @@ fn quick_example() {
 
 #[test]
 fn full_ruleset_example() {
-    use vetro_engine::rules::engine::{Decision, Rule};
-    use vetro_engine::{evaluate, Dialect, EnforcementPolicy};
+    use vericto_engine::rules::engine::{Decision, Rule};
+    use vericto_engine::{evaluate, Dialect, EnforcementPolicy};
 
     fn is_safe(sql: &str, rules: &[Rule], policy: &EnforcementPolicy) -> bool {
         evaluate(sql, Dialect::Postgres, rules, policy).decision == Decision::Allow
@@ -44,7 +44,7 @@ fn full_ruleset_example() {
 
 #[test]
 fn custom_rule_example() {
-    use vetro_engine::rules::engine::{EnforcementAction, Rule, RuleType, Severity};
+    use vericto_engine::rules::engine::{EnforcementAction, Rule, RuleType, Severity};
 
     let _custom = Rule {
         rule_id: "custom-1".into(),
@@ -66,8 +66,8 @@ where_null: true
 
 #[test]
 fn custom_rule_example_scopes_correctly() {
-    use vetro_engine::rules::engine::{EnforcementAction, Rule, RuleType, Severity};
-    use vetro_engine::{evaluate, Decision, Dialect, EnforcementPolicy};
+    use vericto_engine::rules::engine::{EnforcementAction, Rule, RuleType, Severity};
+    use vericto_engine::{evaluate, Decision, Dialect, EnforcementPolicy};
 
     let custom = Rule {
         rule_id: "custom-1".into(),

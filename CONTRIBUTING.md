@@ -1,14 +1,14 @@
-# Contributing to vetro-engine
+# Contributing to vericto-engine
 
-Thank you for your interest in contributing to the Vetro AST evaluation engine.
+Thank you for your interest in contributing to the Vericto AST evaluation engine.
 
 ## What belongs here
 
-`vetro-engine` is a **library crate** — it contains only the SQL parser and rule
+`vericto-engine` is a **library crate** — it contains only the SQL parser and rule
 evaluation logic. Contributions that fit here:
 
 - New or improved SQL dialect support (parser backends)
-- New standard rule implementations (`VETRO-*` codes in `rules/evaluator.rs`)
+- New standard rule implementations (`VERICTO-*` codes in `rules/evaluator.rs`)
 - Bug fixes in AST normalization or rule evaluation
 - Performance improvements to the parsing or evaluation path
 - Tests and documentation
@@ -21,8 +21,8 @@ Contributions that belong elsewhere:
 ## Getting started
 
 ```bash
-git clone https://github.com/donkan168/vetro-engine
-cd vetro-engine
+git clone https://github.com/donkan168/vericto-engine
+cd vericto-engine
 
 # Build
 cargo build

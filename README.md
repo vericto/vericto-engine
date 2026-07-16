@@ -1,12 +1,12 @@
-# vetro-engine
+# vericto-engine
 
-> Deterministic SQL AST evaluation engine — the open core of [Vetro](https://vetro.dev).
+> Deterministic SQL AST evaluation engine — the open core of [Vericto](https://vetro.dev).
 
-[![CI](https://github.com/donkan168/vetro-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/donkan168/vetro-engine/actions/workflows/ci.yml)
+[![CI](https://github.com/donkan168/vericto-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/donkan168/vericto-engine/actions/workflows/ci.yml)
 [![License: ELv2](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](LICENSE)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
-`vetro-engine` parses every SQL query into its full Abstract Syntax Tree using
+`vericto-engine` parses every SQL query into its full Abstract Syntax Tree using
 [pg_query](https://github.com/pganalyze/pg_query.rs) (PostgreSQL's own internal
 parser) and [sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs), then
 evaluates it against a ruleset **deterministically** — same input always produces
@@ -14,7 +14,7 @@ the same result, no ML, no thresholds, no false positives.
 
 This crate is consumed by:
 - **[vetro-proxy](https://github.com/donkan168/vetro-proxy)** — TCP wire-protocol proxy deployed in customer infrastructure
-- **vetro-eval** (private) — HTTP evaluation sidecar used by the Vetro SaaS API
+- **vetro-eval** (private) — HTTP evaluation sidecar used by the Vericto SaaS API
 
 ---
 
@@ -24,19 +24,19 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vetro-engine = { git = "https://github.com/donkan168/vetro-engine", tag = "v2.1.0" }
+vericto-engine = { git = "https://github.com/donkan168/vericto-engine", tag = "v2.1.0" }
 ```
 
 ### Quick example
 
 ```rust
-use vetro_engine::{
+use vericto_engine::{
     evaluate, Decision, Dialect, EnforcementAction, EnforcementPolicy, Rule, RuleType, Severity,
 };
 
 let rules = vec![Rule {
     rule_id: "r1".into(),
-    code: "VETRO-001".into(),          // DELETE without WHERE
+    code: "VERICTO-001".into(),          // DELETE without WHERE
     severity: Severity::Critical,
     default_action: EnforcementAction::Block,
     rule_type: RuleType::Standard,
@@ -48,15 +48,15 @@ let rules = vec![Rule {
 let policy = EnforcementPolicy::default();
 let outcome = evaluate("DELETE FROM users", Dialect::Postgres, &rules, &policy);
 assert_eq!(outcome.decision, Decision::Block);
-assert_eq!(outcome.rule_code.as_deref(), Some("VETRO-001"));
+assert_eq!(outcome.rule_code.as_deref(), Some("VERICTO-001"));
 assert_eq!(outcome.ast_node_path.as_deref(), Some("DeleteStmt > WhereClause = NULL"));
 ```
 
 ### Evaluate with a full ruleset
 
 ```rust
-use vetro_engine::{evaluate, Dialect, EnforcementPolicy};
-use vetro_engine::rules::engine::{Decision, Rule};
+use vericto_engine::{evaluate, Dialect, EnforcementPolicy};
+use vericto_engine::rules::engine::{Decision, Rule};
 
 fn is_safe(sql: &str, rules: &[Rule], policy: &EnforcementPolicy) -> bool {
     evaluate(sql, Dialect::Postgres, rules, policy).decision == Decision::Allow
@@ -76,7 +76,7 @@ fn is_safe(sql: &str, rules: &[Rule], policy: &EnforcementPolicy) -> bool {
 
 ---
 
-## Standard rules (VETRO-*)
+## Standard rules (VERICTO-*)
 
 Standard rules are identified by code and evaluated by built-in Rust logic — no
 YAML required. The complete catalogue is below, grouped by severity. Each rule
@@ -92,49 +92,49 @@ Low/Informational → Monitor).
 
 | Code | Name | What it detects |
 |---|---|---|
-| VETRO-001 | DELETE without WHERE | A `DELETE` with no `WHERE` — removes every row of the table. |
-| VETRO-003 | DELETE with always-true WHERE | A `DELETE` whose `WHERE` is trivially true (`1=1`, `id = id`, `NOT FALSE`, `WHERE 1`) — semantically WHERE-less. |
-| VETRO-010 | DROP TABLE / DATABASE | `DROP TABLE` or `DROP DATABASE` — irreversible loss of a relation/database. Excludes `INDEX` (VETRO-013) and `SCHEMA` (VETRO-012). |
-| VETRO-011 | TRUNCATE TABLE | `TRUNCATE` — empties a table, non-transactional/unfiltered by design. |
-| VETRO-012 | DROP SCHEMA | `DROP SCHEMA` — drops a whole namespace and everything in it. |
-| VETRO-030 | UPDATE without WHERE (primary tables) | An `UPDATE` with no effective `WHERE`. Same predicate as VETRO-042; separate code so a workspace can scope/severity it independently. |
-| VETRO-042 | UPDATE without WHERE | An `UPDATE` with no `WHERE` (or an always-true one) — rewrites every row. |
-| VETRO-080 | COPY … TO/FROM PROGRAM | `COPY … PROGRAM '…'` runs a shell command on the database host — remote code execution / data-exfiltration channel. (PostgreSQL.) |
-| VETRO-081 | DO anonymous code block | `DO $$ … $$` runs an arbitrary PL/pgSQL body that can hide any DML/DDL; opaque to the SQL parser. (PostgreSQL.) |
-| VETRO-090 | OR tautology in WHERE (SQL injection) | A `WHERE` with a trivially-true `OR` branch (`… OR 1=1`) — the canonical injection bypass. Covers SELECT/DELETE/UPDATE at any depth. |
+| VERICTO-001 | DELETE without WHERE | A `DELETE` with no `WHERE` — removes every row of the table. |
+| VERICTO-003 | DELETE with always-true WHERE | A `DELETE` whose `WHERE` is trivially true (`1=1`, `id = id`, `NOT FALSE`, `WHERE 1`) — semantically WHERE-less. |
+| VERICTO-010 | DROP TABLE / DATABASE | `DROP TABLE` or `DROP DATABASE` — irreversible loss of a relation/database. Excludes `INDEX` (VERICTO-013) and `SCHEMA` (VERICTO-012). |
+| VERICTO-011 | TRUNCATE TABLE | `TRUNCATE` — empties a table, non-transactional/unfiltered by design. |
+| VERICTO-012 | DROP SCHEMA | `DROP SCHEMA` — drops a whole namespace and everything in it. |
+| VERICTO-030 | UPDATE without WHERE (primary tables) | An `UPDATE` with no effective `WHERE`. Same predicate as VERICTO-042; separate code so a workspace can scope/severity it independently. |
+| VERICTO-042 | UPDATE without WHERE | An `UPDATE` with no `WHERE` (or an always-true one) — rewrites every row. |
+| VERICTO-080 | COPY … TO/FROM PROGRAM | `COPY … PROGRAM '…'` runs a shell command on the database host — remote code execution / data-exfiltration channel. (PostgreSQL.) |
+| VERICTO-081 | DO anonymous code block | `DO $$ … $$` runs an arbitrary PL/pgSQL body that can hide any DML/DDL; opaque to the SQL parser. (PostgreSQL.) |
+| VERICTO-090 | OR tautology in WHERE (SQL injection) | A `WHERE` with a trivially-true `OR` branch (`… OR 1=1`) — the canonical injection bypass. Covers SELECT/DELETE/UPDATE at any depth. |
 
 ### High
 
 | Code | Name | What it detects |
 |---|---|---|
-| VETRO-002 | DELETE with LIMIT 0 | A `DELETE … LIMIT 0` — deletes nothing, usually a misconfigured scope. (MySQL/SQLite; no `DELETE … LIMIT` syntax on PostgreSQL.) |
-| VETRO-013 | DROP INDEX without IF EXISTS | `DROP INDEX` lacking `IF EXISTS` — errors if the index is missing, breaking scripts. |
-| VETRO-015 | ALTER TABLE DROP COLUMN | Drops a column — irreversible data loss. |
-| VETRO-016 | ALTER TABLE RENAME | Renames a table or column — breaks any code referencing the old name. |
-| VETRO-017 | ALTER TABLE DROP CONSTRAINT | Drops a FK/PK/CHECK (or `DROP PRIMARY KEY`) — silently removes a data-integrity invariant. |
-| VETRO-018 | ALTER TABLE ALTER COLUMN TYPE | Changes a column type — table rewrite, potentially lossy/blocking cast. |
-| VETRO-019 | ALTER TABLE DISABLE TRIGGER / RLS | `DISABLE TRIGGER` or `DISABLE ROW LEVEL SECURITY` — disables a protection. |
-| VETRO-031 | UPDATE in CTE without WHERE | A data-modifying CTE (`WITH x AS (UPDATE … )`) whose `UPDATE` has no WHERE. |
-| VETRO-033 | DELETE in subquery/CTE without WHERE | A nested `DELETE` with no WHERE inside a subquery or CTE. |
-| VETRO-040 | INSERT INTO … SELECT without filter | `INSERT … SELECT` whose source has no filter — copies every source row. |
-| VETRO-070 | SLEEP() / PG_SLEEP() | A sleep-family call (`sleep`, `pg_sleep`, `pg_sleep_for`, `pg_sleep_until`) anywhere in the query — DoS / time-based blind injection probing. |
-| VETRO-082 | GRANT / REVOKE | A `GRANT` or `REVOKE` — privilege escalation or accidental lockout. |
-| VETRO-083 | MERGE | `MERGE INTO …` — can mass-mutate the target like an UPDATE/DELETE with no effective WHERE. |
-| VETRO-084 | CREATE TABLE AS SELECT | `CREATE TABLE … AS SELECT …` / `SELECT … INTO` — bulk data copy that can duplicate a whole table. |
+| VERICTO-002 | DELETE with LIMIT 0 | A `DELETE … LIMIT 0` — deletes nothing, usually a misconfigured scope. (MySQL/SQLite; no `DELETE … LIMIT` syntax on PostgreSQL.) |
+| VERICTO-013 | DROP INDEX without IF EXISTS | `DROP INDEX` lacking `IF EXISTS` — errors if the index is missing, breaking scripts. |
+| VERICTO-015 | ALTER TABLE DROP COLUMN | Drops a column — irreversible data loss. |
+| VERICTO-016 | ALTER TABLE RENAME | Renames a table or column — breaks any code referencing the old name. |
+| VERICTO-017 | ALTER TABLE DROP CONSTRAINT | Drops a FK/PK/CHECK (or `DROP PRIMARY KEY`) — silently removes a data-integrity invariant. |
+| VERICTO-018 | ALTER TABLE ALTER COLUMN TYPE | Changes a column type — table rewrite, potentially lossy/blocking cast. |
+| VERICTO-019 | ALTER TABLE DISABLE TRIGGER / RLS | `DISABLE TRIGGER` or `DISABLE ROW LEVEL SECURITY` — disables a protection. |
+| VERICTO-031 | UPDATE in CTE without WHERE | A data-modifying CTE (`WITH x AS (UPDATE … )`) whose `UPDATE` has no WHERE. |
+| VERICTO-033 | DELETE in subquery/CTE without WHERE | A nested `DELETE` with no WHERE inside a subquery or CTE. |
+| VERICTO-040 | INSERT INTO … SELECT without filter | `INSERT … SELECT` whose source has no filter — copies every source row. |
+| VERICTO-070 | SLEEP() / PG_SLEEP() | A sleep-family call (`sleep`, `pg_sleep`, `pg_sleep_for`, `pg_sleep_until`) anywhere in the query — DoS / time-based blind injection probing. |
+| VERICTO-082 | GRANT / REVOKE | A `GRANT` or `REVOKE` — privilege escalation or accidental lockout. |
+| VERICTO-083 | MERGE | `MERGE INTO …` — can mass-mutate the target like an UPDATE/DELETE with no effective WHERE. |
+| VERICTO-084 | CREATE TABLE AS SELECT | `CREATE TABLE … AS SELECT …` / `SELECT … INTO` — bulk data copy that can duplicate a whole table. |
 
 ### Medium
 
 | Code | Name | What it detects |
 |---|---|---|
-| VETRO-050 | SELECT without LIMIT | A top-level `SELECT` with no `LIMIT`/`FETCH`/`TOP` — unbounded read. Scoped to the client-visible query, not inner subqueries. |
-| VETRO-051 | SELECT * without WHERE | `SELECT *` with no `WHERE` — unfiltered full-column scan; detected at any nesting depth. |
-| VETRO-061 | INSERT batch > 10k rows | `INSERT … VALUES` with more than 10,000 row tuples — oversized batch. |
+| VERICTO-050 | SELECT without LIMIT | A top-level `SELECT` with no `LIMIT`/`FETCH`/`TOP` — unbounded read. Scoped to the client-visible query, not inner subqueries. |
+| VERICTO-051 | SELECT * without WHERE | `SELECT *` with no `WHERE` — unfiltered full-column scan; detected at any nesting depth. |
+| VERICTO-061 | INSERT batch > 10k rows | `INSERT … VALUES` with more than 10,000 row tuples — oversized batch. |
 
 ### Low
 
 | Code | Name | What it detects |
 |---|---|---|
-| VETRO-060 | INSERT without explicit columns | `INSERT` with no explicit column list — relies on column order, breaks on schema change. |
+| VERICTO-060 | INSERT without explicit columns | `INSERT` with no explicit column list — relies on column order, breaks on schema change. |
 
 The host application owns the rule *catalogue* (which codes are active, with
 what severity/action per workspace); the engine owns the *detection logic*. The
@@ -152,7 +152,7 @@ schema qualifier and quoting), and `where_null` (optional — when `true`, only
 matches statements with no WHERE clause):
 
 ```rust
-use vetro_engine::rules::engine::{EnforcementAction, Rule, RuleType, Severity};
+use vericto_engine::rules::engine::{EnforcementAction, Rule, RuleType, Severity};
 
 let custom = Rule {
     rule_id: "custom-1".into(),
@@ -174,7 +174,7 @@ where_null: true
 ## Architecture
 
 ```
-vetro-engine/
+vericto-engine/
 ├── src/
 │   ├── lib.rs          ← public API + evaluate() convenience fn
 │   ├── error.rs        ← ProxyError, Result
@@ -189,7 +189,7 @@ vetro-engine/
 │   └── rules/
 │       ├── mod.rs
 │       ├── engine.rs    ← Rule, RuleEngine, Decision, EnforcementPolicy, EvaluationOutcome
-│       ├── evaluator.rs ← per-rule evaluation logic (VETRO-* codes)
+│       ├── evaluator.rs ← per-rule evaluation logic (VERICTO-* codes)
 │       └── properties.rs ← property-based tests (test-only)
 └── tests/               ← integration tests (audit regression, README↔code sync)
 ```
