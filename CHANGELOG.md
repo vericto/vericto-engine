@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Migrated to Rust edition 2024** (`edition = "2021"` → `"2024"`). No source
+  changes were required beyond rustfmt's edition-2024 import/format style; the
+  toolchain is already pinned to 1.88, which supports the 2024 edition. Public
+  API and behaviour are unchanged.
+- Updated the `repository` URL and README links from `donkan168/vericto-engine`
+  to `vericto/vericto-engine` to reflect the repository transfer.
+
 ## [3.1.0] — 2026-07-29
 
 Custom-rule (YAML) evaluation now implements the full predicate schema

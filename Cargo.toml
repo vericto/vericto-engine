@@ -1,11 +1,11 @@
 [package]
 name = "vericto-engine"
 version = "3.1.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.88"
 description = "Vericto — Deterministic SQL AST evaluation engine (open core)"
 license = "Elastic-2.0"
-repository = "https://github.com/donkan168/vericto-engine"
+repository = "https://github.com/vericto/vericto-engine"
 readme = "README.md"
 keywords = ["sql", "security", "ast", "parser", "llm"]
 categories = ["database", "parser-implementations"]

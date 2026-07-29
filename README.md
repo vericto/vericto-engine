@@ -2,7 +2,7 @@
 
 > Deterministic SQL AST evaluation engine — the open core of [Vericto](https://vetro.dev).
 
-[![CI](https://github.com/donkan168/vericto-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/donkan168/vericto-engine/actions/workflows/ci.yml)
+[![CI](https://github.com/vericto/vericto-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/vericto/vericto-engine/actions/workflows/ci.yml)
 [![License: ELv2](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](LICENSE)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/donkan168/vericto-engine", tag = "v2.1.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.1.0" }
 ```
 
 ### Quick example
