@@ -936,8 +936,14 @@ mod tests {
         let rule = make_custom_rule(
             "rule: block-select-star\nnode_type: SelectStmt\ncondition:\n  target_list: \"*\"",
         );
-        assert!(evaluate_rule(&rule, &parse("SELECT * FROM payments", Dialect::Postgres)).is_some());
-        assert!(evaluate_rule(&rule, &parse("SELECT id, email FROM payments", Dialect::Postgres)).is_none());
+        assert!(
+            evaluate_rule(&rule, &parse("SELECT * FROM payments", Dialect::Postgres)).is_some()
+        );
+        assert!(evaluate_rule(
+            &rule,
+            &parse("SELECT id, email FROM payments", Dialect::Postgres)
+        )
+        .is_none());
     }
 
     // Example 2: block UPDATE with no WHERE (where_clause: null).
@@ -946,8 +952,19 @@ mod tests {
         let rule = make_custom_rule(
             "rule: block-update-no-where\nnode_type: UpdateStmt\ncondition:\n  where_clause: null",
         );
-        assert!(evaluate_rule(&rule, &parse("UPDATE users SET status = 'blocked'", Dialect::Postgres)).is_some());
-        assert!(evaluate_rule(&rule, &parse("UPDATE users SET status = 'blocked' WHERE id = 1", Dialect::Postgres)).is_none());
+        assert!(evaluate_rule(
+            &rule,
+            &parse("UPDATE users SET status = 'blocked'", Dialect::Postgres)
+        )
+        .is_some());
+        assert!(evaluate_rule(
+            &rule,
+            &parse(
+                "UPDATE users SET status = 'blocked' WHERE id = 1",
+                Dialect::Postgres
+            )
+        )
+        .is_none());
     }
 
     // Example 3: detect SQL-injection tautology (where_always_true: true).
@@ -956,8 +973,16 @@ mod tests {
         let rule = make_custom_rule(
             "rule: block-or-tautology\nnode_type: DeleteStmt\ncondition:\n  where_always_true: true",
         );
-        assert!(evaluate_rule(&rule, &parse("DELETE FROM users WHERE id = 1 OR 1 = 1", Dialect::Postgres)).is_some());
-        assert!(evaluate_rule(&rule, &parse("DELETE FROM users WHERE id = 1", Dialect::Postgres)).is_none());
+        assert!(evaluate_rule(
+            &rule,
+            &parse("DELETE FROM users WHERE id = 1 OR 1 = 1", Dialect::Postgres)
+        )
+        .is_some());
+        assert!(evaluate_rule(
+            &rule,
+            &parse("DELETE FROM users WHERE id = 1", Dialect::Postgres)
+        )
+        .is_none());
     }
 
     // Example 4: block SLEEP/PG_SLEEP calls (node_type: FuncCall, func_name).
@@ -977,7 +1002,11 @@ mod tests {
             "rule: require-limit\nnode_type: SelectStmt\ncondition:\n  has_limit: false",
         );
         assert!(evaluate_rule(&rule, &parse("SELECT id FROM users", Dialect::Postgres)).is_some());
-        assert!(evaluate_rule(&rule, &parse("SELECT id FROM users LIMIT 100", Dialect::Postgres)).is_none());
+        assert!(evaluate_rule(
+            &rule,
+            &parse("SELECT id FROM users LIMIT 100", Dialect::Postgres)
+        )
+        .is_none());
     }
 
     // Example 6: block any DROP (node_type with no condition block).
@@ -985,16 +1014,22 @@ mod tests {
     fn custom_no_condition_matches_any_drop() {
         let rule = make_custom_rule("rule: block-all-drops\nnode_type: DropStmt");
         assert!(evaluate_rule(&rule, &parse("DROP TABLE users", Dialect::Postgres)).is_some());
-        assert!(evaluate_rule(&rule, &parse("DROP INDEX idx_users_email", Dialect::Postgres)).is_some());
+        assert!(evaluate_rule(
+            &rule,
+            &parse("DROP INDEX idx_users_email", Dialect::Postgres)
+        )
+        .is_some());
     }
 
     // object_type scopes a DROP to a single kind.
     #[test]
     fn custom_object_type_scopes_drop() {
-        let rule = make_custom_rule(
-            "node_type: DropStmt\ncondition:\n  object_type: index",
-        );
-        assert!(evaluate_rule(&rule, &parse("DROP INDEX idx_users_email", Dialect::Postgres)).is_some());
+        let rule = make_custom_rule("node_type: DropStmt\ncondition:\n  object_type: index");
+        assert!(evaluate_rule(
+            &rule,
+            &parse("DROP INDEX idx_users_email", Dialect::Postgres)
+        )
+        .is_some());
         assert!(evaluate_rule(&rule, &parse("DROP TABLE users", Dialect::Postgres)).is_none());
     }
 
@@ -1006,7 +1041,11 @@ mod tests {
         );
         assert!(evaluate_rule(&rule, &parse("DELETE FROM payments", Dialect::Postgres)).is_some());
         // Schema-qualified name still matches on its final segment.
-        assert!(evaluate_rule(&rule, &parse("DELETE FROM public.payments", Dialect::Postgres)).is_some());
+        assert!(evaluate_rule(
+            &rule,
+            &parse("DELETE FROM public.payments", Dialect::Postgres)
+        )
+        .is_some());
         // A different table is left alone.
         assert!(evaluate_rule(&rule, &parse("DELETE FROM users", Dialect::Postgres)).is_none());
     }
@@ -1014,20 +1053,35 @@ mod tests {
     // alter_kind restricts an ALTER TABLE rule to one command subtype.
     #[test]
     fn custom_alter_kind_scopes_alter_table() {
-        let rule = make_custom_rule(
-            "node_type: AlterTableStmt\ncondition:\n  alter_kind: drop_column",
-        );
-        assert!(evaluate_rule(&rule, &parse("ALTER TABLE users DROP COLUMN email", Dialect::Postgres)).is_some());
+        let rule =
+            make_custom_rule("node_type: AlterTableStmt\ncondition:\n  alter_kind: drop_column");
+        assert!(evaluate_rule(
+            &rule,
+            &parse("ALTER TABLE users DROP COLUMN email", Dialect::Postgres)
+        )
+        .is_some());
         // A RENAME is a different subtype → no match.
-        assert!(evaluate_rule(&rule, &parse("ALTER TABLE users RENAME TO accounts", Dialect::Postgres)).is_none());
+        assert!(evaluate_rule(
+            &rule,
+            &parse("ALTER TABLE users RENAME TO accounts", Dialect::Postgres)
+        )
+        .is_none());
     }
 
     // Without alter_kind, an AlterTableStmt rule fires for any ALTER subtype.
     #[test]
     fn custom_alter_table_no_kind_matches_any() {
         let rule = make_custom_rule("node_type: AlterTableStmt");
-        assert!(evaluate_rule(&rule, &parse("ALTER TABLE users DROP COLUMN email", Dialect::Postgres)).is_some());
-        assert!(evaluate_rule(&rule, &parse("ALTER TABLE users RENAME TO accounts", Dialect::Postgres)).is_some());
+        assert!(evaluate_rule(
+            &rule,
+            &parse("ALTER TABLE users DROP COLUMN email", Dialect::Postgres)
+        )
+        .is_some());
+        assert!(evaluate_rule(
+            &rule,
+            &parse("ALTER TABLE users RENAME TO accounts", Dialect::Postgres)
+        )
+        .is_some());
     }
 
     #[test]
@@ -1055,7 +1109,11 @@ mod tests {
     #[test]
     fn custom_unknown_alter_kind_never_matches() {
         let rule = make_custom_rule("node_type: AlterTableStmt\ncondition:\n  alter_kind: bogus");
-        assert!(evaluate_rule(&rule, &parse("ALTER TABLE users DROP COLUMN email", Dialect::Postgres)).is_none());
+        assert!(evaluate_rule(
+            &rule,
+            &parse("ALTER TABLE users DROP COLUMN email", Dialect::Postgres)
+        )
+        .is_none());
     }
 
     // An unknown predicate is ignored (logged), so the rule still fires on the
