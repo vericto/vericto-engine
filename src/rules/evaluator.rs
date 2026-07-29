@@ -450,9 +450,36 @@ struct CustomRuleSpec {
     condition: serde_yaml::Value,
 }
 
+/// The predicate keys recognized inside a custom rule's `condition:` block.
+/// A key outside this set is a typo or an unsupported predicate: the engine
+/// can't act on it, so we warn instead of silently ignoring it (which would
+/// make the rule match differently than the author intended).
+const KNOWN_CONDITION_KEYS: &[&str] = &[
+    "relation",
+    "where_clause",
+    "where_always_true",
+    "target_list",
+    "has_limit",
+    "func_name",
+    "object_type",
+    "alter_kind",
+];
+
 fn evaluate_custom(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
     let yaml = rule.ast_condition_yaml.as_ref()?;
-    let spec: CustomRuleSpec = serde_yaml::from_str(yaml).ok()?;
+    // A malformed rule must not silently "allow" the query: this evaluator is a
+    // last line of defense, so log and skip it rather than fail open in silence.
+    let spec: CustomRuleSpec = match serde_yaml::from_str(yaml) {
+        Ok(spec) => spec,
+        Err(e) => {
+            tracing::warn!(
+                rule_code = %rule.code,
+                error = %e,
+                "custom rule YAML failed to parse; rule skipped"
+            );
+            return None;
+        }
+    };
 
     let target_kind = match spec.node_type.as_str() {
         "DeleteStmt" => StatementKind::Delete,
@@ -463,13 +490,39 @@ fn evaluate_custom(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         "SelectStmt" => StatementKind::Select,
         "AlterTableStmt" => StatementKind::AlterTable,
         "FuncCall" => StatementKind::FunctionCall,
-        _ => return None,
+        other => {
+            tracing::warn!(
+                rule_code = %rule.code,
+                node_type = other,
+                "custom rule has an unknown node_type; rule skipped"
+            );
+            return None;
+        }
     };
 
     let cond = &spec.condition;
     // A node_type with no `condition:` block fires for every matching node
     // (e.g. `node_type: DropStmt` blocks any DROP).
     let cond_get = |key: &str| cond.get(serde_yaml::Value::from(key));
+
+    // Warn on any predicate the engine doesn't understand. We only iterate the
+    // condition when it's a mapping; a missing/scalar `condition:` has no keys.
+    if let Some(map) = cond.as_mapping() {
+        for key in map.keys() {
+            match key.as_str() {
+                Some(k) if KNOWN_CONDITION_KEYS.contains(&k) => {}
+                Some(k) => tracing::warn!(
+                    rule_code = %rule.code,
+                    predicate = k,
+                    "custom rule has an unknown condition predicate; it will be ignored"
+                ),
+                None => tracing::warn!(
+                    rule_code = %rule.code,
+                    "custom rule has a non-string condition key; it will be ignored"
+                ),
+            }
+        }
+    }
 
     // `where_clause: null` — the key must be PRESENT (its value is null). serde's
     // `.get()` returns Some(Value::Null) when present-with-null, None when absent.
@@ -487,10 +540,11 @@ fn evaluate_custom(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
                 _ => return false,
             }
         }
-        // alter_kind: <kind> → restrict AlterTableStmt to one command subtype
-        // (drop_column | rename | drop_constraint | alter_column_type | disable_trigger).
+        // alter_kind: <kind> → restrict AlterTableStmt to one command subtype.
+        // An unrecognized value parses to None → matches nothing (never fires),
+        // which is the safe failure for a rule the author mistyped.
         if let Some(kind) = cond_get("alter_kind").and_then(|v| v.as_str()) {
-            if !alter_kind_matches(s.alter_table_kind, kind) {
+            if AlterTableKind::from_yaml(kind) != s.alter_table_kind {
                 return false;
             }
         }
@@ -523,45 +577,16 @@ fn evaluate_custom(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
                 _ => return false,
             }
         }
-        // object_type: "table"|"schema"|"index"|"database" → scope a DROP.
+        // object_type: "table"|"database"|"schema"|"index" → scope a DROP.
+        // An unrecognized value parses to None → matches nothing.
         if let Some(obj) = cond_get("object_type").and_then(|v| v.as_str()) {
-            if !drop_object_matches(s.drop_object, obj) {
+            if DropObjectKind::from_yaml(obj) != s.drop_object {
                 return false;
             }
         }
         true
     })
     .map(|s| violation(rule, s, None))
-}
-
-/// Matches a statement's DROP object kind against a user-supplied string
-/// (case-insensitive): "table" | "database" | "schema" | "index".
-fn drop_object_matches(actual: Option<DropObjectKind>, expected: &str) -> bool {
-    let Some(actual) = actual else { return false };
-    let expected = expected.to_ascii_lowercase();
-    matches!(
-        (actual, expected.as_str()),
-        (DropObjectKind::Table, "table")
-            | (DropObjectKind::Database, "database")
-            | (DropObjectKind::Schema, "schema")
-            | (DropObjectKind::Index, "index")
-    )
-}
-
-/// Matches an ALTER TABLE subtype against a user-supplied string
-/// (case-insensitive): "drop_column" | "rename" | "drop_constraint" |
-/// "alter_column_type" | "disable_trigger".
-fn alter_kind_matches(actual: Option<AlterTableKind>, expected: &str) -> bool {
-    let Some(actual) = actual else { return false };
-    let expected = expected.to_ascii_lowercase();
-    matches!(
-        (actual, expected.as_str()),
-        (AlterTableKind::DropColumn, "drop_column")
-            | (AlterTableKind::Rename, "rename")
-            | (AlterTableKind::DropConstraint, "drop_constraint")
-            | (AlterTableKind::AlterColumnType, "alter_column_type")
-            | (AlterTableKind::DisableTrigger, "disable_trigger")
-    )
 }
 
 /// Compares two relation names, dialect-normalized: strips schema qualifier and
@@ -1009,5 +1034,38 @@ mod tests {
     fn custom_unknown_node_type_never_matches() {
         let rule = make_custom_rule("node_type: BogusStmt");
         assert!(evaluate_rule(&rule, &parse("DELETE FROM users", Dialect::Postgres)).is_none());
+    }
+
+    // Malformed YAML must fail safe (no match), not panic or match spuriously.
+    #[test]
+    fn custom_malformed_yaml_never_matches() {
+        let rule = make_custom_rule("node_type: [this is: not valid");
+        assert!(evaluate_rule(&rule, &parse("DELETE FROM users", Dialect::Postgres)).is_none());
+    }
+
+    // An unrecognized object_type value matches nothing (safe failure), rather
+    // than falling through and firing for every DROP.
+    #[test]
+    fn custom_unknown_object_type_never_matches() {
+        let rule = make_custom_rule("node_type: DropStmt\ncondition:\n  object_type: sequence");
+        assert!(evaluate_rule(&rule, &parse("DROP TABLE users", Dialect::Postgres)).is_none());
+    }
+
+    // Likewise an unrecognized alter_kind value matches nothing.
+    #[test]
+    fn custom_unknown_alter_kind_never_matches() {
+        let rule = make_custom_rule("node_type: AlterTableStmt\ncondition:\n  alter_kind: bogus");
+        assert!(evaluate_rule(&rule, &parse("ALTER TABLE users DROP COLUMN email", Dialect::Postgres)).is_none());
+    }
+
+    // An unknown predicate is ignored (logged), so the rule still fires on the
+    // predicates it does understand — it does not become a no-op or an error.
+    #[test]
+    fn custom_unknown_predicate_is_ignored_not_fatal() {
+        let rule = make_custom_rule(
+            "node_type: SelectStmt\ncondition:\n  target_list: \"*\"\n  bogus_key: 1",
+        );
+        assert!(evaluate_rule(&rule, &parse("SELECT * FROM users", Dialect::Postgres)).is_some());
+        assert!(evaluate_rule(&rule, &parse("SELECT id FROM users", Dialect::Postgres)).is_none());
     }
 }
