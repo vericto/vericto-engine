@@ -7,7 +7,7 @@
 //! UPDATE, DROP, and TRUNCATE — including those nested inside data-modifying
 //! CTEs (`WITH x AS (DELETE ...)`), which sqlparser-rs does not handle.
 
-use crate::error::{ProxyError, Result, MAX_AST_DEPTH};
+use crate::error::{MAX_AST_DEPTH, ProxyError, Result};
 use crate::parser::{
     AlterTableKind, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, WherePresence,
 };

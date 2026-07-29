@@ -4,7 +4,7 @@
 #[test]
 fn quick_example() {
     use vericto_engine::{
-        evaluate, Decision, Dialect, EnforcementAction, EnforcementPolicy, Rule, RuleType, Severity,
+        Decision, Dialect, EnforcementAction, EnforcementPolicy, Rule, RuleType, Severity, evaluate,
     };
 
     let rules = vec![Rule {
@@ -29,7 +29,7 @@ fn quick_example() {
 #[test]
 fn full_ruleset_example() {
     use vericto_engine::rules::engine::{Decision, Rule};
-    use vericto_engine::{evaluate, Dialect, EnforcementPolicy};
+    use vericto_engine::{Dialect, EnforcementPolicy, evaluate};
 
     fn is_safe(sql: &str, rules: &[Rule], policy: &EnforcementPolicy) -> bool {
         evaluate(sql, Dialect::Postgres, rules, policy).decision == Decision::Allow
@@ -68,7 +68,7 @@ condition:
 #[test]
 fn custom_rule_example_scopes_correctly() {
     use vericto_engine::rules::engine::{EnforcementAction, Rule, RuleType, Severity};
-    use vericto_engine::{evaluate, Decision, Dialect, EnforcementPolicy};
+    use vericto_engine::{Decision, Dialect, EnforcementPolicy, evaluate};
 
     let custom = Rule {
         rule_id: "custom-1".into(),

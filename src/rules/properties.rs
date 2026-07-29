@@ -324,7 +324,7 @@ fn p8_severity_as_str_is_unique_per_variant() {
 
 #[cfg(test)]
 mod examples {
-    use crate::parser::{parser_for, Dialect};
+    use crate::parser::{Dialect, parser_for};
     use crate::rules::engine::{
         Decision, EnforcementAction, EnforcementPolicy, ParseErrorAction, Rule, RuleEngine,
         RuleType, Severity,

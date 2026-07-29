@@ -1,5 +1,5 @@
 use vericto_engine::{
-    evaluate, Decision, Dialect, EnforcementAction, EnforcementPolicy, Rule, RuleType, Severity,
+    Decision, Dialect, EnforcementAction, EnforcementPolicy, Rule, RuleType, Severity, evaluate,
 };
 
 fn rule(code: &str, sev: Severity) -> Rule {

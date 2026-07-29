@@ -5,7 +5,7 @@
 //! subqueries / CTEs. Also detects INSERT patterns, SELECT * / no-LIMIT,
 //! and function calls (SLEEP, PG_SLEEP).
 
-use crate::error::{ProxyError, Result, MAX_AST_DEPTH};
+use crate::error::{MAX_AST_DEPTH, ProxyError, Result};
 use crate::parser::{
     AlterTableKind, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, WherePresence,
 };
@@ -805,9 +805,10 @@ mod tests {
     #[test]
     fn safe_select_has_no_destructive_stmt() {
         let p = parse_pg("SELECT * FROM users WHERE id = 1");
-        assert!(p
-            .statements
-            .iter()
-            .all(|s| s.kind != StatementKind::Delete && s.kind != StatementKind::Drop));
+        assert!(
+            p.statements
+                .iter()
+                .all(|s| s.kind != StatementKind::Delete && s.kind != StatementKind::Drop)
+        );
     }
 }

@@ -275,7 +275,7 @@ impl RuleEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{parser_for, Dialect};
+    use crate::parser::{Dialect, parser_for};
 
     /// Destructive-critical rule codes that MUST resolve to BLOCK under the
     /// default policy (R9.1 / R13 table). These are the engine-side mirror of
