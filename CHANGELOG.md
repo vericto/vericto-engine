@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.1] — 2026-07-29
+
+Maintenance release: no API or behaviour changes.
+
 ### Changed
 
 - **Migrated to Rust edition 2024** (`edition = "2021"` → `"2024"`). No source
