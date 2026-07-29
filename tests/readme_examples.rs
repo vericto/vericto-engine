@@ -56,8 +56,9 @@ fn custom_rule_example() {
             r#"
 rule: block_orders_delete
 node_type: DeleteStmt
-relation: orders
-where_null: true
+condition:
+  relation: orders
+  where_clause: null
 "#
             .into(),
         ),
@@ -76,7 +77,7 @@ fn custom_rule_example_scopes_correctly() {
         default_action: EnforcementAction::Block,
         rule_type: RuleType::Custom,
         ast_condition_yaml: Some(
-            "rule: block_orders_delete\nnode_type: DeleteStmt\nrelation: orders\nwhere_null: true\n".into(),
+            "rule: block_orders_delete\nnode_type: DeleteStmt\ncondition:\n  relation: orders\n  where_clause: null\n".into(),
         ),
     };
     let rules = [custom];
@@ -92,7 +93,7 @@ fn custom_rule_example_scopes_correctly() {
         evaluate("DELETE FROM users", Dialect::Postgres, &rules, &p).decision,
         Decision::Allow
     );
-    // Does NOT match a scoped DELETE on orders (where_null: true).
+    // Does NOT match a scoped DELETE on orders (where_clause: null).
     assert_eq!(
         evaluate(
             "DELETE FROM orders WHERE id = 1",
