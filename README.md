@@ -144,12 +144,25 @@ mirrors this table verbatim.
 
 ## Custom rules (YAML)
 
-You can define domain-specific rules using YAML AST conditions. The condition
-supports these fields: `node_type` (required — `DeleteStmt`, `UpdateStmt`,
-`DropStmt`, `TruncateStmt`, `InsertStmt`, `SelectStmt`, or `AlterTableStmt`),
-`relation` (optional — matches the target table, case-insensitive, ignoring
-schema qualifier and quoting), and `where_null` (optional — when `true`, only
-matches statements with no WHERE clause):
+You can define domain-specific rules using YAML AST conditions. A rule has a
+required `node_type` and an optional `condition:` block of predicates (omit it
+to fire for every node of that type):
+
+- `node_type` (required): `DeleteStmt`, `UpdateStmt`, `DropStmt`,
+  `TruncateStmt`, `InsertStmt`, `SelectStmt`, `AlterTableStmt`, or `FuncCall`.
+
+Predicates under `condition:`:
+
+| Predicate | Applies to | Meaning |
+|---|---|---|
+| `relation: <table>` | any | Scope to a table (case-insensitive, schema-agnostic) |
+| `where_clause: null` | DELETE/UPDATE/SELECT | No WHERE clause |
+| `where_always_true: true` | DELETE/UPDATE/SELECT | Trivially-true WHERE (`OR 1=1`) |
+| `target_list: "*"` | SELECT | `SELECT *` |
+| `has_limit: false` | SELECT | No LIMIT |
+| `func_name: <name>` | FuncCall | Function by name (case-insensitive) |
+| `object_type: <kind>` | DropStmt | `table`/`database`/`schema`/`index` |
+| `alter_kind: <kind>` | AlterTableStmt | `drop_column`/`rename`/`drop_constraint`/`alter_column_type`/`disable_trigger` |
 
 ```rust
 use vericto_engine::rules::engine::{EnforcementAction, Rule, RuleType, Severity};
@@ -163,8 +176,9 @@ let custom = Rule {
     ast_condition_yaml: Some(r#"
 rule: block_orders_delete
 node_type: DeleteStmt
-relation: orders
-where_null: true
+condition:
+  relation: orders
+  where_clause: null
 "#.into()),
 };
 ```

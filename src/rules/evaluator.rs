@@ -421,21 +421,67 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
 // Custom rule evaluator (YAML-defined)
 // ---------------------------------------------------------------------------
 
-/// Condition structure for a YAML-defined custom rule.
+/// A YAML-defined custom rule, matching the schema documented at
+/// `/docs/custom-rules`:
+///
+/// ```yaml
+/// rule: block-select-star        # optional label
+/// node_type: SelectStmt          # required — AST node to capture
+/// message: "..."                 # optional human message
+/// condition:                     # optional — predicates on the node
+///   target_list: "*"
+/// ```
+///
+/// Predicates live under `condition:`. We deserialize `condition` as a raw
+/// `serde_yaml::Value` so we can distinguish `where_clause: null` (key present,
+/// value null → "no WHERE clause") from the key being absent — an important
+/// signal that a typed `Option<T>` would collapse into `None` either way.
+///
+/// Supported predicates: `relation`, `where_clause: null`, `where_always_true`,
+/// `target_list`, `has_limit`, `func_name`, `object_type`, `alter_kind`.
 #[derive(Debug, Deserialize)]
-struct CustomCondition {
+struct CustomRuleSpec {
     #[allow(dead_code)]
     rule: Option<String>,
     node_type: String,
-    relation: Option<String>,
-    where_null: Option<bool>,
+    #[allow(dead_code)]
+    message: Option<String>,
+    #[serde(default)]
+    condition: serde_yaml::Value,
 }
+
+/// The predicate keys recognized inside a custom rule's `condition:` block.
+/// A key outside this set is a typo or an unsupported predicate: the engine
+/// can't act on it, so we warn instead of silently ignoring it (which would
+/// make the rule match differently than the author intended).
+const KNOWN_CONDITION_KEYS: &[&str] = &[
+    "relation",
+    "where_clause",
+    "where_always_true",
+    "target_list",
+    "has_limit",
+    "func_name",
+    "object_type",
+    "alter_kind",
+];
 
 fn evaluate_custom(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
     let yaml = rule.ast_condition_yaml.as_ref()?;
-    let cond: CustomCondition = serde_yaml::from_str(yaml).ok()?;
+    // A malformed rule must not silently "allow" the query: this evaluator is a
+    // last line of defense, so log and skip it rather than fail open in silence.
+    let spec: CustomRuleSpec = match serde_yaml::from_str(yaml) {
+        Ok(spec) => spec,
+        Err(e) => {
+            tracing::warn!(
+                rule_code = %rule.code,
+                error = %e,
+                "custom rule YAML failed to parse; rule skipped"
+            );
+            return None;
+        }
+    };
 
-    let target_kind = match cond.node_type.as_str() {
+    let target_kind = match spec.node_type.as_str() {
         "DeleteStmt" => StatementKind::Delete,
         "UpdateStmt" => StatementKind::Update,
         "DropStmt" => StatementKind::Drop,
@@ -443,25 +489,118 @@ fn evaluate_custom(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         "InsertStmt" => StatementKind::Insert,
         "SelectStmt" => StatementKind::Select,
         "AlterTableStmt" => StatementKind::AlterTable,
-        _ => return None,
+        "FuncCall" => StatementKind::FunctionCall,
+        other => {
+            tracing::warn!(
+                rule_code = %rule.code,
+                node_type = other,
+                "custom rule has an unknown node_type; rule skipped"
+            );
+            return None;
+        }
     };
+
+    let cond = &spec.condition;
+    // A node_type with no `condition:` block fires for every matching node
+    // (e.g. `node_type: DropStmt` blocks any DROP).
+    let cond_get = |key: &str| cond.get(serde_yaml::Value::from(key));
+
+    // Warn on any predicate the engine doesn't understand. We only iterate the
+    // condition when it's a mapping; a missing/scalar `condition:` has no keys.
+    if let Some(map) = cond.as_mapping() {
+        for key in map.keys() {
+            match key.as_str() {
+                Some(k) if KNOWN_CONDITION_KEYS.contains(&k) => {}
+                Some(k) => tracing::warn!(
+                    rule_code = %rule.code,
+                    predicate = k,
+                    "custom rule has an unknown condition predicate; it will be ignored"
+                ),
+                None => tracing::warn!(
+                    rule_code = %rule.code,
+                    "custom rule has a non-string condition key; it will be ignored"
+                ),
+            }
+        }
+    }
+
+    // `where_clause: null` — the key must be PRESENT (its value is null). serde's
+    // `.get()` returns Some(Value::Null) when present-with-null, None when absent.
+    let where_clause_present = cond_get("where_clause").is_some();
 
     find(&parsed.statements, |s| {
         if s.kind != target_kind {
             return false;
         }
-        if let Some(rel) = &cond.relation {
+        // relation: <table> → scope the rule to a single table (dialect-normalized,
+        // case-insensitive; a schema-qualified name matches on its final segment).
+        if let Some(rel) = cond_get("relation").and_then(|v| v.as_str()) {
             match &s.relation {
                 Some(actual) if relation_matches(actual, rel) => {}
                 _ => return false,
             }
         }
-        if cond.where_null == Some(true) && s.where_presence == WherePresence::Present {
+        // alter_kind: <kind> → restrict AlterTableStmt to one command subtype.
+        // An unrecognized value parses to None → matches nothing (never fires),
+        // which is the safe failure for a rule the author mistyped.
+        if let Some(kind) = cond_get("alter_kind").and_then(|v| v.as_str()) {
+            if AlterTableKind::from_yaml(kind) != s.alter_table_kind {
+                return false;
+            }
+        }
+        // where_clause: null → require the statement to have NO WHERE clause.
+        if where_clause_present && s.where_presence == WherePresence::Present {
             return false;
+        }
+        // where_always_true: true → require a trivially-true predicate (OR 1=1, …).
+        if cond_get("where_always_true").and_then(|v| v.as_bool()) == Some(true)
+            && !s.has_or_tautology
+        {
+            return false;
+        }
+        // target_list: "*" → require SELECT * (any other value never matches).
+        if let Some(target) = cond_get("target_list").and_then(|v| v.as_str()) {
+            if target != "*" || !s.select_is_star {
+                return false;
+            }
+        }
+        // has_limit: false/true → match statements with/without a LIMIT.
+        if let Some(want_limit) = cond_get("has_limit").and_then(|v| v.as_bool()) {
+            if s.select_has_limit != want_limit {
+                return false;
+            }
+        }
+        // func_name: "sleep" → match a called function by name (case-insensitive).
+        if let Some(fname) = cond_get("func_name").and_then(|v| v.as_str()) {
+            match &s.function_name {
+                Some(actual) if actual.eq_ignore_ascii_case(fname) => {}
+                _ => return false,
+            }
+        }
+        // object_type: "table"|"database"|"schema"|"index" → scope a DROP.
+        // An unrecognized value parses to None → matches nothing.
+        if let Some(obj) = cond_get("object_type").and_then(|v| v.as_str()) {
+            if DropObjectKind::from_yaml(obj) != s.drop_object {
+                return false;
+            }
         }
         true
     })
     .map(|s| violation(rule, s, None))
+}
+
+/// Compares two relation names, dialect-normalized: strips schema qualifier and
+/// quotes, then case-insensitive. `public.payments` matches `payments`.
+fn relation_matches(actual: &str, expected: &str) -> bool {
+    let normalize = |s: &str| {
+        s.rsplit('.')
+            .next()
+            .unwrap_or(s)
+            .trim_matches('"')
+            .trim_matches('`')
+            .to_ascii_lowercase()
+    };
+    normalize(actual) == normalize(expected)
 }
 
 // ---------------------------------------------------------------------------
@@ -483,18 +622,6 @@ fn violation(rule: &Rule, stmt: &StatementInfo, suggestion: Option<String>) -> V
         estimated_rows_affected: None,
         suggested_safe_query: suggestion,
     }
-}
-
-fn relation_matches(actual: &str, expected: &str) -> bool {
-    let normalize = |s: &str| {
-        s.rsplit('.')
-            .next()
-            .unwrap_or(s)
-            .trim_matches('"')
-            .trim_matches('`')
-            .to_ascii_lowercase()
-    };
-    normalize(actual) == normalize(expected)
 }
 
 fn rel_or_placeholder(stmt: &StatementInfo) -> String {
@@ -785,5 +912,218 @@ mod tests {
     fn vetro_051_allows_select_star_with_where() {
         let p = parse("SELECT * FROM users WHERE id = 1", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-051"), &p).is_none());
+    }
+
+    // ── Custom rules (ast_condition_yaml) ────────────────────────────────────
+    // These mirror the six "practical examples" documented at /docs/custom-rules,
+    // using the exact YAML schema published there: a required `node_type`, an
+    // optional `condition:` block, and the predicates where_clause/
+    // where_always_true/target_list/has_limit/func_name/object_type.
+    fn make_custom_rule(yaml: &str) -> Rule {
+        Rule {
+            rule_id: "CUSTOM-1".to_string(),
+            code: "CUSTOM-1".to_string(),
+            severity: Severity::High,
+            default_action: EnforcementPolicy::default().action_for(Severity::High),
+            rule_type: RuleType::Custom,
+            ast_condition_yaml: Some(yaml.to_string()),
+        }
+    }
+
+    // Example 1: block SELECT * (target_list: "*").
+    #[test]
+    fn custom_target_list_star_matches_select_star() {
+        let rule = make_custom_rule(
+            "rule: block-select-star\nnode_type: SelectStmt\ncondition:\n  target_list: \"*\"",
+        );
+        assert!(
+            evaluate_rule(&rule, &parse("SELECT * FROM payments", Dialect::Postgres)).is_some()
+        );
+        assert!(evaluate_rule(
+            &rule,
+            &parse("SELECT id, email FROM payments", Dialect::Postgres)
+        )
+        .is_none());
+    }
+
+    // Example 2: block UPDATE with no WHERE (where_clause: null).
+    #[test]
+    fn custom_where_clause_null_matches_update_without_where() {
+        let rule = make_custom_rule(
+            "rule: block-update-no-where\nnode_type: UpdateStmt\ncondition:\n  where_clause: null",
+        );
+        assert!(evaluate_rule(
+            &rule,
+            &parse("UPDATE users SET status = 'blocked'", Dialect::Postgres)
+        )
+        .is_some());
+        assert!(evaluate_rule(
+            &rule,
+            &parse(
+                "UPDATE users SET status = 'blocked' WHERE id = 1",
+                Dialect::Postgres
+            )
+        )
+        .is_none());
+    }
+
+    // Example 3: detect SQL-injection tautology (where_always_true: true).
+    #[test]
+    fn custom_where_always_true_matches_tautology() {
+        let rule = make_custom_rule(
+            "rule: block-or-tautology\nnode_type: DeleteStmt\ncondition:\n  where_always_true: true",
+        );
+        assert!(evaluate_rule(
+            &rule,
+            &parse("DELETE FROM users WHERE id = 1 OR 1 = 1", Dialect::Postgres)
+        )
+        .is_some());
+        assert!(evaluate_rule(
+            &rule,
+            &parse("DELETE FROM users WHERE id = 1", Dialect::Postgres)
+        )
+        .is_none());
+    }
+
+    // Example 4: block SLEEP/PG_SLEEP calls (node_type: FuncCall, func_name).
+    #[test]
+    fn custom_func_name_matches_sleep_case_insensitive() {
+        let rule = make_custom_rule(
+            "rule: block-sleep-calls\nnode_type: FuncCall\ncondition:\n  func_name: pg_sleep",
+        );
+        assert!(evaluate_rule(&rule, &parse("SELECT PG_SLEEP(10)", Dialect::Postgres)).is_some());
+        assert!(evaluate_rule(&rule, &parse("SELECT id FROM users", Dialect::Postgres)).is_none());
+    }
+
+    // Example 5: require LIMIT on SELECT (has_limit: false).
+    #[test]
+    fn custom_has_limit_false_matches_unbounded_select() {
+        let rule = make_custom_rule(
+            "rule: require-limit\nnode_type: SelectStmt\ncondition:\n  has_limit: false",
+        );
+        assert!(evaluate_rule(&rule, &parse("SELECT id FROM users", Dialect::Postgres)).is_some());
+        assert!(evaluate_rule(
+            &rule,
+            &parse("SELECT id FROM users LIMIT 100", Dialect::Postgres)
+        )
+        .is_none());
+    }
+
+    // Example 6: block any DROP (node_type with no condition block).
+    #[test]
+    fn custom_no_condition_matches_any_drop() {
+        let rule = make_custom_rule("rule: block-all-drops\nnode_type: DropStmt");
+        assert!(evaluate_rule(&rule, &parse("DROP TABLE users", Dialect::Postgres)).is_some());
+        assert!(evaluate_rule(
+            &rule,
+            &parse("DROP INDEX idx_users_email", Dialect::Postgres)
+        )
+        .is_some());
+    }
+
+    // object_type scopes a DROP to a single kind.
+    #[test]
+    fn custom_object_type_scopes_drop() {
+        let rule = make_custom_rule("node_type: DropStmt\ncondition:\n  object_type: index");
+        assert!(evaluate_rule(
+            &rule,
+            &parse("DROP INDEX idx_users_email", Dialect::Postgres)
+        )
+        .is_some());
+        assert!(evaluate_rule(&rule, &parse("DROP TABLE users", Dialect::Postgres)).is_none());
+    }
+
+    // relation scopes a rule to a single table (case-insensitive, schema-agnostic).
+    #[test]
+    fn custom_relation_scopes_to_one_table() {
+        let rule = make_custom_rule(
+            "node_type: DeleteStmt\ncondition:\n  relation: payments\n  where_clause: null",
+        );
+        assert!(evaluate_rule(&rule, &parse("DELETE FROM payments", Dialect::Postgres)).is_some());
+        // Schema-qualified name still matches on its final segment.
+        assert!(evaluate_rule(
+            &rule,
+            &parse("DELETE FROM public.payments", Dialect::Postgres)
+        )
+        .is_some());
+        // A different table is left alone.
+        assert!(evaluate_rule(&rule, &parse("DELETE FROM users", Dialect::Postgres)).is_none());
+    }
+
+    // alter_kind restricts an ALTER TABLE rule to one command subtype.
+    #[test]
+    fn custom_alter_kind_scopes_alter_table() {
+        let rule =
+            make_custom_rule("node_type: AlterTableStmt\ncondition:\n  alter_kind: drop_column");
+        assert!(evaluate_rule(
+            &rule,
+            &parse("ALTER TABLE users DROP COLUMN email", Dialect::Postgres)
+        )
+        .is_some());
+        // A RENAME is a different subtype → no match.
+        assert!(evaluate_rule(
+            &rule,
+            &parse("ALTER TABLE users RENAME TO accounts", Dialect::Postgres)
+        )
+        .is_none());
+    }
+
+    // Without alter_kind, an AlterTableStmt rule fires for any ALTER subtype.
+    #[test]
+    fn custom_alter_table_no_kind_matches_any() {
+        let rule = make_custom_rule("node_type: AlterTableStmt");
+        assert!(evaluate_rule(
+            &rule,
+            &parse("ALTER TABLE users DROP COLUMN email", Dialect::Postgres)
+        )
+        .is_some());
+        assert!(evaluate_rule(
+            &rule,
+            &parse("ALTER TABLE users RENAME TO accounts", Dialect::Postgres)
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn custom_unknown_node_type_never_matches() {
+        let rule = make_custom_rule("node_type: BogusStmt");
+        assert!(evaluate_rule(&rule, &parse("DELETE FROM users", Dialect::Postgres)).is_none());
+    }
+
+    // Malformed YAML must fail safe (no match), not panic or match spuriously.
+    #[test]
+    fn custom_malformed_yaml_never_matches() {
+        let rule = make_custom_rule("node_type: [this is: not valid");
+        assert!(evaluate_rule(&rule, &parse("DELETE FROM users", Dialect::Postgres)).is_none());
+    }
+
+    // An unrecognized object_type value matches nothing (safe failure), rather
+    // than falling through and firing for every DROP.
+    #[test]
+    fn custom_unknown_object_type_never_matches() {
+        let rule = make_custom_rule("node_type: DropStmt\ncondition:\n  object_type: sequence");
+        assert!(evaluate_rule(&rule, &parse("DROP TABLE users", Dialect::Postgres)).is_none());
+    }
+
+    // Likewise an unrecognized alter_kind value matches nothing.
+    #[test]
+    fn custom_unknown_alter_kind_never_matches() {
+        let rule = make_custom_rule("node_type: AlterTableStmt\ncondition:\n  alter_kind: bogus");
+        assert!(evaluate_rule(
+            &rule,
+            &parse("ALTER TABLE users DROP COLUMN email", Dialect::Postgres)
+        )
+        .is_none());
+    }
+
+    // An unknown predicate is ignored (logged), so the rule still fires on the
+    // predicates it does understand — it does not become a no-op or an error.
+    #[test]
+    fn custom_unknown_predicate_is_ignored_not_fatal() {
+        let rule = make_custom_rule(
+            "node_type: SelectStmt\ncondition:\n  target_list: \"*\"\n  bogus_key: 1",
+        );
+        assert!(evaluate_rule(&rule, &parse("SELECT * FROM users", Dialect::Postgres)).is_some());
+        assert!(evaluate_rule(&rule, &parse("SELECT id FROM users", Dialect::Postgres)).is_none());
     }
 }

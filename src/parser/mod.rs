@@ -70,6 +70,21 @@ pub enum DropObjectKind {
     Other,
 }
 
+impl DropObjectKind {
+    /// Parses the value of a custom-rule `object_type:` predicate
+    /// (case-insensitive). `None` for an unrecognized value, so a typo becomes
+    /// a validation error rather than a silently non-matching rule.
+    pub fn from_yaml(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "table" => Some(DropObjectKind::Table),
+            "database" => Some(DropObjectKind::Database),
+            "schema" => Some(DropObjectKind::Schema),
+            "index" => Some(DropObjectKind::Index),
+            _ => None,
+        }
+    }
+}
+
 /// Subtype of an ALTER TABLE command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlterTableKind {
@@ -82,6 +97,21 @@ pub enum AlterTableKind {
     /// `DISABLE TRIGGER` / `DISABLE ROW LEVEL SECURITY` — disables a protection.
     DisableTrigger,
     Other,
+}
+
+impl AlterTableKind {
+    /// Parses the value of a custom-rule `alter_kind:` predicate
+    /// (case-insensitive). `None` for an unrecognized value.
+    pub fn from_yaml(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "drop_column" => Some(AlterTableKind::DropColumn),
+            "rename" => Some(AlterTableKind::Rename),
+            "drop_constraint" => Some(AlterTableKind::DropConstraint),
+            "alter_column_type" => Some(AlterTableKind::AlterColumnType),
+            "disable_trigger" => Some(AlterTableKind::DisableTrigger),
+            _ => None,
+        }
+    }
 }
 
 /// Presence and quality of a WHERE clause.
