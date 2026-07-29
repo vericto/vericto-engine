@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] — 2026-07-29
+
+Custom-rule (YAML) evaluation now implements the full predicate schema
+documented at `/docs/custom-rules`. Previously the docs described predicates the
+engine silently ignored; rules are now evaluated against the nested `condition:`
+schema. All changes are additive to the public Rust API — `Rule`, `evaluate`,
+and the exported types are unchanged.
+
+### Added
+
+- **`FuncCall` node type** for custom rules, so the documented `SLEEP` /
+  `PG_SLEEP` detection example actually matches.
+- **Custom-rule predicates** under `condition:`: `relation`, `where_clause: null`,
+  `where_always_true`, `target_list: "*"`, `has_limit`, `func_name`,
+  `object_type`, and `alter_kind`. All read fields the parser already extracts —
+  no parser changes.
+- `DropObjectKind::from_yaml` and `AlterTableKind::from_yaml` for parsing the
+  `object_type` / `alter_kind` predicate values (mirrors `Severity::from_legacy`).
+
+### Changed
+
+- **Custom-rule YAML schema** now nests predicates under a `condition:` block
+  (matching the published docs) instead of the previous root-level fields. Rules
+  written against the pre-3.1.0 README examples (`relation` / `where_null` at the
+  root) must move those keys under `condition:` and rename `where_null` →
+  `where_clause: null`. Standard `VERICTO-NNN` rule evaluation is unaffected.
+
+### Hardened
+
+- Malformed rule YAML and unknown `node_type` values now log a warning and skip
+  the rule (fail-safe) instead of silently evaluating to no-match.
+- Unknown `condition:` predicates and unrecognized `object_type` / `alter_kind`
+  values are surfaced (logged / non-matching) rather than silently ignored.
+
 ## [3.0.0] — 2026-07-16
 
 Rebrand from **Vetro** to **Vericto**. This is a breaking release: the standard
