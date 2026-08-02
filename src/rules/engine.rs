@@ -54,6 +54,61 @@ impl Severity {
     }
 }
 
+/// The kind of risk a rule represents — a *static* property of the rule,
+/// independent of the channel it is evaluated on. Lets the host apply a
+/// different enforcement ceiling per class per channel (e.g. schema DDL is
+/// routine in a CI migration but high-risk against a live production database),
+/// without the engine's detection logic ever needing to know the channel.
+///
+/// This does NOT change *what* a rule detects — only gives the host a lever to
+/// modulate the resulting action. See `EnforcementPolicy::schema_migration_cap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleClass {
+    /// Schema/DDL changes: DROP TABLE/DATABASE/SCHEMA, TRUNCATE, ALTER TABLE,
+    /// DROP INDEX. Destructive against a live DB, but normal in a versioned
+    /// migration — the class a CI channel may want to soften to Flag.
+    SchemaMigration,
+    /// Data mutation without adequate scope: DELETE/UPDATE without WHERE,
+    /// INSERT..SELECT / CREATE TABLE AS with no filter, MERGE. Dangerous on
+    /// *any* channel — a WHERE-less DELETE is never intended, even in a migration.
+    DataMutation,
+    /// Security-sensitive: SQL-injection tautologies, COPY..PROGRAM, DO blocks,
+    /// GRANT/REVOKE, sleep-based probing. Never softened by channel.
+    Security,
+    /// Best-practice / performance hints: SELECT without LIMIT, SELECT *,
+    /// INSERT without column list. Advisory (Medium/Low by default).
+    Performance,
+}
+
+impl RuleClass {
+    /// Classifies a built-in rule by its code. Custom rules and any unknown code
+    /// fall back to `DataMutation` (the conservative default: never softened by
+    /// a channel cap, so an unclassified rule can't be accidentally weakened).
+    pub fn for_code(code: &str) -> RuleClass {
+        match code {
+            // Schema / DDL
+            "VERICTO-010" | "VERICTO-011" | "VERICTO-012" | "VERICTO-013" | "VERICTO-015"
+            | "VERICTO-016" | "VERICTO-017" | "VERICTO-018" | "VERICTO-019" => {
+                RuleClass::SchemaMigration
+            }
+            // Data mutation (destructive DML)
+            "VERICTO-001" | "VERICTO-002" | "VERICTO-003" | "VERICTO-030" | "VERICTO-031"
+            | "VERICTO-033" | "VERICTO-040" | "VERICTO-042" | "VERICTO-083" | "VERICTO-084" => {
+                RuleClass::DataMutation
+            }
+            // Security
+            "VERICTO-070" | "VERICTO-080" | "VERICTO-081" | "VERICTO-082" | "VERICTO-090" => {
+                RuleClass::Security
+            }
+            // Performance / best-practice
+            "VERICTO-050" | "VERICTO-051" | "VERICTO-060" | "VERICTO-061" => RuleClass::Performance,
+            // Custom rules / unknown codes: conservative default.
+            _ => RuleClass::DataMutation,
+        }
+    }
+}
+
 /// What to do about a violation (policy decision).
 ///
 /// `Ord` derived: `Monitor < Flag < Block` (used by the reclassification-safety
@@ -94,6 +149,17 @@ pub struct EnforcementPolicy {
     pub parse_error: ParseErrorAction,
     /// Global dry-run: forces every blocking action to a non-blocking one (R4.4).
     pub monitor_mode: bool,
+    /// Per-channel ceiling for `RuleClass::SchemaMigration` violations. When set,
+    /// a schema/DDL violation's action is capped at (i.e. never exceeds) this
+    /// value — so a CI channel can pass `Some(Flag)` to make DROP/ALTER/TRUNCATE
+    /// *report* rather than *block* (migrations legitimately contain them), while
+    /// a runtime channel leaves it `None` to keep the full policy in force.
+    ///
+    /// Only ever *lowers* the action (`action.min(cap)`), so it can never make a
+    /// channel more aggressive than the base policy. `None` = no cap = today's
+    /// behavior exactly (backward-compatible; absent in older serialized policies).
+    #[serde(default)]
+    pub schema_migration_cap: Option<EnforcementAction>,
 }
 
 impl Default for EnforcementPolicy {
@@ -108,6 +174,7 @@ impl Default for EnforcementPolicy {
             informational: EnforcementAction::Monitor,
             parse_error: ParseErrorAction::AllowReport,
             monitor_mode: false,
+            schema_migration_cap: None,
         }
     }
 }
@@ -130,6 +197,23 @@ impl EnforcementPolicy {
             EnforcementAction::Flag
         } else {
             base
+        }
+    }
+
+    /// Resolves the effective action for a violation, applying both the
+    /// severity mapping (`action_for`) and any per-class ceiling.
+    ///
+    /// The only class-specific cap today is `schema_migration_cap`: when set, a
+    /// `RuleClass::SchemaMigration` violation is lowered to at most that action
+    /// (`min`, since Monitor < Flag < Block). All other classes — DataMutation,
+    /// Security, Performance — are unaffected, so a WHERE-less DELETE or a
+    /// COPY..PROGRAM is never softened by a channel that only means to relax
+    /// schema DDL. With no cap set this is identical to `action_for`.
+    pub fn action_for_class(&self, severity: Severity, class: RuleClass) -> EnforcementAction {
+        let action = self.action_for(severity);
+        match (class, self.schema_migration_cap) {
+            (RuleClass::SchemaMigration, Some(cap)) => action.min(cap),
+            _ => action,
         }
     }
 
@@ -252,7 +336,11 @@ impl RuleEngine {
         match best {
             None => EvaluationOutcome::allowed(),
             Some((severity, v)) => {
-                let action = policy.action_for(severity);
+                // Resolve the action through the per-class path so a channel's
+                // schema-migration cap (if any) can soften DDL without touching
+                // DataMutation / Security violations. Class is derived from the
+                // winning rule's code — a static property, not a channel input.
+                let action = policy.action_for_class(severity, RuleClass::for_code(&v.rule_code));
                 EvaluationOutcome {
                     decision: Decision::from_action(action),
                     action: Some(action),
@@ -361,5 +449,161 @@ mod tests {
         assert_eq!(outcome.action, Some(EnforcementAction::Block));
         assert_eq!(outcome.severity, Some(Severity::Critical));
         assert_eq!(outcome.rule_code.as_deref(), Some("VERICTO-001"));
+    }
+
+    // ── RuleClass classification ──────────────────────────────────────────────
+    #[test]
+    fn rule_class_partitions_the_catalogue() {
+        use RuleClass::*;
+        // Schema/DDL
+        for c in [
+            "VERICTO-010",
+            "VERICTO-011",
+            "VERICTO-012",
+            "VERICTO-013",
+            "VERICTO-015",
+            "VERICTO-016",
+            "VERICTO-017",
+            "VERICTO-018",
+            "VERICTO-019",
+        ] {
+            assert_eq!(RuleClass::for_code(c), SchemaMigration, "{c}");
+        }
+        // Data mutation
+        for c in [
+            "VERICTO-001",
+            "VERICTO-002",
+            "VERICTO-003",
+            "VERICTO-030",
+            "VERICTO-031",
+            "VERICTO-033",
+            "VERICTO-040",
+            "VERICTO-042",
+            "VERICTO-083",
+            "VERICTO-084",
+        ] {
+            assert_eq!(RuleClass::for_code(c), DataMutation, "{c}");
+        }
+        // Security
+        for c in [
+            "VERICTO-070",
+            "VERICTO-080",
+            "VERICTO-081",
+            "VERICTO-082",
+            "VERICTO-090",
+        ] {
+            assert_eq!(RuleClass::for_code(c), Security, "{c}");
+        }
+        // Performance
+        for c in ["VERICTO-050", "VERICTO-051", "VERICTO-060", "VERICTO-061"] {
+            assert_eq!(RuleClass::for_code(c), Performance, "{c}");
+        }
+        // Unknown / custom → conservative default (never softened by a cap).
+        assert_eq!(RuleClass::for_code("CUSTOM-001"), DataMutation);
+        assert_eq!(RuleClass::for_code("VERICTO-999"), DataMutation);
+    }
+
+    // ── schema_migration_cap (per-channel ceiling) ────────────────────────────
+    #[test]
+    fn no_cap_is_identical_to_action_for() {
+        // Backward-compat: default policy (cap None) resolves every class exactly
+        // as the plain severity mapping does.
+        let policy = EnforcementPolicy::default();
+        for class in [
+            RuleClass::SchemaMigration,
+            RuleClass::DataMutation,
+            RuleClass::Security,
+            RuleClass::Performance,
+        ] {
+            for sev in [
+                Severity::Critical,
+                Severity::High,
+                Severity::Medium,
+                Severity::Low,
+                Severity::Informational,
+            ] {
+                assert_eq!(policy.action_for_class(sev, class), policy.action_for(sev));
+            }
+        }
+    }
+
+    #[test]
+    fn ci_cap_softens_schema_but_not_data_or_security() {
+        // A CI-style policy: schema DDL capped at Flag, everything else full force.
+        let ci = EnforcementPolicy {
+            schema_migration_cap: Some(EnforcementAction::Flag),
+            ..EnforcementPolicy::default()
+        };
+        // Critical schema (DROP TABLE) → capped Block down to Flag.
+        assert_eq!(
+            ci.action_for_class(Severity::Critical, RuleClass::SchemaMigration),
+            EnforcementAction::Flag
+        );
+        // Critical data mutation (DELETE without WHERE) → still Block.
+        assert_eq!(
+            ci.action_for_class(Severity::Critical, RuleClass::DataMutation),
+            EnforcementAction::Block
+        );
+        // Critical security → still Block.
+        assert_eq!(
+            ci.action_for_class(Severity::Critical, RuleClass::Security),
+            EnforcementAction::Block
+        );
+    }
+
+    #[test]
+    fn cap_only_lowers_never_raises() {
+        // A cap of Block on a Medium-severity schema rule (base Flag) must not
+        // *raise* it to Block — the cap is a ceiling (min), not a floor.
+        let policy = EnforcementPolicy {
+            schema_migration_cap: Some(EnforcementAction::Block),
+            ..EnforcementPolicy::default()
+        };
+        assert_eq!(
+            policy.action_for_class(Severity::Medium, RuleClass::SchemaMigration),
+            EnforcementAction::Flag
+        );
+    }
+
+    #[test]
+    fn ci_cap_end_to_end_drop_table_flags_delete_blocks() {
+        // The whole point, end to end: on a CI policy, DROP TABLE reports (Flag)
+        // while DELETE-without-WHERE still blocks.
+        let ci = EnforcementPolicy {
+            schema_migration_cap: Some(EnforcementAction::Flag),
+            ..EnforcementPolicy::default()
+        };
+        let drop_rule = Rule {
+            rule_id: "VERICTO-010".into(),
+            code: "VERICTO-010".into(),
+            severity: Severity::Critical,
+            default_action: EnforcementAction::Block,
+            rule_type: RuleType::Standard,
+            ast_condition_yaml: None,
+        };
+        let del_rule = Rule {
+            rule_id: "VERICTO-001".into(),
+            code: "VERICTO-001".into(),
+            severity: Severity::Critical,
+            default_action: EnforcementAction::Block,
+            rule_type: RuleType::Standard,
+            ast_condition_yaml: None,
+        };
+
+        let drop = parser_for(Dialect::Postgres)
+            .parse("DROP TABLE users")
+            .unwrap();
+        let out = RuleEngine::evaluate(&drop, std::slice::from_ref(&drop_rule), &ci);
+        assert_eq!(out.decision, Decision::Flag, "DROP TABLE should FLAG in CI");
+
+        let del = parser_for(Dialect::Postgres)
+            .parse("DELETE FROM users")
+            .unwrap();
+        let out = RuleEngine::evaluate(&del, std::slice::from_ref(&del_rule), &ci);
+        assert_eq!(
+            out.decision,
+            Decision::Block,
+            "DELETE w/o WHERE must still BLOCK in CI"
+        );
     }
 }

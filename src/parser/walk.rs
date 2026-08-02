@@ -109,8 +109,17 @@ fn walk_statement(
         } => {
             let drop_object = match object_type {
                 ObjectType::Table => DropObjectKind::Table,
+                // sqlparser exposes DROP DATABASE as its own ObjectType —
+                // previously it fell into `_ => Other`, so on MySQL a
+                // `DROP DATABASE` was mis-classified. Map it explicitly so
+                // VERICTO-010's allowlist (Table|Database) catches it on every
+                // dialect, not just Postgres.
+                ObjectType::Database => DropObjectKind::Database,
                 ObjectType::Schema => DropObjectKind::Schema,
                 ObjectType::Index => DropObjectKind::Index,
+                // View/Trigger/Function/Policy/Sequence/… stay `Other`: they are
+                // not destructive table/data drops, so VERICTO-010 must not fire
+                // on them (that was the DROP POLICY false positive).
                 _ => DropObjectKind::Other,
             };
             let relation = names.first().map(|n| n.to_string());

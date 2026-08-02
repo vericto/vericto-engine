@@ -11,7 +11,7 @@
 use proptest::prelude::*;
 
 use crate::rules::engine::{
-    Decision, EnforcementAction, EnforcementPolicy, ParseErrorAction, Severity,
+    Decision, EnforcementAction, EnforcementPolicy, ParseErrorAction, RuleClass, Severity,
 };
 
 // ---------------------------------------------------------------------------
@@ -58,9 +58,19 @@ fn policy_strategy() -> impl Strategy<Value = EnforcementPolicy> {
         action_strategy(),
         parse_error_action_strategy(),
         any::<bool>(),
+        proptest::option::of(action_strategy()),
     )
         .prop_map(
-            |(critical, high, medium, low, informational, parse_error, monitor_mode)| {
+            |(
+                critical,
+                high,
+                medium,
+                low,
+                informational,
+                parse_error,
+                monitor_mode,
+                schema_migration_cap,
+            )| {
                 EnforcementPolicy {
                     critical,
                     high,
@@ -69,6 +79,7 @@ fn policy_strategy() -> impl Strategy<Value = EnforcementPolicy> {
                     informational,
                     parse_error,
                     monitor_mode,
+                    schema_migration_cap,
                 }
             },
         )
@@ -220,6 +231,42 @@ proptest! {
         // Monotonicity (R4.6): under the order Monitor < Flag < Block, enabling
         // monitor_mode never increases the resolved action.
         prop_assert!(with_monitor.action_for(s) <= without_monitor.action_for(s));
+    }
+
+    // Property: the per-class schema_migration_cap only ever LOWERS a
+    // SchemaMigration action (never raises it) and leaves every other class
+    // exactly equal to the plain severity mapping. This is the safety guarantee
+    // that a channel cap can't make enforcement more aggressive, nor soften a
+    // DataMutation / Security / Performance violation.
+    #[test]
+    fn p7_schema_cap_lowers_only_schema_and_never_raises(
+        policy in policy_strategy(),
+        s in severity_strategy(),
+        class in prop_oneof![
+            Just(RuleClass::SchemaMigration),
+            Just(RuleClass::DataMutation),
+            Just(RuleClass::Security),
+            Just(RuleClass::Performance),
+        ],
+    ) {
+        let capped = policy.action_for_class(s, class);
+        let base = policy.action_for(s);
+
+        // Never raises, for any class.
+        prop_assert!(capped <= base);
+
+        // Non-schema classes are untouched.
+        if class != RuleClass::SchemaMigration {
+            prop_assert_eq!(capped, base);
+        }
+
+        // Schema class equals min(base, cap) when a cap is set, else base.
+        match policy.schema_migration_cap {
+            Some(cap) if class == RuleClass::SchemaMigration => {
+                prop_assert_eq!(capped, base.min(cap));
+            }
+            _ => prop_assert_eq!(capped, base),
+        }
     }
 
     // Feature: severity-based-enforcement, Property 6: under the default policy

@@ -46,16 +46,18 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         })
         .map(|s| violation(rule, s, suggest_delete(s))),
 
-        // VERICTO-010: DROP TABLE / DROP DATABASE. Excludes DROP INDEX (own rule
-        // VERICTO-013) and DROP SCHEMA (own rule VERICTO-012) so the two no longer
-        // co-match on the same statement (ENG-010). DROP DATABASE is included
-        // here now that the PostgreSQL path emits DropObjectKind::Database
-        // (ENG-004); on MySQL it already arrived as a generic DropStmt.
+        // VERICTO-010: DROP TABLE / DROP DATABASE — the destructive object drops
+        // this rule is named for. Uses an ALLOWLIST (Table | Database), not a
+        // denylist: the old `!(Index | Schema)` form matched *every* other DROP,
+        // so DROP POLICY / TRIGGER / FUNCTION / VIEW / SEQUENCE (all parsed as
+        // DropObjectKind::Other) were flagged as critical table drops — a false
+        // positive on routine RLS/migration DDL. DROP INDEX has its own rule
+        // (VERICTO-013) and DROP SCHEMA VERICTO-012, so they are not covered here.
         "VERICTO-010" => find(stmts, |s| {
             s.kind == StatementKind::Drop
-                && !matches!(
+                && matches!(
                     s.drop_object,
-                    Some(DropObjectKind::Index) | Some(DropObjectKind::Schema)
+                    Some(DropObjectKind::Table) | Some(DropObjectKind::Database)
                 )
         })
         .map(|s| violation(rule, s, Some(suggest_migration()))),
@@ -712,9 +714,57 @@ mod tests {
 
     #[test]
     fn vetro_010_blocks_drop_database() {
-        // sqlparser represents DROP DATABASE under the generic DropStmt
-        let p = parse("DROP TABLE prod", Dialect::Postgres);
+        let p = parse("DROP DATABASE prod", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-010"), &p).is_some());
+    }
+
+    #[test]
+    fn vetro_010_blocks_drop_table_mysql() {
+        let p = parse("DROP TABLE users", Dialect::Mysql);
+        assert!(evaluate_rule(&make_rule("VERICTO-010"), &p).is_some());
+    }
+
+    #[test]
+    fn vetro_010_blocks_drop_database_mysql() {
+        // Regression: DROP DATABASE on MySQL used to map to DropObjectKind::Other
+        // (walk.rs) and only matched via the old catch-all denylist. It must
+        // still fire now that the rule uses an explicit Table|Database allowlist.
+        let p = parse("DROP DATABASE prod", Dialect::Mysql);
+        assert!(evaluate_rule(&make_rule("VERICTO-010"), &p).is_some());
+    }
+
+    // Regression for the DROP POLICY false positive (and its DDL siblings): none
+    // of these are destructive table/data drops, so VERICTO-010 must NOT fire.
+    #[test]
+    fn vetro_010_ignores_drop_policy() {
+        let p = parse(
+            "DROP POLICY IF EXISTS service_role_all ON public.oidc_trust_policies",
+            Dialect::Postgres,
+        );
+        assert!(
+            evaluate_rule(&make_rule("VERICTO-010"), &p).is_none(),
+            "DROP POLICY must not be treated as a DROP TABLE"
+        );
+    }
+
+    #[test]
+    fn vetro_010_ignores_drop_view_and_trigger() {
+        for sql in ["DROP VIEW v", "DROP TRIGGER t ON users", "DROP SEQUENCE s"] {
+            let p = parse(sql, Dialect::Postgres);
+            assert!(
+                evaluate_rule(&make_rule("VERICTO-010"), &p).is_none(),
+                "VERICTO-010 must not fire on: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn vetro_010_ignores_drop_index_and_schema() {
+        // These have their own rules (013 / 012); 010 must leave them alone.
+        let idx = parse("DROP INDEX idx_users_email", Dialect::Postgres);
+        assert!(evaluate_rule(&make_rule("VERICTO-010"), &idx).is_none());
+        let sch = parse("DROP SCHEMA analytics", Dialect::Postgres);
+        assert!(evaluate_rule(&make_rule("VERICTO-010"), &sch).is_none());
     }
 
     // ── VERICTO-011 ──────────────────────────────────────────────────────────

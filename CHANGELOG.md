@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.0] — 2026-08-02
+
+### Fixed
+
+- **VERICTO-010 false positive on non-table DROPs.** The rule matched every
+  `DROP` except `INDEX`/`SCHEMA` (a denylist), so `DROP POLICY`, `DROP TRIGGER`,
+  `DROP FUNCTION`, `DROP VIEW`, and `DROP SEQUENCE` (all parsed as
+  `DropObjectKind::Other`) were flagged as critical `DROP TABLE` — hitting
+  routine RLS/migration DDL. It now uses an allowlist (`Table | Database`).
+  `DROP DATABASE` is also mapped explicitly in the sqlparser path (`walk.rs`);
+  it previously fell into `Other`, so on MySQL it was mis-classified.
+
+### Added
+
+- **`RuleClass`** (`SchemaMigration` / `DataMutation` / `Security` /
+  `Performance`) — a static classification of each built-in rule by code,
+  independent of the channel it runs on. Custom/unknown codes default to
+  `DataMutation` (conservative: never softened by a class cap).
+- **`EnforcementPolicy.schema_migration_cap: Option<EnforcementAction>`** — an
+  optional per-channel ceiling for `SchemaMigration` findings. When set, a
+  schema/DDL violation's action is capped (`min`, never raised) at that value;
+  other classes are untouched. Lets a shift-left channel (CI) soften
+  `DROP`/`ALTER`/`TRUNCATE` to Flag while a runtime channel keeps blocking.
+  `None` is byte-for-byte the previous behavior. Additive to the public API:
+  consumers that build the policy via `EnforcementPolicy::default()` (proxy,
+  eval) need no changes.
+
 ## [3.1.1] — 2026-07-29
 
 Maintenance release: no API or behaviour changes.
