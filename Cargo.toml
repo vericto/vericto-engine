@@ -1,6 +1,6 @@
 [package]
 name = "vericto-engine"
-version = "3.2.0"
+version = "3.2.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Vericto — Deterministic SQL AST evaluation engine (open core)"
@@ -16,7 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # SQL parsing — AST engine
-pg_query = "5.1"
+pg_query = "6.2"
 sqlparser = "0.52"
 
 # Serialization

@@ -55,9 +55,13 @@ export LIBCLANG_PATH=$(brew --prefix llvm)/lib
 
 ## Adding a new standard rule
 
-1. Add the rule code to `rules/evaluator.rs` in the `evaluate_standard_rule` match block
+1. Add the rule code to `rules/evaluator.rs` in the `evaluate_builtin` match block
 2. Add a test case in the same file under `#[cfg(test)]`
-3. Document the rule in `README.md`
+3. Document the rule in the `README.md` catalogue table — `tests/rule_catalogue_sync.rs`
+   fails the build if the evaluator and the README table drift apart
+4. Classify the rule in `RuleClass::for_code` (`rules/engine.rs`). An unlisted
+   code silently falls back to `DataMutation`, so a missing entry does not fail
+   any test
 
 ## License
 

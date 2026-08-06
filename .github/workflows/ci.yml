@@ -12,8 +12,15 @@ env:
 
 jobs:
   test:
-    name: fmt + clippy + test
-    runs-on: ubuntu-latest
+    name: fmt + clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Report every platform's result: a macOS-only break (e.g. the vendored
+      # PostgreSQL sources in pg_query failing against a newer Xcode SDK) must
+      # not be masked by Linux passing, nor cancel the Linux job.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4.2.2
 
@@ -23,11 +30,21 @@ jobs:
           toolchain: "1.88.0"
           components: rustfmt, clippy
 
-      - name: Install system dependencies (libclang + protoc for pg_query)
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libclang-dev clang libssl-dev pkg-config protobuf-compiler
+
+      # Only protoc is installed here: pg_query's build also needs libclang
+      # (via bindgen), but the runner already ships it with the Xcode Command
+      # Line Tools, so bindgen finds it without brew's llvm or LIBCLANG_PATH.
+      # If a future runner image drops the CLT, add `llvm` here and export
+      # LIBCLANG_PATH=$(brew --prefix llvm)/lib (see CONTRIBUTING.md).
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
 
       - name: Cache cargo registry and target
         uses: actions/cache@v4.2.3
