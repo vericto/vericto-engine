@@ -97,21 +97,21 @@ fn walk_node(
                 // Map the libpg_query subtype to our normalized kind. Trigger
                 // disabling has several subtypes (single/all/user); all of them
                 // disable a protection and map to DisableTrigger.
-                let (kind, path) = match AlterTableType::from_i32(c.subtype) {
-                    Some(AlterTableType::AtDropColumn) => {
+                let (kind, path) = match AlterTableType::try_from(c.subtype) {
+                    Ok(AlterTableType::AtDropColumn) => {
                         (AlterTableKind::DropColumn, "AlterTableStmt > DropColumn")
                     }
-                    Some(AlterTableType::AtDropConstraint) => (
+                    Ok(AlterTableType::AtDropConstraint) => (
                         AlterTableKind::DropConstraint,
                         "AlterTableStmt > DropConstraint",
                     ),
-                    Some(AlterTableType::AtAlterColumnType) => (
+                    Ok(AlterTableType::AtAlterColumnType) => (
                         AlterTableKind::AlterColumnType,
                         "AlterTableStmt > AlterColumnType",
                     ),
-                    Some(AlterTableType::AtDisableTrig)
-                    | Some(AlterTableType::AtDisableTrigAll)
-                    | Some(AlterTableType::AtDisableTrigUser) => (
+                    Ok(AlterTableType::AtDisableTrig)
+                    | Ok(AlterTableType::AtDisableTrigAll)
+                    | Ok(AlterTableType::AtDisableTrigUser) => (
                         AlterTableKind::DisableTrigger,
                         "AlterTableStmt > DisableTrigger",
                     ),
@@ -133,8 +133,8 @@ fn walk_node(
         // AlterTableCmd subtype.
         NodeEnum::RenameStmt(stmt) => {
             if matches!(
-                ObjectType::from_i32(stmt.rename_type),
-                Some(ObjectType::ObjectTable) | Some(ObjectType::ObjectColumn)
+                ObjectType::try_from(stmt.rename_type),
+                Ok(ObjectType::ObjectTable) | Ok(ObjectType::ObjectColumn)
             ) {
                 out.push(StatementInfo {
                     kind: StatementKind::AlterTable,
@@ -584,21 +584,21 @@ fn is_always_true(node: &NodeEnum) -> bool {
         }
         NodeEnum::BoolExpr(b) => {
             use pg_query::protobuf::BoolExprType;
-            match BoolExprType::from_i32(b.boolop) {
-                Some(BoolExprType::AndExpr) => {
+            match BoolExprType::try_from(b.boolop) {
+                Ok(BoolExprType::AndExpr) => {
                     !b.args.is_empty()
                         && b.args
                             .iter()
                             .filter_map(|n| n.node.as_ref())
                             .all(is_always_true)
                 }
-                Some(BoolExprType::OrExpr) => b
+                Ok(BoolExprType::OrExpr) => b
                     .args
                     .iter()
                     .filter_map(|n| n.node.as_ref())
                     .any(is_always_true),
                 // `NOT x` is always true when `x` is always false.
-                Some(BoolExprType::NotExpr) => b
+                Ok(BoolExprType::NotExpr) => b
                     .args
                     .iter()
                     .filter_map(|n| n.node.as_ref())
@@ -631,14 +631,11 @@ fn is_always_false(node: &NodeEnum) -> bool {
         }
         NodeEnum::BoolExpr(b) => {
             use pg_query::protobuf::BoolExprType;
-            matches!(
-                BoolExprType::from_i32(b.boolop),
-                Some(BoolExprType::NotExpr)
-            ) && b
-                .args
-                .iter()
-                .filter_map(|n| n.node.as_ref())
-                .all(is_always_true)
+            matches!(BoolExprType::try_from(b.boolop), Ok(BoolExprType::NotExpr))
+                && b.args
+                    .iter()
+                    .filter_map(|n| n.node.as_ref())
+                    .all(is_always_true)
         }
         _ => false,
     }
@@ -757,11 +754,11 @@ fn has_or_tautology(node: &NodeEnum) -> bool {
         return false;
     };
     let children = || b.args.iter().filter_map(|n| n.node.as_ref());
-    match BoolExprType::from_i32(b.boolop) {
-        Some(BoolExprType::OrExpr) => {
+    match BoolExprType::try_from(b.boolop) {
+        Ok(BoolExprType::OrExpr) => {
             children().any(is_always_true) || children().any(has_or_tautology)
         }
-        Some(BoolExprType::AndExpr) => children().any(has_or_tautology),
+        Ok(BoolExprType::AndExpr) => children().any(has_or_tautology),
         _ => false,
     }
 }
@@ -803,13 +800,13 @@ fn target_list_has_star(target_list: &[Node]) -> bool {
 }
 
 /// Map the `remove_type` integer (ObjectType protobuf enum) to `DropObjectKind`.
-/// Uses `from_i32()` rather than `TryFrom<i32>` — the pg_query protobuf enums
-/// do not implement the latter.
+/// An unrecognized discriminant maps to `Other`, so an unknown DROP target is
+/// never mistaken for a table/schema/index.
 fn drop_kind(remove_type: i32) -> DropObjectKind {
-    match ObjectType::from_i32(remove_type) {
-        Some(ObjectType::ObjectTable) => DropObjectKind::Table,
-        Some(ObjectType::ObjectSchema) => DropObjectKind::Schema,
-        Some(ObjectType::ObjectIndex) => DropObjectKind::Index,
+    match ObjectType::try_from(remove_type) {
+        Ok(ObjectType::ObjectTable) => DropObjectKind::Table,
+        Ok(ObjectType::ObjectSchema) => DropObjectKind::Schema,
+        Ok(ObjectType::ObjectIndex) => DropObjectKind::Index,
         _ => DropObjectKind::Other,
     }
 }

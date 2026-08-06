@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.1] — 2026-08-06
+
+Portability and correctness fixes. No breaking API changes.
+
+### Fixed
+
+- **Build failure on macOS with the current Xcode SDK.** `cargo build` aborted
+  in `pg_query`'s vendored PostgreSQL sources with
+  `static declaration of 'strchrnul' follows non-static declaration`: macOS
+  15.4+ SDKs declare `strchrnul` in `<string.h>`, colliding with the static
+  fallback that the bundled `src_port_snprintf.c` defines when
+  `HAVE_STRCHRNUL` is unset. PostgreSQL fixed this upstream in April 2025, but
+  `pg_query 5.1.1` vendors PostgreSQL 16.1 (November 2023), which predates the
+  fix. Bumping to `pg_query 6.2` (PostgreSQL 17.7) picks it up. CI was green
+  throughout because it only ran on Linux — see the CI matrix change below.
+
+### Changed
+
+- **`pg_query` 5.1 → 6.2** (vendored PostgreSQL 16.1 → 17.7; pulls `prost`
+  0.10 → 0.13 transitively). No public API or behaviour change: the existing
+  test suite passes unmodified.
+- **Internal: migrated the protobuf enum conversions from the deprecated
+  `from_i32()` to `TryFrom<i32>`** (6 call sites in `parser/pg_ast.rs`).
+  `pg_query 6.x` deprecates `from_i32`, which `cargo clippy -D warnings`
+  (as CI runs it) treats as an error. The conversion returns `Result` rather
+  than `Option`, so the match arms moved from `Some(..)` to `Ok(..)`; the
+  unrecognized-discriminant fallbacks are unchanged.
+- **CI now runs on `ubuntu-latest` *and* `macos-latest`** (`fail-fast: false`,
+  so one platform's failure neither masks nor cancels the other). The
+  system-dependency step is split per `runner.os`: `apt-get` on Linux,
+  `brew install protobuf` on macOS — `libclang` (needed by `bindgen`) comes
+  from the runner's preinstalled Xcode Command Line Tools. This is the guard
+  that would have caught the macOS break above.
+
+### Documentation
+
+- **`CONTRIBUTING.md` pointed new rules at a function that does not exist.**
+  The "Adding a new standard rule" checklist named `evaluate_standard_rule`;
+  the real entry point is `evaluate_builtin`. The checklist also now mentions
+  the `tests/rule_catalogue_sync.rs` guard (which fails the build when the
+  evaluator and the README table drift apart) and the `RuleClass::for_code`
+  classification step, whose omission is silent because unlisted codes fall
+  back to `DataMutation`.
+
 ## [3.2.0] — 2026-08-02
 
 ### Fixed
