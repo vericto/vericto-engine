@@ -40,6 +40,10 @@ Portability and correctness fixes. No breaking API changes.
   `brew install protobuf` on macOS — `libclang` (needed by `bindgen`) comes
   from the runner's preinstalled Xcode Command Line Tools. This is the guard
   that would have caught the macOS break above.
+- **CI now also runs on pull requests that do not target `main`.** The
+  `pull_request` trigger filtered on `branches: [main]`, so a stacked PR — one
+  based on another open branch — reported no checks at all and could be merged
+  unverified. The filter is removed; `push` is still restricted to `main`.
 
 ### Documentation
 
