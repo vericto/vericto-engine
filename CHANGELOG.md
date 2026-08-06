@@ -9,10 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [3.2.1] — 2026-08-06
 
-Portability and correctness fixes. No breaking API changes.
+Correctness and portability fixes. No breaking API changes: the only public-API
+addition is the `StatementInfo.insert_select_has_filter` field described below.
 
 ### Fixed
 
+- **Custom-rule `where_always_true` did not match a bare `WHERE 1=1`.** The
+  predicate tested `has_or_tautology` alone, which is only true for an
+  always-true *OR branch* (`WHERE id = 5 OR 1=1`); a WHERE that is trivially
+  true as a whole (`WHERE 1=1`, `WHERE true`) is recorded as
+  `WherePresence::AlwaysTrue` and was silently skipped. The published predicate
+  reference documents both shapes — the table cites `1=1`/`true` while the
+  worked example cites `id = 1 OR 1=1` — so a rule written against the table
+  never fired. It now matches either shape, which only widens what the
+  predicate catches: every query that matched before still matches.
+- **VERICTO-040 false positive on a filtered `INSERT … SELECT`.** The predicate
+  only checked that the INSERT had a SELECT source, never that the source was
+  unfiltered — so `INSERT INTO t SELECT … WHERE id = $1` was reported (and,
+  wherever the rule is configured to Block, as it is in the TCP proxy's default
+  ruleset, rejected) with an `ast_node_path` that claimed `(no WHERE)`. The rule
+  now fires only when the source has no filter, matching the description it has
+  always carried in the README catalogue.
+  A source is considered filtered when it has an *effective* `WHERE` or a row
+  limit (`LIMIT`/`FETCH`). A tautological `WHERE 1=1` bounds nothing and still
+  fires. A set-operation source (`UNION`/`INTERSECT`/`EXCEPT`) is
+  conservatively treated as unfiltered — over-reporting is the safe direction
+  for a blocking rule.
+  Implemented as a new `StatementInfo.insert_select_has_filter` field populated
+  by both walkers, because the source SELECT is recorded as a separate nested
+  statement and the rule predicate cannot reach its `where_presence` from the
+  INSERT entry. Additive to the public API.
+- **`error.rs` module docs contradicted the default parse-error policy.** The
+  header stated that an unparseable query "is blocked as a precaution
+  (fail-closed)", but the shipped default is `ParseErrorAction::AllowReport`
+  (fail-open: forward + report, R4.8) — the opposite, on the security-critical
+  default. The docs now state that the disposition is the host's policy
+  decision and name both options.
 - **Build failure on macOS with the current Xcode SDK.** `cargo build` aborted
   in `pg_query`'s vendored PostgreSQL sources with
   `static declaration of 'strchrnul' follows non-static declaration`: macOS
@@ -43,6 +75,15 @@ Portability and correctness fixes. No breaking API changes.
 
 ### Documentation
 
+- **`MAX_QUERY_SIZE_BYTES` now states that this crate does not enforce it.** The
+  previous one-liner ("enforced by the coding standards") named no enforcement
+  point, which reads as though the engine applies the limit; it does not —
+  neither `evaluate` nor `SqlParser::parse` checks input length. The constant is
+  published so hosts share one threshold, and the doc now says so, notes that
+  `MAX_AST_DEPTH` bounds nesting depth rather than input size, and carries a
+  doctest showing the guard paired with `ProxyError::QueryTooLarge`.
+- **Custom-rule predicate table** (`README.md`) now describes both WHERE shapes
+  `where_always_true` matches, instead of only the `OR 1=1` form.
 - **`CONTRIBUTING.md` pointed new rules at a function that does not exist.**
   The "Adding a new standard rule" checklist named `evaluate_standard_rule`;
   the real entry point is `evaluate_builtin`. The checklist also now mentions

@@ -153,6 +153,20 @@ pub struct StatementInfo {
     pub insert_has_columns: bool,
     /// Whether INSERT uses a SELECT as its source.
     pub insert_has_select: bool,
+    /// Whether the SELECT sourcing an `INSERT … SELECT` carries a filter that
+    /// stops it from copying every source row: an *effective* WHERE (a
+    /// tautology like `WHERE 1=1` does not count) or a row limit
+    /// (`LIMIT`/`FETCH`). Used by VERICTO-040.
+    ///
+    /// Lives on the INSERT's own `StatementInfo` because the source SELECT is
+    /// recorded as a separate (nested) statement, so the rule predicate cannot
+    /// reach its `where_presence` from the INSERT entry.
+    ///
+    /// Conservatively `false` when the source is a set operation
+    /// (`UNION`/`INTERSECT`/`EXCEPT`), even if every arm is filtered: the
+    /// set-op node carries no WHERE of its own and the arms are not inspected.
+    /// Over-reporting is the safe direction for a blocking rule.
+    pub insert_select_has_filter: bool,
     /// Whether SELECT uses LIMIT.
     pub select_has_limit: bool,
     /// Whether SELECT target list is `*` (star).
@@ -185,6 +199,7 @@ impl Default for StatementInfo {
             insert_row_count: None,
             insert_has_columns: false,
             insert_has_select: false,
+            insert_select_has_filter: false,
             select_has_limit: false,
             select_is_star: false,
             function_name: None,

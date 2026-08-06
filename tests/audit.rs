@@ -219,6 +219,65 @@ fn eng_002_003_pg_insert() {
     assert!(!m.contains(&"VERICTO-040".to_string()), "got {m:?}");
 }
 
+/// VERICTO-040 only fires on an *unfiltered* `INSERT … SELECT`. A source bounded
+/// by an effective WHERE or a LIMIT is not an unbounded copy; the rule used to
+/// match on `insert_has_select` alone and reported those too (and rejects them
+/// wherever the rule is configured to Block). Checked on both parser paths,
+/// since the two walkers populate the field independently.
+#[test]
+fn vericto_040_does_not_fire_on_a_filtered_insert_select() {
+    let policy = EnforcementPolicy::default();
+    for dialect in [Dialect::Postgres, Dialect::Mysql] {
+        // Unfiltered → fires.
+        let m = matching_codes(
+            "INSERT INTO archive SELECT * FROM users",
+            dialect,
+            &ruleset(),
+            &policy,
+        );
+        assert!(
+            m.contains(&"VERICTO-040".to_string()),
+            "{dialect:?}: unfiltered INSERT … SELECT must fire, got {m:?}"
+        );
+
+        // WHERE-filtered → does not fire.
+        let m = matching_codes(
+            "INSERT INTO archive SELECT * FROM users WHERE id = 1",
+            dialect,
+            &ruleset(),
+            &policy,
+        );
+        assert!(
+            !m.contains(&"VERICTO-040".to_string()),
+            "{dialect:?}: WHERE-filtered INSERT … SELECT must NOT fire, got {m:?}"
+        );
+
+        // LIMIT-bounded → does not fire.
+        let m = matching_codes(
+            "INSERT INTO archive SELECT * FROM users LIMIT 100",
+            dialect,
+            &ruleset(),
+            &policy,
+        );
+        assert!(
+            !m.contains(&"VERICTO-040".to_string()),
+            "{dialect:?}: LIMIT-bounded INSERT … SELECT must NOT fire, got {m:?}"
+        );
+
+        // A tautology bounds nothing → still fires.
+        let m = matching_codes(
+            "INSERT INTO archive SELECT * FROM users WHERE 1 = 1",
+            dialect,
+            &ruleset(),
+            &policy,
+        );
+        assert!(
+            m.contains(&"VERICTO-040".to_string()),
+            "{dialect:?}: tautological WHERE is not a filter, got {m:?}"
+        );
+    }
+}
+
 #[test]
 fn eng_004_drop_database_pg() {
     assert_matches(
