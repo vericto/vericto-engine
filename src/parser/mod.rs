@@ -233,3 +233,18 @@ pub fn parser_for(dialect: Dialect) -> Box<dyn SqlParser> {
         Dialect::MsSql => Box::new(mssql::MsSqlParser::new()),
     }
 }
+
+/// Sleep-family functions used for DoS or time-based blind SQL injection
+/// (VERICTO-070). `name` must already be lowercased.
+///
+/// Lives here rather than in either walker because both `pg_ast` (PostgreSQL)
+/// and `walk` (sqlparser dialects) need it, and keeping two lists in sync by
+/// convention already failed: the sqlparser walker was missing
+/// `pg_sleep_until`, so the rule fired on PostgreSQL but not on MySQL, Oracle,
+/// or MS SQL. One definition makes that drift impossible.
+pub(crate) fn is_sleep_function(name: &str) -> bool {
+    matches!(
+        name,
+        "sleep" | "pg_sleep" | "pg_sleep_for" | "pg_sleep_until"
+    )
+}

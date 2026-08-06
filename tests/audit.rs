@@ -336,6 +336,35 @@ fn eng_006_sleep_in_projection() {
     );
 }
 
+/// VERICTO-070 must fire on the same sleep functions regardless of dialect.
+///
+/// Regression: the sqlparser walker (MySQL, Oracle, MS SQL) omitted
+/// `pg_sleep_until` while the pg_query walker (PostgreSQL) had it, so a
+/// time-based blind-injection probe using that function was reported on
+/// PostgreSQL and silently allowed everywhere else.
+#[test]
+fn vericto_070_detects_every_sleep_variant_on_every_dialect() {
+    for sql in [
+        "SELECT sleep(5)",
+        "SELECT pg_sleep(5)",
+        "SELECT pg_sleep_for('5 seconds')",
+        "SELECT pg_sleep_until('tomorrow')",
+    ] {
+        for dialect in [
+            Dialect::Postgres,
+            Dialect::Mysql,
+            Dialect::Oracle,
+            Dialect::MsSql,
+        ] {
+            let m = matching_codes(sql, dialect, &ruleset(), &EnforcementPolicy::default());
+            assert!(
+                m.contains(&"VERICTO-070".to_string()),
+                "{sql} on {dialect:?} got {m:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn eng_007_dangerous_pg_statements() {
     assert_matches(
