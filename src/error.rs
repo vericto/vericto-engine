@@ -1,12 +1,44 @@
 //! Vericto proxy error types.
 //!
 //! `ProxyError` covers failures in the AST evaluation path. Parse errors get
-//! special treatment: a query that does not parse is blocked as a precaution
-//! (fail-closed) and reported as `PARSE_ERROR`.
+//! special treatment: a query that does not parse is reported as
+//! `PARSE_ERROR`, and whether it is forwarded or rejected is the host's
+//! policy decision, not this crate's — see
+//! [`EnforcementPolicy::parse_error`](crate::EnforcementPolicy::parse_error).
+//! The default is [`ParseErrorAction::AllowReport`](crate::ParseErrorAction)
+//! (fail-open: forward + report, R4.8); [`ParseErrorAction::Block`] is the
+//! fail-closed opt-in (R4.9).
 
 use thiserror::Error;
 
-/// Query size limit (64KB) enforced by the coding standards.
+/// Recommended maximum query size in bytes (64KB).
+///
+/// **This crate does not enforce it.** Neither [`crate::evaluate`] nor
+/// [`SqlParser::parse`](crate::parser::SqlParser::parse) checks the input
+/// length: the limit is published here so every host applies the same
+/// threshold, and the host is the layer that can reject an oversized query
+/// before deserializing or copying it.
+///
+/// A host that skips the check hands unbounded input to the parsers. Parse cost
+/// grows with input size and [`MAX_AST_DEPTH`] does not bound it — that guard
+/// limits nesting *depth*, not breadth, so a wide statement (for example an
+/// `INSERT` with hundreds of thousands of value tuples) stays shallow while
+/// taking time proportional to its size.
+///
+/// Enforce it on the way in, and pair it with [`ProxyError::QueryTooLarge`]:
+///
+/// ```rust
+/// use vericto_engine::error::{MAX_QUERY_SIZE_BYTES, ProxyError};
+///
+/// fn guard(sql: &str) -> Result<(), ProxyError> {
+///     if sql.len() > MAX_QUERY_SIZE_BYTES {
+///         return Err(ProxyError::QueryTooLarge);
+///     }
+///     Ok(())
+/// }
+///
+/// assert!(guard("SELECT 1").is_ok());
+/// ```
 pub const MAX_QUERY_SIZE_BYTES: usize = 64 * 1024;
 
 /// Maximum AST depth that is walked (50 levels).

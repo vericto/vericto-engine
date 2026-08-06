@@ -274,12 +274,19 @@ fn walk_node(
             //   - real SELECT → set insert_has_select for VERICTO-040.
             let mut insert_has_select = false;
             let mut insert_row_count = None;
+            let mut insert_select_has_filter = false;
             if let Some(sel) = stmt.select_stmt.as_deref() {
                 if let Some(NodeEnum::SelectStmt(inner)) = sel.node.as_ref() {
                     if !inner.values_lists.is_empty() {
                         insert_row_count = Some(inner.values_lists.len());
                     } else {
                         insert_has_select = true;
+                        // Does the source bound the rows it copies? An effective
+                        // WHERE or a LIMIT both do; a tautological WHERE does
+                        // not (`where_presence` reports it as AlwaysTrue).
+                        insert_select_has_filter = where_presence(inner.where_clause.as_deref())
+                            == WherePresence::Present
+                            || inner.limit_count.is_some();
                     }
                 }
             }
@@ -291,6 +298,7 @@ fn walk_node(
                 ast_node_path: "InsertStmt".to_string(),
                 insert_has_columns: has_cols,
                 insert_has_select,
+                insert_select_has_filter,
                 insert_row_count,
                 ..Default::default()
             });
@@ -927,6 +935,51 @@ mod tests {
             .find(|s| s.kind == StatementKind::Select)
             .expect("must detect the SELECT");
         assert_eq!(select.where_presence, WherePresence::Present);
+    }
+
+    // ── INSERT … SELECT source filter (VERICTO-040 input) ──────────────────
+
+    /// The INSERT's own StatementInfo (the source SELECT is recorded separately).
+    fn insert_stmt(sql: &str) -> StatementInfo {
+        parse_postgres(sql)
+            .unwrap()
+            .statements
+            .into_iter()
+            .find(|s| s.kind == StatementKind::Insert)
+            .expect("must detect INSERT")
+    }
+
+    #[test]
+    fn insert_select_unfiltered_has_no_filter() {
+        let ins = insert_stmt("INSERT INTO archive SELECT * FROM users");
+        assert!(ins.insert_has_select);
+        assert!(!ins.insert_select_has_filter);
+    }
+
+    #[test]
+    fn insert_select_with_where_has_filter() {
+        let ins = insert_stmt("INSERT INTO archive SELECT * FROM users WHERE id = 1");
+        assert!(ins.insert_select_has_filter);
+    }
+
+    #[test]
+    fn insert_select_with_limit_has_filter() {
+        let ins = insert_stmt("INSERT INTO archive SELECT * FROM users LIMIT 100");
+        assert!(ins.insert_select_has_filter);
+    }
+
+    // A tautology does not bound anything, so it is not a filter.
+    #[test]
+    fn insert_select_with_tautology_has_no_filter() {
+        let ins = insert_stmt("INSERT INTO archive SELECT * FROM users WHERE 1 = 1");
+        assert!(!ins.insert_select_has_filter);
+    }
+
+    #[test]
+    fn insert_values_has_no_select_and_no_filter() {
+        let ins = insert_stmt("INSERT INTO t (a) VALUES (1)");
+        assert!(!ins.insert_has_select);
+        assert!(!ins.insert_select_has_filter);
     }
 
     // ── ALTER TABLE / RENAME / DROP INDEX / OR-tautology ───────────────────

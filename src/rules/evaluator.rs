@@ -278,10 +278,14 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         })
         .map(|s| violation(rule, s, suggest_delete(s))),
 
-        // VERICTO-040: INSERT INTO … SELECT without a WHERE filter on the SELECT.
-        // This copies every row from the source, which can be accidental.
+        // VERICTO-040: INSERT INTO … SELECT whose source has no filter, which
+        // copies every source row. A source bounded by an effective WHERE or a
+        // LIMIT/FETCH does not match — it is not an unbounded copy. Previously
+        // the predicate only checked `insert_has_select`, so a filtered
+        // `INSERT … SELECT … WHERE id = $1` was reported (and, where the rule
+        // is Block, rejected) with evidence that claimed "no WHERE".
         "VERICTO-040" => find(stmts, |s| {
-            s.kind == StatementKind::Insert && s.insert_has_select
+            s.kind == StatementKind::Insert && s.insert_has_select && !s.insert_select_has_filter
         })
         .map(|s| {
             let mut v = violation(
@@ -292,7 +296,7 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
                     s.relation.as_deref().unwrap_or("{table}")
                 )),
             );
-            v.ast_node_path = "InsertStmt > source = SelectStmt (no WHERE)".to_string();
+            v.ast_node_path = "InsertStmt > source = SelectStmt (unfiltered)".to_string();
             v
         }),
 
@@ -554,9 +558,14 @@ fn evaluate_custom(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         if where_clause_present && s.where_presence == WherePresence::Present {
             return false;
         }
-        // where_always_true: true → require a trivially-true predicate (OR 1=1, …).
+        // where_always_true: true → require a WHERE that does not actually
+        // filter. Two shapes qualify, and the published predicate reference
+        // documents both: the whole predicate is trivially true (`WHERE 1=1`,
+        // `WHERE true` → WherePresence::AlwaysTrue), or it carries an
+        // always-true OR branch (`WHERE id = 5 OR 1=1` → has_or_tautology).
+        // Checking only the OR form silently failed to match `WHERE 1=1`.
         if cond_get("where_always_true").and_then(|v| v.as_bool()) == Some(true)
-            && !s.has_or_tautology
+            && !(s.where_presence == WherePresence::AlwaysTrue || s.has_or_tautology)
         {
             return false;
         }
@@ -1036,6 +1045,35 @@ mod tests {
             )
             .is_some()
         );
+        assert!(
+            evaluate_rule(
+                &rule,
+                &parse("DELETE FROM users WHERE id = 1", Dialect::Postgres)
+            )
+            .is_none()
+        );
+    }
+
+    /// `where_always_true` must also match a WHERE that is trivially true as a
+    /// whole (`WHERE 1=1`, `WHERE true`), not only an always-true OR branch.
+    /// The predicate previously read `has_or_tautology` alone, which is false
+    /// for a bare `1=1` (it is an A_Expr, not a BoolExpr), so these silently
+    /// did not match despite being the exact form the predicate reference cites.
+    #[test]
+    fn custom_where_always_true_matches_bare_tautology() {
+        let rule = make_custom_rule(
+            "rule: block-always-true\nnode_type: DeleteStmt\ncondition:\n  where_always_true: true",
+        );
+        for sql in [
+            "DELETE FROM users WHERE 1 = 1",
+            "DELETE FROM users WHERE true",
+        ] {
+            assert!(
+                evaluate_rule(&rule, &parse(sql, Dialect::Postgres)).is_some(),
+                "{sql} must match where_always_true"
+            );
+        }
+        // An effective predicate still must not match.
         assert!(
             evaluate_rule(
                 &rule,

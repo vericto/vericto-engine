@@ -216,6 +216,24 @@ fn walk_statement(
                 None => false,
             };
 
+            // Does the source bound the rows it copies? An effective WHERE or a
+            // row limit both do; a tautological WHERE (`1=1`) does not. Mirrors
+            // the pg_query path so VERICTO-040 behaves the same per dialect.
+            let insert_select_has_filter = match insert.source.as_deref() {
+                Some(query) => match query.body.as_ref() {
+                    SetExpr::Select(select) => {
+                        let effective_where = select
+                            .selection
+                            .as_ref()
+                            .map(|e| !is_always_true(e))
+                            .unwrap_or(false);
+                        effective_where || query.limit.is_some() || query.fetch.is_some()
+                    }
+                    _ => false,
+                },
+                None => false,
+            };
+
             out.push(StatementInfo {
                 kind: StatementKind::Insert,
                 relation: Some(insert.table_name.to_string()),
@@ -223,6 +241,7 @@ fn walk_statement(
                 ast_node_path: "InsertStmt".to_string(),
                 insert_has_columns: has_columns,
                 insert_has_select,
+                insert_select_has_filter,
                 insert_row_count,
                 ..Default::default()
             });
@@ -740,6 +759,44 @@ mod tests {
         let p = parse_pg("UPDATE products SET price = 0");
         assert_eq!(p.statements[0].kind, StatementKind::Update);
         assert_eq!(p.statements[0].where_presence, WherePresence::Absent);
+    }
+
+    // VERICTO-040 inputs: `insert_select_has_filter` must be true only when the
+    // source SELECT actually bounds the rows it copies.
+    #[test]
+    fn insert_select_unfiltered_has_no_filter() {
+        let p = parse_pg("INSERT INTO archive SELECT * FROM users");
+        let ins = &p.statements[0];
+        assert_eq!(ins.kind, StatementKind::Insert);
+        assert!(ins.insert_has_select);
+        assert!(!ins.insert_select_has_filter);
+    }
+
+    #[test]
+    fn insert_select_with_where_has_filter() {
+        let p = parse_pg("INSERT INTO archive SELECT * FROM users WHERE id = 1");
+        assert!(p.statements[0].insert_select_has_filter);
+    }
+
+    #[test]
+    fn insert_select_with_limit_has_filter() {
+        let p = parse_pg("INSERT INTO archive SELECT * FROM users LIMIT 100");
+        assert!(p.statements[0].insert_select_has_filter);
+    }
+
+    // A tautology does not bound anything, so it is not a filter.
+    #[test]
+    fn insert_select_with_tautology_has_no_filter() {
+        let p = parse_pg("INSERT INTO archive SELECT * FROM users WHERE 1 = 1");
+        assert!(!p.statements[0].insert_select_has_filter);
+    }
+
+    // VALUES sources are not SELECT sources at all.
+    #[test]
+    fn insert_values_has_no_select_and_no_filter() {
+        let p = parse_pg("INSERT INTO t (a) VALUES (1)");
+        assert!(!p.statements[0].insert_has_select);
+        assert!(!p.statements[0].insert_select_has_filter);
     }
 
     #[test]

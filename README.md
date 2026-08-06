@@ -157,7 +157,7 @@ Predicates under `condition:`:
 |---|---|---|
 | `relation: <table>` | any | Scope to a table (case-insensitive, schema-agnostic) |
 | `where_clause: null` | DELETE/UPDATE/SELECT | No WHERE clause |
-| `where_always_true: true` | DELETE/UPDATE/SELECT | Trivially-true WHERE (`OR 1=1`) |
+| `where_always_true: true` | DELETE/UPDATE/SELECT | WHERE that matches every row: trivially true (`1=1`, `true`) or with an always-true OR branch (`id = 5 OR 1=1`) |
 | `target_list: "*"` | SELECT | `SELECT *` |
 | `has_limit: false` | SELECT | No LIMIT |
 | `func_name: <name>` | FuncCall | Function by name (case-insensitive) |
