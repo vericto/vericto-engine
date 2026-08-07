@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **The cargo cache step in CI.** Its key was
+  `${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}`, but `Cargo.lock` is
+  git-ignored for this library, so on a clean checkout `hashFiles` matched nothing
+  and returned an empty string. The key collapsed to the constant
+  `Linux-cargo-` / `macOS-cargo-`, which always hit exactly — and `actions/cache`
+  does not save on an exact hit, so the cache could never update. The Linux entry
+  dated from before the `pg_query` 5.1 → 6.2 bump, which is why that job took
+  2m20s while macOS, whose cache happened to be created after the bump, took 35s.
+  Removed rather than re-keyed: every run now builds from a clean tree, so no
+  stale artifact can mask a real break, and there is no cache key to drift again.
+
 ## [3.2.2] — 2026-08-06
 
 Cross-dialect rule parity and a documentation fix. No API or behaviour changes
