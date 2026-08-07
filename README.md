@@ -63,6 +63,12 @@ fn is_safe(sql: &str, rules: &[Rule], policy: &EnforcementPolicy) -> bool {
 }
 ```
 
+A query may violate several rules at once; the outcome reports the one with the
+highest severity. When several share the top severity, the one with the lowest
+`code` wins. The order of the `rules` slice never affects the result, so you do
+not need to sort it — the same query and ruleset always report the same
+violation.
+
 ---
 
 ## Supported dialects

@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.4] — 2026-08-07
+
+### Fixed
+
+- **Which violation is reported no longer depends on the order of the `rules`
+  slice.** When two violated rules shared the top severity the comparison was
+  `rule.severity > best_severity`, strictly greater, so the first one in the
+  caller's slice won. Rule order is not a property of the query being evaluated,
+  and the control plane serves its ruleset from a query with no `ORDER BY`, so
+  the same query against the same ruleset could report different codes between
+  runs — visible as a finding's `rule_code` changing with nothing else changing.
+  Ties are now broken on the rule code, lowest first, which favours the
+  lower-numbered and therefore more fundamental rule. Severity still decides
+  first; the tie-break only applies at equal severity.
+  This narrows what the crate reports rather than changing whether a query is
+  blocked: both tied rules resolve to the same severity, so the decision and
+  action are identical either way — only the reported `rule_code`, `rule_id` and
+  `ast_node_path` can differ. Hosts that group findings by code may see the
+  distribution shift.
+
+### Documentation
+
+- **`README.md` now states how a violation is chosen** — highest severity, ties
+  broken by lowest code, order-independent — next to the ruleset example. The
+  crate has always advertised deterministic evaluation; with ties resolved by
+  input order that claim only held if the caller kept the order stable.
+
 ## [3.2.3] — 2026-08-06
 
 Housekeeping. No API, behaviour, or rule changes.
