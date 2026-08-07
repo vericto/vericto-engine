@@ -7,8 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.3] — 2026-08-06
+
+Housekeeping. No API, behaviour, or rule changes.
+
 ### Removed
 
+- **Unused dependencies `anyhow` and `tokio-test`.** Neither was referenced
+  anywhere outside `Cargo.toml`: no source, test, or doctest use, and `anyhow`
+  appeared in no public signature. Error handling here is `thiserror`-based via
+  `error::ProxyError`, and the engine is synchronous, so a tokio test harness had
+  nothing to drive.
+  Dropping `tokio-test` removes four crates from the resolved graph
+  (`tokio-test`, `tokio`, `tokio-stream`, `futures-core`; 112 → 108), all
+  dev-only, so it lightens building this crate's tests and does not affect
+  consumers. Dropping `anyhow` removes nothing from the graph — `prost-derive`
+  still pulls it in through `pg_query` — but it stops the manifest from claiming
+  a direct dependency the code never had, and keeps a second error-handling idiom
+  from creeping in alongside `thiserror`.
+  Patch-level: `tokio-test` was a dev-dependency and therefore invisible to
+  consumers, and `anyhow` was neither re-exported nor present in any public
+  signature, so no consumer could have reached it through this crate.
 - **The cargo cache step in CI.** Its key was
   `${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}`, but `Cargo.lock` is
   git-ignored for this library, so on a clean checkout `hashFiles` matched nothing
