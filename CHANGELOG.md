@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.2] — 2026-08-06
+
+Cross-dialect rule parity and a documentation fix. No API or behaviour changes
+beyond VERICTO-070 now firing where it previously did not.
+
+### Fixed
+
+- **VERICTO-070 did not fire on `pg_sleep_until` outside PostgreSQL.** The
+  sleep-family list was duplicated: the pg_query walker matched `sleep`,
+  `pg_sleep`, `pg_sleep_for` and `pg_sleep_until`, while the sqlparser walker —
+  which serves MySQL, Oracle and MS SQL — matched only the first three. A
+  time-based blind-injection probe using `pg_sleep_until` was therefore reported
+  on PostgreSQL and silently allowed on every other dialect. The two lists are
+  now one `parser::is_sleep_function`, so the invariant is enforced by the
+  compiler rather than by convention.
+  The duplicated helper already carried the comment *"Mirrors the list in
+  `walk.rs` so detection is dialect-consistent"* — the contract was documented,
+  just not checked, and it had already drifted.
+- **The dependency snippet in the crate-level docs named the wrong repository
+  and a stale tag.** It pointed at `donkan168/vericto-engine`, the URL from
+  before the repository transfer, with `tag = "v2.1.0"` while the crate was at
+  3.2.1. That is the line downstream repos copy to depend on the engine, so it
+  pinned anyone following it to a parser four releases old. It now matches the
+  manifest's `repository` and version.
+
+### Added
+
+- **`tests/usage_snippet_sync.rs`** — guards the dependency snippet against the
+  drift above. The snippet is a ```toml block, so unlike the Rust example beside
+  it in `lib.rs` it is never compiled and nothing caught it going stale. Two
+  tests assert the snippet's `git` URL equals `Cargo.toml`'s `repository` and
+  its `tag` equals the crate version, so the tag has to be bumped with the
+  release. Follows the `rule_catalogue_sync.rs` pattern: sources are pulled in
+  with `include_str!`, and the extractor fails loudly if the snippet changes
+  shape rather than silently matching nothing.
+
 ## [3.2.1] — 2026-08-06
 
 Correctness and portability fixes. No breaking API changes: the only public-API

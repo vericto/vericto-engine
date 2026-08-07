@@ -10,6 +10,7 @@
 use crate::error::{MAX_AST_DEPTH, ProxyError, Result};
 use crate::parser::{
     AlterTableKind, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, WherePresence,
+    is_sleep_function,
 };
 
 use pg_query::protobuf::node::Node as NodeEnum;
@@ -536,15 +537,6 @@ fn func_call_name(funcname: &[Node]) -> Option<String> {
         Some(NodeEnum::String(s)) => Some(s.sval.to_ascii_lowercase()),
         _ => None,
     })
-}
-
-/// Sleep-family functions used for DoS / time-based blind SQL injection.
-/// Mirrors the list in `walk.rs` so detection is dialect-consistent.
-fn is_sleep_function(name: &str) -> bool {
-    matches!(
-        name,
-        "sleep" | "pg_sleep" | "pg_sleep_for" | "pg_sleep_until"
-    )
 }
 
 /// Determine WHERE clause state from a protobuf node.

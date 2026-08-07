@@ -8,6 +8,7 @@
 use crate::error::{MAX_AST_DEPTH, ProxyError, Result};
 use crate::parser::{
     AlterTableKind, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, WherePresence,
+    is_sleep_function,
 };
 
 use sqlparser::ast::{
@@ -459,7 +460,7 @@ fn walk_expr(expr: &Expr, depth: usize, out: &mut Vec<StatementInfo>) -> Result<
             walk_query(query.as_ref(), true, depth + 1, out)?;
         }
 
-        // Function call — check for SLEEP / PG_SLEEP
+        // Function call — check for the sleep family (VERICTO-070)
         Expr::Function(func) => {
             let name = func
                 .name
@@ -468,7 +469,7 @@ fn walk_expr(expr: &Expr, depth: usize, out: &mut Vec<StatementInfo>) -> Result<
                 .map(|p| p.value.to_ascii_lowercase())
                 .unwrap_or_default();
 
-            if matches!(name.as_str(), "sleep" | "pg_sleep" | "pg_sleep_for") {
+            if is_sleep_function(&name) {
                 out.push(StatementInfo {
                     kind: StatementKind::FunctionCall,
                     function_name: Some(name),
@@ -797,6 +798,39 @@ mod tests {
         let p = parse_pg("INSERT INTO t (a) VALUES (1)");
         assert!(!p.statements[0].insert_has_select);
         assert!(!p.statements[0].insert_select_has_filter);
+    }
+
+    // VERICTO-070 inputs. `pg_sleep_until` used to be missing from this walker's
+    // list while the pg_query walker had it, so the rule was dialect-dependent.
+    // Both walkers now share `parser::is_sleep_function`.
+    #[test]
+    fn every_sleep_variant_is_detected() {
+        for sql in [
+            "SELECT sleep(5)",
+            "SELECT pg_sleep(5)",
+            "SELECT pg_sleep_for('5 seconds')",
+            "SELECT pg_sleep_until('tomorrow')",
+        ] {
+            let p = parse_pg(sql);
+            assert!(
+                p.statements
+                    .iter()
+                    .any(|s| s.kind == StatementKind::FunctionCall),
+                "{sql} produced no FunctionCall: {:?}",
+                p.statements
+            );
+        }
+    }
+
+    // A function that merely contains "sleep" is not a sleep call.
+    #[test]
+    fn non_sleep_function_is_not_detected() {
+        let p = parse_pg("SELECT sleepless(5)");
+        assert!(
+            !p.statements
+                .iter()
+                .any(|s| s.kind == StatementKind::FunctionCall)
+        );
     }
 
     #[test]
