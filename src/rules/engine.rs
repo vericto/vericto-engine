@@ -1,6 +1,7 @@
 //! Rule domain types and evaluation orchestration.
 
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 
 use crate::parser::ParsedQuery;
 use crate::rules::evaluator;
@@ -314,6 +315,11 @@ impl RuleEngine {
     ///   action is `policy.action_for(severity)` (R3.4); decision derived from
     ///   the action (R3.6). Severity, action, rule_id, rule_code, ast_node_path
     ///   and suggested_safe_query are populated (R3.5, R3.7).
+    ///
+    /// When several violated rules share the top severity, the one with the
+    /// lowest `code` wins. The order of `rules` never affects the outcome, so
+    /// the same query and ruleset always report the same violation regardless of
+    /// how the host assembled the slice.
     pub fn evaluate(
         parsed: &ParsedQuery,
         rules: &[Rule],
@@ -325,7 +331,19 @@ impl RuleEngine {
             if let Some(violation) = evaluator::evaluate_rule(rule, parsed) {
                 let is_better = match &best {
                     None => true,
-                    Some((sev, _)) => rule.severity > *sev,
+                    Some((sev, current)) => match rule.severity.cmp(sev) {
+                        Ordering::Greater => true,
+                        // Equal severity: decide on the rule code rather than on
+                        // whichever came first in `rules`. The host supplies that
+                        // slice — the control plane serves it from a query with no
+                        // ORDER BY — so position is not a property of the query
+                        // being evaluated, and letting it decide would make the
+                        // reported code vary between runs on identical input.
+                        // Lowest code wins, which favours the lower-numbered and
+                        // therefore more fundamental rule.
+                        Ordering::Equal => rule.code < current.rule_code,
+                        Ordering::Less => false,
+                    },
                 };
                 if is_better {
                     best = Some((rule.severity, violation));
@@ -449,6 +467,66 @@ mod tests {
         assert_eq!(outcome.action, Some(EnforcementAction::Block));
         assert_eq!(outcome.severity, Some(Severity::Critical));
         assert_eq!(outcome.rule_code.as_deref(), Some("VERICTO-001"));
+    }
+
+    // ── Deterministic tie-break on equal severity ─────────────────────────────
+
+    fn rule_at(code: &str, severity: Severity) -> Rule {
+        Rule {
+            rule_id: format!("id-{code}"),
+            code: code.to_string(),
+            severity,
+            default_action: EnforcementAction::Block,
+            rule_type: RuleType::Standard,
+            ast_condition_yaml: None,
+        }
+    }
+
+    /// `SELECT * FROM users` violates VERICTO-050 (no LIMIT) and VERICTO-051
+    /// (star, no WHERE) at once. Given both at the same severity, the reported
+    /// code must come from the codes themselves, not from the order the host
+    /// happened to assemble the slice in.
+    #[test]
+    fn equal_severity_tie_is_broken_by_rule_code_not_input_order() {
+        let parsed = parser_for(Dialect::Postgres)
+            .parse("SELECT * FROM users")
+            .expect("must parse");
+        let low_code = rule_at("VERICTO-050", Severity::Medium);
+        let high_code = rule_at("VERICTO-051", Severity::Medium);
+        let policy = EnforcementPolicy::default();
+
+        let forward =
+            RuleEngine::evaluate(&parsed, &[low_code.clone(), high_code.clone()], &policy);
+        let reversed = RuleEngine::evaluate(&parsed, &[high_code, low_code], &policy);
+
+        assert_eq!(forward.rule_code.as_deref(), Some("VERICTO-050"));
+        assert_eq!(
+            forward.rule_code, reversed.rule_code,
+            "reordering the rules slice changed the reported violation"
+        );
+    }
+
+    /// The tie-break must not override severity: a higher-severity rule still
+    /// wins even when its code sorts after the lower-severity one, in either
+    /// input order.
+    #[test]
+    fn higher_severity_wins_over_lower_code_in_either_order() {
+        let parsed = parser_for(Dialect::Postgres)
+            .parse("SELECT * FROM users")
+            .expect("must parse");
+        // Lower code, lower severity — must lose to VERICTO-051 below.
+        let weak = rule_at("VERICTO-050", Severity::Low);
+        let strong = rule_at("VERICTO-051", Severity::High);
+        let policy = EnforcementPolicy::default();
+
+        for slice in [
+            [weak.clone(), strong.clone()],
+            [strong.clone(), weak.clone()],
+        ] {
+            let outcome = RuleEngine::evaluate(&parsed, &slice, &policy);
+            assert_eq!(outcome.rule_code.as_deref(), Some("VERICTO-051"));
+            assert_eq!(outcome.severity, Some(Severity::High));
+        }
     }
 
     // ── RuleClass classification ──────────────────────────────────────────────
