@@ -13,11 +13,26 @@ use thiserror::Error;
 
 /// Recommended maximum query size in bytes (64KB).
 ///
-/// **This crate does not enforce it.** Neither [`crate::evaluate`] nor
-/// [`SqlParser::parse`](crate::parser::SqlParser::parse) checks the input
-/// length: the limit is published here so every host applies the same
-/// threshold, and the host is the layer that can reject an oversized query
-/// before deserializing or copying it.
+/// **This crate does not enforce it, and hosts are expected to diverge.** Neither
+/// [`crate::evaluate`] nor [`SqlParser::parse`](crate::parser::SqlParser::parse)
+/// checks the input length. The host is the layer that can reject an oversized
+/// query before deserializing or copying it, and it is also the only layer that
+/// knows what its traffic looks like — so this is a starting point, not a value
+/// every host should share.
+///
+/// The two first-party hosts already differ, for reasons particular to each:
+///
+/// - the HTTP evaluation sidecar applies this value, and derives its request body
+///   limit from it. It is multi-tenant and serves one query per request from
+///   dashboards and CI, so a small ceiling costs nothing and a large one would
+///   mean buffering that much for every tenant;
+/// - the TCP proxy applies a much larger limit (10 MiB by default, operator
+///   configurable). It carries a customer's production traffic, where batch
+///   inserts and long `IN` lists legitimately reach megabytes, and it is inline —
+///   refusing a statement is an outage for that workload, not a warning.
+///
+/// A host raising the limit is taking on the cost knowingly: evaluation time grows
+/// linearly with input size, so the ceiling is also a latency budget.
 ///
 /// A host that skips the check hands unbounded input to the parsers. Parse cost
 /// grows with input size and [`MAX_AST_DEPTH`] does not bound it — that guard
