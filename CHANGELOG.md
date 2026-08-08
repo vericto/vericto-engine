@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.5] — 2026-08-08
+
+Documentation only. No API, behaviour, or rule changes.
+
+### Documentation
+
+- **`MAX_QUERY_SIZE_BYTES` no longer claims every host applies the same
+  threshold.** The doc said the limit is published "so every host applies the same
+  threshold", which stopped being true once the TCP proxy adopted a configurable
+  10 MiB ceiling while the HTTP sidecar kept this crate's 64 KiB. Left as written
+  it would read as a contract hosts were violating, rather than the deliberate
+  design it is.
+  It now states that hosts are expected to diverge and why the two first-party
+  ones do: the sidecar is multi-tenant, serves one query per request from
+  dashboards and CI, and derives its request body limit from this value, so a small
+  ceiling costs nothing; the proxy carries production traffic where batch inserts
+  and long `IN` lists legitimately reach megabytes, and refusing a statement inline
+  is an outage for that workload rather than a warning. Also notes that raising the
+  limit is taking on a latency budget, since evaluation time grows linearly with
+  input size.
+
 ## [3.2.4] — 2026-08-07
 
 ### Fixed
