@@ -359,6 +359,19 @@ fn walk_select_stmt(
     depth: usize,
     out: &mut Vec<StatementInfo>,
 ) -> Result<()> {
+    walk_select_stmt_inner(stmt, is_nested, false, depth, out)
+}
+
+/// `inherited_limit` carries a row bound down from an enclosing set-operation
+/// node. See the set-op branch below for why it is needed; every other caller
+/// passes `false` through [`walk_select_stmt`].
+fn walk_select_stmt_inner(
+    stmt: &pg_query::protobuf::SelectStmt,
+    is_nested: bool,
+    inherited_limit: bool,
+    depth: usize,
+    out: &mut Vec<StatementInfo>,
+) -> Result<()> {
     if depth > MAX_AST_DEPTH {
         return Err(ProxyError::AstTooDeep);
     }
@@ -366,12 +379,21 @@ fn walk_select_stmt(
     // A set-operation node (UNION/INTERSECT/EXCEPT) has empty target/from and
     // carries its real SELECTs in `larg`/`rarg`. Recurse into both arms and do
     // not record the synthetic set-op node itself.
+    //
+    // The row bound lives on THIS node, not on the arms: `SELECT … UNION SELECT …
+    // LIMIT 10` parses as a set-op with `limit_count`, and each arm carries none.
+    // Without threading it down, every arm looked unbounded and a bounded UNION
+    // tripped VERICTO-050 — on PostgreSQL only, since `walk.rs` already passes its
+    // `has_limit` into both sides of a SetOperation. Also covers a bound inherited
+    // from a further-out set-op, so it survives `a UNION b UNION c LIMIT 10`,
+    // which nests set-op nodes.
     if stmt.larg.is_some() || stmt.rarg.is_some() {
+        let bound = inherited_limit || has_row_bound(stmt);
         if let Some(larg) = stmt.larg.as_deref() {
-            walk_select_stmt(larg, is_nested, depth + 1, out)?;
+            walk_select_stmt_inner(larg, is_nested, bound, depth + 1, out)?;
         }
         if let Some(rarg) = stmt.rarg.as_deref() {
-            walk_select_stmt(rarg, is_nested, depth + 1, out)?;
+            walk_select_stmt_inner(rarg, is_nested, bound, depth + 1, out)?;
         }
         walk_with_clause(stmt.with_clause.as_ref(), depth + 1, out)?;
         return Ok(());
@@ -387,7 +409,7 @@ fn walk_select_stmt(
         } else {
             "SelectStmt".to_string()
         },
-        select_has_limit: stmt.limit_count.is_some(),
+        select_has_limit: inherited_limit || has_row_bound(stmt),
         select_is_star: target_list_has_star(&stmt.target_list),
         has_or_tautology: where_has_or_tautology(stmt.where_clause.as_deref()),
         ..Default::default()
@@ -528,6 +550,16 @@ fn scan_expr(node: Option<&NodeEnum>, depth: usize, out: &mut Vec<StatementInfo>
         _ => {}
     }
     Ok(())
+}
+
+/// Does this SELECT carry its own row bound?
+///
+/// libpg_query normalises both `LIMIT n` and `FETCH FIRST n ROWS ONLY` onto
+/// `limit_count` (they differ only in `limit_option`), so one check covers both.
+/// `limit_offset` is deliberately not a bound: `OFFSET 10` alone skips rows
+/// without capping how many are returned.
+fn has_row_bound(stmt: &pg_query::protobuf::SelectStmt) -> bool {
+    stmt.limit_count.is_some()
 }
 
 /// Extract the (unqualified) function name from a `FuncCall.funcname` list of
