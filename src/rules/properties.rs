@@ -534,3 +534,111 @@ mod examples {
         assert_eq!(outcome.action, Some(EnforcementAction::Block));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Property 9: a predicate that references a column is never "always true"
+// ---------------------------------------------------------------------------
+//
+// `is_always_true` is the shared input to five blocking rules — it drives
+// `where_presence` (VERICTO-003/030/042), `has_or_tautology` (VERICTO-090) and
+// `insert_select_has_filter` (VERICTO-040) — so widening it widens all of them at
+// once. The invariant that keeps that safe is structural: only predicates whose
+// operands are *all literals* may qualify, because their truth value cannot
+// depend on the row.
+//
+// The moment a `ColumnRef` appears, the predicate filters something and the
+// engine must not treat it as WHERE-less. SQL's three-valued logic is what makes
+// this sharp rather than pedantic: `id IS NOT NULL` and `name LIKE '%'` both read
+// as tautologies but drop every row where the column is NULL — verified against
+// PostgreSQL, 2 of 3 rows for a table with one NULL. Blocking those would be a
+// false positive on a Critical rule that rejects live traffic.
+//
+// This property is the guard rail for future widening: any new form added to
+// `is_always_true` must keep it passing.
+//
+// The one deliberate exception is the column self-comparison `col = col`, which
+// predates this property and is documented as such at its definition: it is the
+// canonical WHERE-stripping trick with no legitimate use, and it is excluded here
+// by construction (the generator never emits the same column on both sides).
+#[cfg(test)]
+mod column_predicates_are_not_tautologies {
+    use crate::parser::{Dialect, WherePresence, parser_for};
+    use proptest::prelude::*;
+
+    /// Predicate templates that all reference at least one column. `{c}` is
+    /// substituted with a column name; every one of these filters rows for some
+    /// table, so none may be reported as always-true.
+    const COLUMN_PREDICATES: &[&str] = &[
+        "{c} IS NOT NULL",
+        "{c} IS NULL",
+        "{c} = 1",
+        "{c} <> 1",
+        "{c} > 0",
+        "{c} >= 0",
+        "{c} < 100",
+        "{c} IN (1, 2)",
+        "{c} NOT IN (1, 2)",
+        "{c} BETWEEN 0 AND 100",
+        "{c} LIKE '%'",
+        "{c} LIKE 'a%'",
+        "{c} = {c} + 0",
+        "NOT ({c} IS NULL)",
+        "{c} = 1 AND {c} < 5",
+        "{c} = 1 OR {c} = 2",
+        "COALESCE({c}, 0) = 0",
+        "{c}::text = 'x'",
+    ];
+
+    fn column_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("id".to_string()),
+            Just("name".to_string()),
+            Just("t.id".to_string()),
+            Just("deleted_at".to_string()),
+        ]
+    }
+
+    fn dialect_strategy() -> impl Strategy<Value = Dialect> {
+        prop_oneof![
+            Just(Dialect::Postgres),
+            Just(Dialect::Mysql),
+            Just(Dialect::Oracle),
+            Just(Dialect::MsSql),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+        // Feature: constant-only tautologies, Property 9.
+        // A WHERE clause built from a column-referencing predicate is never
+        // classified `AlwaysTrue`, on any dialect. Covers both walkers.
+        #[test]
+        fn p9_column_predicate_is_never_always_true(
+            template in prop::sample::select(COLUMN_PREDICATES),
+            column in column_strategy(),
+            dialect in dialect_strategy(),
+        ) {
+            let predicate = template.replace("{c}", &column);
+            let sql = format!("DELETE FROM t WHERE {predicate}");
+
+            // A dialect that cannot parse the form tells us nothing; skip it.
+            // (`::text` is Postgres-only, for example.)
+            let Ok(parsed) = parser_for(dialect).parse(&sql) else { return Ok(()) };
+
+            for stmt in &parsed.statements {
+                prop_assert_ne!(
+                    stmt.where_presence,
+                    WherePresence::AlwaysTrue,
+                    "`{}` references a column and must not be AlwaysTrue on {:?}",
+                    predicate, dialect
+                );
+                prop_assert!(
+                    !stmt.has_or_tautology,
+                    "`{}` references a column and must not set has_or_tautology on {:?}",
+                    predicate, dialect
+                );
+            }
+        }
+    }
+}
