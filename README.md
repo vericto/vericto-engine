@@ -1,6 +1,6 @@
 # vericto-engine
 
-> Deterministic SQL AST evaluation engine — the open core of [Vericto](https://vetro.dev).
+> Deterministic SQL AST evaluation engine — the open core of [Vericto](https://vericto.com).
 
 [![CI](https://github.com/vericto/vericto-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/vericto/vericto-engine/actions/workflows/ci.yml)
 [![License: ELv2](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](LICENSE)
@@ -13,8 +13,8 @@ evaluates it against a ruleset **deterministically** — same input always produ
 the same result, no ML, no thresholds, no false positives.
 
 This crate is consumed by:
-- **[vetro-proxy](https://github.com/donkan168/vetro-proxy)** — TCP wire-protocol proxy deployed in customer infrastructure
-- **vetro-eval** (private) — HTTP evaluation sidecar used by the Vericto SaaS API
+- **[vericto-proxy](https://github.com/vericto/vericto-proxy)** — TCP wire-protocol proxy deployed in customer infrastructure
+- **vericto-eval** (private) — HTTP evaluation sidecar used by the Vericto SaaS API
 
 ---
 
@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.1.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.2.6" }
 ```
 
 ### Quick example
@@ -73,12 +73,12 @@ violation.
 
 ## Supported dialects
 
-| Dialect    | Parser backend                     |
-|------------|------------------------------------|
-| PostgreSQL | `pg_query` 5.1 (libpg_query 16)     |
-| MySQL      | `sqlparser-rs`                     |
-| SQL Server | `sqlparser-rs`                     |
-| Oracle     | `sqlparser-rs`                     |
+| Dialect    | Parser backend                       |
+|------------|--------------------------------------|
+| PostgreSQL | `pg_query` 6.2 (libpg_query, PG 17)  |
+| MySQL      | `sqlparser-rs` 0.52                  |
+| SQL Server | `sqlparser-rs` 0.52                  |
+| Oracle     | `sqlparser-rs` 0.52                  |
 
 ---
 
@@ -145,8 +145,46 @@ Low/Informational → Monitor).
 The host application owns the rule *catalogue* (which codes are active, with
 what severity/action per workspace); the engine owns the *detection logic*. The
 proxy's built-in fallback catalogue
-([`vetro-proxy/src/tcp/evaluator.rs`](https://github.com/donkan168/vetro-proxy))
+([`vericto-proxy/src/tcp/evaluator.rs`](https://github.com/vericto/vericto-proxy))
 mirrors this table verbatim.
+
+## Rule classes and per-channel caps
+
+Every built-in code carries a static [`RuleClass`](src/rules/engine.rs) — the
+*kind* of risk it represents, independent of the channel it is evaluated on:
+
+| Class | Codes | What it covers |
+|---|---|---|
+| `SchemaMigration` | 010–019 | DROP TABLE/DATABASE/SCHEMA, TRUNCATE, ALTER TABLE, DROP INDEX. Destructive against a live database, but normal in a versioned migration. |
+| `DataMutation` | 001, 002, 003, 030, 031, 033, 040, 042, 083, 084 | Data mutation without adequate scope. Dangerous on *any* channel — a WHERE-less DELETE is never intended, even in a migration. |
+| `Security` | 070, 080, 081, 082, 090 | Injection tautologies, `COPY … PROGRAM`, `DO` blocks, GRANT/REVOKE, sleep-based probing. |
+| `Performance` | 050, 051, 060, 061 | Best-practice / performance hints. Advisory. |
+
+Custom rules and any unrecognized code classify as `DataMutation` — the
+conservative default, since that class is never softened by a cap.
+
+The class exists so a host can modulate the resulting *action* per channel
+without the detection logic ever knowing about the channel.
+`EnforcementPolicy::schema_migration_cap` is the only cap today:
+
+```rust
+use vericto_engine::{EnforcementAction, EnforcementPolicy};
+
+// A CI channel: migration DDL reports instead of blocking, because a versioned
+// migration legitimately contains DROP/ALTER/TRUNCATE. Everything else keeps
+// the full policy in force.
+let ci = EnforcementPolicy {
+    schema_migration_cap: Some(EnforcementAction::Flag),
+    ..EnforcementPolicy::default()
+};
+```
+
+Under that policy `DROP TABLE users` resolves to `Flag` while
+`DELETE FROM users` still resolves to `Block`. The cap is applied as
+`action.min(cap)` — a **ceiling, never a floor**, so it can only ever *lower* an
+action and can never make a channel more aggressive than the base policy. Left
+as `None` (the default) it has no effect at all, which is also how older
+serialized policies that predate the field deserialize.
 
 ## Custom rules (YAML)
 
@@ -221,4 +259,4 @@ vericto-engine/
 Elastic License 2.0 — source-available, community PRs welcome, no managed-service
 resale. See [LICENSE](LICENSE).
 
-For a managed-service license contact [hola@vetro.dev](mailto:hola@vetro.dev).
+For a managed-service license contact [hola@vericto.com](mailto:hola@vericto.com).

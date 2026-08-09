@@ -7,7 +7,7 @@ appreciate responsible disclosure.
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
-Email **security@vetro.dev** with:
+Email **security@vericto.com** with:
 
 - A description of the vulnerability and its impact.
 - Steps to reproduce (a minimal SQL payload or AST input is ideal).

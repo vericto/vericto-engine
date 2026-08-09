@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.2.5" }
+//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.2.6" }
 //! ```
 //!
 //! ```rust
@@ -42,7 +42,7 @@ pub use error::{ProxyError, Result};
 pub use parser::Dialect;
 pub use rules::engine::{
     Decision, EnforcementAction, EnforcementPolicy, EvaluationOutcome, ParseErrorAction, Rule,
-    RuleEngine, RuleType, Severity,
+    RuleClass, RuleEngine, RuleType, Severity,
 };
 
 /// Convenience function: parse + evaluate in one call.

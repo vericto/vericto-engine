@@ -940,7 +940,7 @@ mod tests {
 
     #[test]
     fn vetro_050_allows_parameterized_select_with_where_and_limit() {
-        // Regression lock for the vetro-regression suite case
+        // Regression lock for the vericto-regression suite case
         // (tests/proxy/allow-safe-queries.spec.ts): a parameterized SELECT with
         // explicit columns, a WHERE, and a LIMIT must NOT be flagged by
         // VERICTO-050. This mirrors the exact query the proxy receives over the

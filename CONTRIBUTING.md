@@ -14,14 +14,14 @@ evaluation logic. Contributions that fit here:
 - Tests and documentation
 
 Contributions that belong elsewhere:
-- TCP wire-protocol proxy → [vetro-proxy](https://github.com/donkan168/vetro-proxy)
-- Telemetry, rule sync, configuration → vetro-proxy
-- HTTP evaluation endpoint, dashboard API → vetro-eval (private)
+- TCP wire-protocol proxy → [vericto-proxy](https://github.com/vericto/vericto-proxy)
+- Telemetry, rule sync, configuration → vericto-proxy
+- HTTP evaluation endpoint, dashboard API → vericto-eval (private)
 
 ## Getting started
 
 ```bash
-git clone https://github.com/donkan168/vericto-engine
+git clone https://github.com/vericto/vericto-engine
 cd vericto-engine
 
 # Build

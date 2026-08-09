@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.6] — 2026-08-09
+
+Adds one re-export and fixes documentation drift. No behaviour, rule, or
+evaluation changes.
+
+### Added
+
+- **`RuleClass` is re-exported at the crate root.** It was reachable only as
+  `rules::engine::RuleClass` while every other type a host needs — `Decision`,
+  `EnforcementPolicy`, `Severity`, `Rule` — is re-exported. Nothing about the
+  type changed; the old path keeps working.
+- **The README documents rule classes and `schema_migration_cap`.** Neither
+  appeared anywhere in it. That pairing is what lets a CI channel soften
+  migration DDL to a report while a WHERE-less `DELETE` still blocks, so a host
+  looking for it had no way to discover it short of reading `engine.rs`. The new
+  section lists which codes fall in each class, notes that custom and unknown
+  codes classify as `DataMutation` (the conservative default, never softened by a
+  cap), and states that the cap is applied as `action.min(cap)` — a ceiling, never
+  a floor.
+- **`usage_snippet_sync.rs` now covers the README's dependency snippet too.** The
+  guard checked only the copy in `lib.rs`, which left the README's unguarded — it
+  sat at `tag = "v3.1.0"` while the crate was at 3.2.5, four releases behind, with
+  the guard green throughout. The README is the likelier of the two to be copied
+  by a consumer, so a stale tag there is the more expensive one. Both are now
+  checked against the same manifest values, and a failure names the file that
+  drifted. Verified by pinning the README back to v3.1.0 and confirming the guard
+  fails and reports `README.md`.
+
+### Fixed
+
+- **Documentation still referred to the project by its pre-rebrand name.** The
+  README, `CONTRIBUTING.md`, `SECURITY.md` and `CODE_OF_CONDUCT.md` pointed at
+  `donkan168/vetro-proxy` (the URL from before the repository transfer), named
+  "vetro-eval", and gave `vetro.dev` contact addresses, while `vericto-proxy`
+  already uses `vericto.com` in all three of its equivalents. Links to a
+  transferred repo and mail to a dead domain both fail silently for anyone
+  following them. Also corrects the dialect table, which credited `pg_query` 5.1
+  and libpg_query 16 when the manifest pins 6.2, which vendors PostgreSQL 17, and
+  the README's dependency snippet, which pinned `v3.1.0`.
+
 ## [3.2.5] — 2026-08-08
 
 Documentation only. No API, behaviour, or rule changes.
