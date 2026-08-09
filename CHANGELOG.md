@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.1] — 2026-08-09
+
+### Fixed
+
+- **A row bound on a set operation no longer leaves its arms looking unbounded.**
+  `SELECT … UNION SELECT … LIMIT 10` parses with the bound on the set-op node and
+  none on either arm. The pg_query walker recursed into the arms without carrying
+  it down, so both were recorded with `select_has_limit: false` and a bounded
+  UNION tripped VERICTO-050 — a false positive on a query that caps its result.
+  It affected `UNION`, `UNION ALL`, `INTERSECT` and `EXCEPT`, the `FETCH FIRST`
+  spelling, and nested set-ops (`a UNION b UNION c LIMIT 10`, where the bound has
+  to survive more than one level).
+  PostgreSQL only: `walk.rs` already threads its `has_limit` into both sides of a
+  `SetOperation`, with a comment saying exactly why. One walker had solved this
+  and the other had not — the drift this crate treats as a defect in itself, and
+  the same shape as the `is_sleep_function` divergence in 3.2.2. The fix mirrors
+  the sqlparser walker's approach rather than inventing a second one.
+  Medium → Flag by default, so this dirtied reporting rather than blocking
+  traffic; a workspace that raises Medium to Block would have seen bounded
+  UNIONs rejected on one dialect and allowed on the others.
+  `OFFSET` is deliberately not a bound: it skips rows without capping how many
+  come back, so `… UNION … OFFSET 10` is still reported.
+
 ## [3.3.0] — 2026-08-09
 
 Widens what counts as an always-true `WHERE`. **This blocks queries that

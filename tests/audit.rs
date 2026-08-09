@@ -1,3 +1,4 @@
+use vericto_engine::parser::parser_for;
 use vericto_engine::{
     Decision, Dialect, EnforcementAction, EnforcementPolicy, Rule, RuleType, Severity, evaluate,
 };
@@ -653,4 +654,86 @@ fn constant_only_source_filter_does_not_bound_an_insert_select() {
             "constant-only WHERE must not count as a filter on {d:?}, got {m:?}"
         );
     }
+}
+
+// ── Set-operation row bounds (UNION / INTERSECT / EXCEPT) ────────────────────
+//
+// `SELECT … UNION SELECT … LIMIT 10` parses with the row bound on the set-op
+// node, not on either arm. The pg_query walker recursed into the arms without
+// carrying it down, so both looked unbounded and a bounded UNION tripped
+// VERICTO-050 — on PostgreSQL only, since `walk.rs` already threads its
+// `has_limit` into both sides of a SetOperation.
+//
+// A false positive on a Medium rule only dirties reporting today, but a workspace
+// may raise Medium to Block, and dialects disagreeing on the same query is the
+// drift this crate treats as a defect in itself.
+
+#[test]
+fn a_bound_on_a_set_operation_bounds_both_arms() {
+    for sql in [
+        "SELECT id FROM a UNION SELECT id FROM b LIMIT 10",
+        "SELECT id FROM a UNION ALL SELECT id FROM b LIMIT 10",
+        "SELECT id FROM a INTERSECT SELECT id FROM b LIMIT 10",
+        "SELECT id FROM a EXCEPT SELECT id FROM b LIMIT 10",
+        // FETCH FIRST is the ANSI spelling; libpg_query normalises it onto the
+        // same `limit_count` field, so it must behave identically.
+        "SELECT id FROM a UNION SELECT id FROM b FETCH FIRST 5 ROWS ONLY",
+        // Set-op nodes nest, so the bound has to survive more than one level.
+        "SELECT id FROM a UNION SELECT id FROM b UNION SELECT id FROM c LIMIT 10",
+    ] {
+        for d in ALL_DIALECTS {
+            // Not every dialect accepts every spelling; a parse failure says
+            // nothing about bounding.
+            if parser_for(d).parse(sql).is_err() {
+                continue;
+            }
+            let m = matching_codes(sql, d, &ruleset(), &EnforcementPolicy::default());
+            assert!(
+                !m.contains(&"VERICTO-050".to_string()),
+                "`{sql}` is bounded and must NOT trip VERICTO-050 on {d:?}, got {m:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_unbounded_set_operation_is_still_reported() {
+    // The other half of the fix: propagating a bound must not swallow the case
+    // the rule exists for.
+    for sql in [
+        "SELECT id FROM a UNION SELECT id FROM b",
+        "SELECT id FROM a INTERSECT SELECT id FROM b",
+        // OFFSET alone skips rows without capping how many come back, so it is
+        // not a row bound.
+        "SELECT id FROM a UNION SELECT id FROM b OFFSET 10",
+    ] {
+        for d in ALL_DIALECTS {
+            if parser_for(d).parse(sql).is_err() {
+                continue;
+            }
+            let m = matching_codes(sql, d, &ruleset(), &EnforcementPolicy::default());
+            assert!(
+                m.contains(&"VERICTO-050".to_string()),
+                "`{sql}` is unbounded and must trip VERICTO-050 on {d:?}, got {m:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_arms_own_bound_is_not_leaked_to_its_sibling() {
+    // A bound inside one arm belongs to that arm. The unbounded sibling is still
+    // an unbounded read, so the rule must fire for it — and it does, because a
+    // single match is enough to report the query.
+    let sql = "(SELECT id FROM a LIMIT 5) UNION (SELECT id FROM b)";
+    let m = matching_codes(
+        sql,
+        Dialect::Postgres,
+        &ruleset(),
+        &EnforcementPolicy::default(),
+    );
+    assert!(
+        m.contains(&"VERICTO-050".to_string()),
+        "`{sql}` has an unbounded arm and must trip VERICTO-050, got {m:?}"
+    );
 }
