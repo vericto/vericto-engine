@@ -10,7 +10,6 @@
 use crate::error::{MAX_AST_DEPTH, ProxyError, Result};
 use crate::parser::{
     AlterTableKind, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, WherePresence,
-    is_sleep_function,
 };
 
 use pg_query::protobuf::node::Node as NodeEnum;
@@ -487,15 +486,21 @@ fn scan_expr(node: Option<&NodeEnum>, depth: usize, out: &mut Vec<StatementInfo>
             }
         }
         NodeEnum::FuncCall(fc) => {
+            // Record EVERY function call, not just the sleep family. A custom
+            // rule's `func_name:` predicate is documented as matching any
+            // function by name, but only sleep calls used to reach the
+            // evaluator, so `func_name: pg_read_file` matched nothing — the rule
+            // saved, synced, listed, and silently never fired.
+            //
+            // The sleep-family filter now lives in VERICTO-070's own predicate,
+            // which is where a rule-specific concern belongs.
             if let Some(name) = func_call_name(&fc.funcname) {
-                if is_sleep_function(&name) {
-                    out.push(StatementInfo {
-                        kind: StatementKind::FunctionCall,
-                        function_name: Some(name),
-                        ast_node_path: "FunctionCall > sleep".to_string(),
-                        ..Default::default()
-                    });
-                }
+                out.push(StatementInfo {
+                    kind: StatementKind::FunctionCall,
+                    ast_node_path: format!("FunctionCall > {name}()"),
+                    function_name: Some(name),
+                    ..Default::default()
+                });
             }
             for arg in &fc.args {
                 scan_expr(arg.node.as_ref(), depth + 1, out)?;

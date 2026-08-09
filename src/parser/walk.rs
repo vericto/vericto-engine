@@ -8,7 +8,6 @@
 use crate::error::{MAX_AST_DEPTH, ProxyError, Result};
 use crate::parser::{
     AlterTableKind, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, WherePresence,
-    is_sleep_function,
 };
 
 use sqlparser::ast::{
@@ -469,11 +468,15 @@ fn walk_expr(expr: &Expr, depth: usize, out: &mut Vec<StatementInfo>) -> Result<
                 .map(|p| p.value.to_ascii_lowercase())
                 .unwrap_or_default();
 
-            if is_sleep_function(&name) {
+            // Record EVERY function call, not just the sleep family, so a custom
+            // rule's `func_name:` predicate can name any function as documented.
+            // The sleep-family filter lives in VERICTO-070's predicate; mirrors
+            // the pg_query walker.
+            if !name.is_empty() {
                 out.push(StatementInfo {
                     kind: StatementKind::FunctionCall,
+                    ast_node_path: format!("FunctionCall > {name}()"),
                     function_name: Some(name),
-                    ast_node_path: "FunctionCall > sleep".to_string(),
                     ..Default::default()
                 });
             }
@@ -924,15 +927,22 @@ mod tests {
         }
     }
 
-    // A function that merely contains "sleep" is not a sleep call.
+    // Every function call is recorded, so a custom rule can name any of them by
+    // `func_name:`. What separates a sleep from the rest is the *name* the walker
+    // stores, which VERICTO-070's predicate then filters on — this asserts the
+    // name is captured verbatim rather than that non-sleep calls are dropped.
     #[test]
-    fn non_sleep_function_is_not_detected() {
+    fn non_sleep_function_is_recorded_under_its_own_name() {
         let p = parse_pg("SELECT sleepless(5)");
-        assert!(
-            !p.statements
-                .iter()
-                .any(|s| s.kind == StatementKind::FunctionCall)
-        );
+        let f = p
+            .statements
+            .iter()
+            .find(|s| s.kind == StatementKind::FunctionCall)
+            .expect("every function call is recorded");
+        assert_eq!(f.function_name.as_deref(), Some("sleepless"));
+        // A function that merely contains "sleep" is not a sleep call, so the
+        // shared classifier must not claim it.
+        assert!(!crate::parser::is_sleep_function("sleepless"));
     }
 
     #[test]
