@@ -516,3 +516,141 @@ fn no_regressions_on_safe_queries() {
         vec![],
     );
 }
+
+// ── Constant-only tautologies: IN / BETWEEN / LIKE '%' ───────────────────────
+//
+// A predicate whose operands are all literals cannot depend on the row, so it
+// filters nothing and the statement is effectively WHERE-less. Verified against
+// PostgreSQL on a 3-row table with one NULL row: `1 IN (1,2)`,
+// `1 BETWEEN 0 AND 2` and `'x' LIKE '%'` each return all 3 rows.
+//
+// These fire on every dialect because both walkers implement the same three
+// forms. The negatives matter more than the positives here: this predicate feeds
+// five blocking rules, so a false positive rejects legitimate production traffic.
+
+/// Every dialect must agree, so drift between the two walkers fails the test.
+const ALL_DIALECTS: [Dialect; 4] = [
+    Dialect::Postgres,
+    Dialect::Mysql,
+    Dialect::Oracle,
+    Dialect::MsSql,
+];
+
+fn fires_003(sql: &str, d: Dialect) -> bool {
+    matching_codes(sql, d, &ruleset(), &EnforcementPolicy::default())
+        .contains(&"VERICTO-003".to_string())
+}
+
+#[test]
+fn constant_only_in_between_like_are_where_less() {
+    for sql in [
+        "DELETE FROM users WHERE 1 IN (1, 2)",
+        "DELETE FROM users WHERE 'a' IN ('a', 'b')",
+        "DELETE FROM users WHERE 1 BETWEEN 0 AND 2",
+        "DELETE FROM users WHERE 1 BETWEEN 1 AND 1",
+        "DELETE FROM users WHERE 'x' LIKE '%'",
+    ] {
+        for d in ALL_DIALECTS {
+            assert!(
+                fires_003(sql, d),
+                "`{sql}` is constant-true and must trip VERICTO-003 on {d:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn constant_only_tautologies_reach_the_or_branch_rule() {
+    // The same forms as an OR branch are the injection shape VERICTO-090 exists
+    // for: the left side looks like a real filter, the right side neutralises it.
+    for sql in [
+        "SELECT * FROM users WHERE id = $1 OR 1 IN (1, 2)",
+        "SELECT * FROM users WHERE id = $1 OR 1 BETWEEN 0 AND 2",
+        "SELECT * FROM users WHERE id = $1 OR 'x' LIKE '%'",
+    ] {
+        let m = matching_codes(
+            sql,
+            Dialect::Postgres,
+            &ruleset(),
+            &EnforcementPolicy::default(),
+        );
+        assert!(
+            m.contains(&"VERICTO-090".to_string()),
+            "`{sql}` got {m:?}, expected VERICTO-090"
+        );
+    }
+}
+
+#[test]
+fn a_column_operand_disqualifies_the_predicate() {
+    // The invariant Property 9 locks, asserted end-to-end through the rules: the
+    // moment a column appears the predicate filters rows, so it is a real WHERE.
+    //
+    // `id IS NOT NULL` and `name LIKE '%'` are the sharp cases — both read as
+    // tautologies but drop rows where the column is NULL (2 of 3 in PostgreSQL),
+    // so treating them as WHERE-less would reject a legitimate DELETE.
+    for sql in [
+        "DELETE FROM users WHERE id IN (1, 2)",
+        "DELETE FROM users WHERE 1 IN (1, id)",
+        "DELETE FROM users WHERE id BETWEEN 0 AND 2",
+        "DELETE FROM users WHERE name LIKE '%'",
+        "DELETE FROM users WHERE id IS NOT NULL",
+    ] {
+        for d in ALL_DIALECTS {
+            assert!(
+                !fires_003(sql, d),
+                "`{sql}` references a column and must NOT trip VERICTO-003 on {d:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn negated_and_false_constant_forms_are_not_tautologies() {
+    // `NOT IN` is not the negation of `IN` under three-valued logic: with a NULL
+    // in the list the predicate is NULL, not true, so `1 NOT IN (2, NULL)`
+    // matches no rows at all (verified against PostgreSQL). A naive negation
+    // would make it a false positive on exactly the input an attacker can shape,
+    // so the walkers decide only the positive form.
+    //
+    // `1 IN (1, NULL)` is genuinely all-rows, but is skipped by the same
+    // conservative rule that rejects any NULL in the list — a deliberate false
+    // negative, which is the safe direction for a blocking rule.
+    for sql in [
+        "DELETE FROM users WHERE 1 NOT IN (2, 3)",
+        "DELETE FROM users WHERE 1 NOT IN (2, NULL)",
+        "DELETE FROM users WHERE 1 IN (1, NULL)",
+        "DELETE FROM users WHERE 1 IN (2, 3)",
+        "DELETE FROM users WHERE 5 BETWEEN 0 AND 2",
+        "DELETE FROM users WHERE 1 NOT BETWEEN 0 AND 2",
+        "DELETE FROM users WHERE 'x' LIKE 'a%'",
+        "DELETE FROM users WHERE 'x' NOT LIKE '%'",
+        "DELETE FROM users WHERE 'b' BETWEEN 'a' AND 'c'",
+    ] {
+        for d in ALL_DIALECTS {
+            assert!(
+                !fires_003(sql, d),
+                "`{sql}` is not provably always-true and must NOT trip VERICTO-003 on {d:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn constant_only_source_filter_does_not_bound_an_insert_select() {
+    // VERICTO-040 asks whether the source SELECT bounds the rows it copies. A
+    // constant-only WHERE does not, so an unfiltered copy must still be reported
+    // rather than being excused by a decorative predicate.
+    for d in [Dialect::Postgres, Dialect::Mysql] {
+        let m = matching_codes(
+            "INSERT INTO archive SELECT * FROM users WHERE 1 IN (1, 2)",
+            d,
+            &ruleset(),
+            &EnforcementPolicy::default(),
+        );
+        assert!(
+            m.contains(&"VERICTO-040".to_string()),
+            "constant-only WHERE must not count as a filter on {d:?}, got {m:?}"
+        );
+    }
+}

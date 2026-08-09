@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.2.6" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.3.0" }
 ```
 
 ### Quick example
@@ -99,7 +99,7 @@ Low/Informational → Monitor).
 | Code | Name | What it detects |
 |---|---|---|
 | VERICTO-001 | DELETE without WHERE | A `DELETE` with no `WHERE` — removes every row of the table. |
-| VERICTO-003 | DELETE with always-true WHERE | A `DELETE` whose `WHERE` is trivially true (`1=1`, `id = id`, `NOT FALSE`, `WHERE 1`) — semantically WHERE-less. |
+| VERICTO-003 | DELETE with always-true WHERE | A `DELETE` whose `WHERE` is trivially true (`1=1`, `id = id`, `NOT FALSE`, `WHERE 1`, `1 IN (1,2)`, `1 BETWEEN 0 AND 2`, `'x' LIKE '%'`) — semantically WHERE-less. See [what counts as always-true](#what-counts-as-always-true). |
 | VERICTO-010 | DROP TABLE / DATABASE | `DROP TABLE` or `DROP DATABASE` — irreversible loss of a relation/database. Excludes `INDEX` (VERICTO-013) and `SCHEMA` (VERICTO-012). |
 | VERICTO-011 | TRUNCATE TABLE | `TRUNCATE` — empties a table, non-transactional/unfiltered by design. |
 | VERICTO-012 | DROP SCHEMA | `DROP SCHEMA` — drops a whole namespace and everything in it. |
@@ -147,6 +147,57 @@ what severity/action per workspace); the engine owns the *detection logic*. The
 proxy's built-in fallback catalogue
 ([`vericto-proxy/src/tcp/evaluator.rs`](https://github.com/vericto/vericto-proxy))
 mirrors this table verbatim.
+
+## What counts as always-true
+
+Several rules turn on whether a `WHERE` clause actually filters anything.
+VERICTO-003/030/042 treat an always-true `WHERE` as WHERE-less, VERICTO-090 looks
+for one as an `OR` branch, and VERICTO-040 asks whether an `INSERT … SELECT`
+source is bounded. All four share one predicate, so what it recognises is worth
+stating precisely.
+
+**A predicate qualifies only when every operand is a literal.** Its truth value
+then cannot depend on the row, so it filters nothing:
+
+| Form | Example |
+|---|---|
+| boolean / truthy literal | `WHERE TRUE`, `WHERE 1` |
+| constant comparison | `1=1`, `2 > 1`, `'a'='a'` |
+| constant `IN` list | `1 IN (1, 2)` |
+| constant `BETWEEN` | `1 BETWEEN 0 AND 2` |
+| constant `LIKE '%'` | `'x' LIKE '%'` |
+| `NOT <always-false>` | `NOT FALSE`, `NOT 1=2` |
+| `AND` of always-true, `OR` with any always-true | `1=1 AND 2>1` |
+
+Plus one deliberate exception: the column self-comparison `id = id`, the canonical
+trick for neutralising a `WHERE`, which has no legitimate use.
+
+### What does not count, and why
+
+A predicate that references a column is a real filter, even when it reads like a
+tautology. SQL's three-valued logic is the reason — these drop every row where the
+column is `NULL`:
+
+```sql
+WHERE id IS NOT NULL   -- filters: NULL rows are excluded
+WHERE name LIKE '%'    -- filters: NULL names are excluded
+WHERE id IN (1, 2)     -- filters, obviously
+```
+
+Reporting those would be a false positive on rules that reject live traffic, so
+they are correct behaviour rather than gaps.
+
+Two further cases are **deliberate false negatives**, since over-reporting is the
+dangerous direction for a blocking rule:
+
+- **`NOT IN` is never treated as the negation of `IN`.** With a `NULL` in the list
+  the predicate evaluates to `NULL`, not true: `1 NOT IN (2, NULL)` matches *no*
+  rows. Only the positive form is decided.
+- **A `NULL` anywhere in an `IN` list disqualifies it**, so `1 IN (1, NULL)` is not
+  reported even though it does match every row.
+
+Semantic tautologies over columns (`WHERE id = 1 OR id > 0`) are out of scope:
+deciding them needs the column's domain, which a deterministic parser cannot know.
 
 ## Rule classes and per-channel caps
 
@@ -201,7 +252,7 @@ Predicates under `condition:`:
 |---|---|---|
 | `relation: <table>` | any | Scope to a table (case-insensitive, schema-agnostic) |
 | `where_clause: null` | DELETE/UPDATE/SELECT | No WHERE clause |
-| `where_always_true: true` | DELETE/UPDATE/SELECT | WHERE that matches every row: trivially true (`1=1`, `true`) or with an always-true OR branch (`id = 5 OR 1=1`) |
+| `where_always_true: true` | DELETE/UPDATE/SELECT | WHERE that matches every row: trivially true (`1=1`, `true`, `1 IN (1,2)`) or with an always-true OR branch (`id = 5 OR 1=1`). See [what counts as always-true](#what-counts-as-always-true) |
 | `target_list: "*"` | SELECT | `SELECT *` |
 | `has_limit: false` | SELECT | No LIMIT |
 | `func_name: <name>` | FuncCall | Function by name (case-insensitive) |

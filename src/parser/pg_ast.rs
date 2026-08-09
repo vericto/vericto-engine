@@ -560,18 +560,56 @@ fn where_presence(where_clause: Option<&Node>) -> WherePresence {
 ///   filter expression in some contexts)
 /// - `<const> <cmp> <const>` for `=`, `<>`/`!=`, `<`, `<=`, `>`, `>=`
 ///   evaluated over numeric/boolean literals (`1=1`, `2 > 1`, `'a'='a'`)
+/// - `<const> IN (<const>, …)` where the left side equals one of the items
+///   (`1 IN (1, 2)`)
+/// - `<const> BETWEEN <const> AND <const>` where the bounds hold (`1 BETWEEN 0 AND 2`)
+/// - `<const> LIKE '%'` — the match-everything pattern
 /// - column self-comparison `col = col` (always true for non-null rows; the
 ///   canonical WHERE-stripping trick `WHERE id = id`)
 /// - `NOT <always_false>` (e.g. `NOT FALSE`, `NOT 1=2`)
 /// - AND where every operand is always-true; OR where any operand is
+///
+/// Every form above other than `col = col` is **constant-only**: if any operand
+/// is a column reference the predicate does not qualify, because its truth value
+/// then depends on the row. Property 9 (`rules::properties`) locks that
+/// invariant — `id IS NOT NULL` and `name LIKE '%'` read as tautologies but drop
+/// rows where the column is NULL, so classifying them here would be a false
+/// positive on a rule that rejects live traffic.
 fn is_always_true(node: &NodeEnum) -> bool {
     match node {
         NodeEnum::AConst(c) => const_is_truthy(c),
         NodeEnum::AExpr(expr) => {
+            use pg_query::protobuf::AExprKind;
             let op = operator_name(&expr.name);
             let (Some(l), Some(r)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref()) else {
                 return false;
             };
+
+            // `IN` / `BETWEEN` / `LIKE` are A_Expr nodes distinguished by `kind`,
+            // not by operator name, so they are dispatched before the plain
+            // comparison path below (where `IN` would otherwise look like `=`
+            // against a List and `NOT IN` like `<>`).
+            match AExprKind::try_from(expr.kind) {
+                Ok(AExprKind::AexprIn) => {
+                    // `1 IN (…)` carries name "=", `1 NOT IN (…)` carries "<>".
+                    //
+                    // Only the positive form is decided here. `NOT IN` is NOT the
+                    // negation of `IN` under three-valued logic: with a NULL in
+                    // the list the whole predicate is NULL, not true, so
+                    // `1 NOT IN (2, NULL)` matches no rows at all — verified
+                    // against PostgreSQL. Treating it as a tautology would be a
+                    // false positive on exactly the input an attacker can shape.
+                    return op.as_deref() == Some("=") && const_in_list_true(l, r);
+                }
+                Ok(AExprKind::AexprBetween) => return const_between_true(l, r),
+                Ok(AExprKind::AexprLike) => {
+                    // `~~` is LIKE; `!~~` is NOT LIKE, which is never always-true
+                    // for the `%` pattern this recognises.
+                    return op.as_deref() == Some("~~") && const_like_matches_all(l, r);
+                }
+                _ => {}
+            }
+
             // Column self-comparison: `id = id`.
             if op.as_deref() == Some("=") && same_column_ref(l, r) {
                 return true;
@@ -667,6 +705,94 @@ fn const_is_falsey(c: &pg_query::protobuf::AConst) -> bool {
 /// Is this node a literal constant?
 fn is_const(node: &Node) -> bool {
     matches!(node.node.as_ref(), Some(NodeEnum::AConst(_)))
+}
+
+/// The `A_Const` behind a node, if it is a non-NULL literal.
+///
+/// A NULL literal (`isnull: true`, `val: None`) is deliberately excluded: no
+/// comparison against NULL is ever *true*, it is NULL, which does not match a
+/// row. Returning it as a comparable constant is how a `NOT IN (…, NULL)` would
+/// be mistaken for a tautology.
+fn non_null_const(node: &Node) -> Option<&pg_query::protobuf::AConst> {
+    match node.node.as_ref() {
+        Some(NodeEnum::AConst(c)) if !c.isnull => Some(c),
+        _ => None,
+    }
+}
+
+/// `<const> IN (<const>, …)` — true when the left literal equals at least one
+/// literal in the list.
+///
+/// Requires *every* element to be a non-NULL literal. A column anywhere makes the
+/// result row-dependent; a NULL element cannot make the predicate true and is
+/// rejected so the caller never has to reason about three-valued logic here.
+fn const_in_list_true(left: &Node, right: &Node) -> bool {
+    let Some(needle) = non_null_const(left) else {
+        return false;
+    };
+    let Some(NodeEnum::List(list)) = right.node.as_ref() else {
+        return false;
+    };
+    if list.items.is_empty() {
+        return false;
+    }
+    // All items must be literals: `1 IN (1, col)` still matches every row, but
+    // proving that needs the column's domain, so it stays undecided.
+    if !list.items.iter().all(|i| non_null_const(i).is_some()) {
+        return false;
+    }
+    list.items
+        .iter()
+        .filter_map(non_null_const)
+        .any(|item| aconst_eq(needle, item))
+}
+
+/// `<const> BETWEEN <lo> AND <hi>` — true when all three are literals and
+/// `lo <= x <= hi` holds. Numeric only: `BETWEEN` over strings depends on the
+/// database's collation, which is not knowable here.
+fn const_between_true(left: &Node, right: &Node) -> bool {
+    let Some(x) = non_null_const(left).and_then(aconst_as_f64) else {
+        return false;
+    };
+    let Some(NodeEnum::List(list)) = right.node.as_ref() else {
+        return false;
+    };
+    let [lo, hi] = &list.items[..] else {
+        return false;
+    };
+    let (Some(lo), Some(hi)) = (
+        non_null_const(lo).and_then(aconst_as_f64),
+        non_null_const(hi).and_then(aconst_as_f64),
+    ) else {
+        return false;
+    };
+    lo <= x && x <= hi
+}
+
+/// `<const> LIKE '%'` — the pattern that matches every non-NULL value.
+///
+/// Restricted to exactly `%`. Patterns like `'abc' LIKE 'a%'` are also
+/// constant-true, but deciding them means implementing LIKE matching, which is
+/// more bug surface than the case is worth. The left side must be a non-NULL
+/// literal: `col LIKE '%'` drops NULL rows and is a real filter.
+fn const_like_matches_all(left: &Node, right: &Node) -> bool {
+    use pg_query::protobuf::a_const::Val;
+    if non_null_const(left).is_none() {
+        return false;
+    }
+    matches!(
+        non_null_const(right).and_then(|c| c.val.as_ref()),
+        Some(Val::Sval(s)) if s.sval == "%"
+    )
+}
+
+/// Equality between two non-NULL literals: numerically when both are numbers,
+/// otherwise by the same debug-string identity `const_cmp_true` uses.
+fn aconst_eq(a: &pg_query::protobuf::AConst, b: &pg_query::protobuf::AConst) -> bool {
+    match (aconst_as_f64(a), aconst_as_f64(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => format!("{:?}", a.val) == format!("{:?}", b.val),
+    }
 }
 
 /// Compare two literal constants under `op`, returning whether the comparison
