@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.4.0] — 2026-08-09
+
+### Fixed
+
+- **A custom rule's `func_name:` predicate now matches any function, as
+  documented.** Both walkers only recorded a `FunctionCall` statement when the
+  name was in the sleep family, so `func_name: pg_read_file` — or `dblink`,
+  `lo_export`, `encode` — matched nothing. The rule saved, synced, appeared in the
+  workspace's catalogue, and silently never fired.
+  This is the worst shape a gap can take in a security product: a workspace that
+  wrote the rule believed it was protected and was not, with no error to notice.
+  Custom rules are the mechanism for covering domain-specific risk, so the
+  predicate reaching only four hard-coded names left that mechanism largely
+  inoperative.
+  The walkers now record every call, and each records the function's own name in
+  the evidence (`FunctionCall > pg_read_file()`) instead of a generic label.
+
+### Changed
+
+- **VERICTO-070 filters the sleep family in its own predicate.** It previously
+  matched *any* `StatementKind::FunctionCall`, relying on the walkers having
+  pre-filtered. That coupling is why the two changes above ship together:
+  recording every function without narrowing this rule would have turned
+  `SELECT now()` into a High → Block violation — a far worse regression than the
+  bug being fixed. A rule-specific concern now lives in the rule, and the shared
+  `parser::is_sleep_function` classifier is unchanged, so which names count is
+  still defined in exactly one place.
+  No behaviour change for the rule itself: it fires on the same four functions,
+  on every dialect, verified by the 3.2.2 regression lock.
+
+### Migration
+
+Hosts that build a ruleset from the built-in catalogue are unaffected. Two things
+do change for anyone reading `ParsedQuery` directly:
+
+- A host that wrote its own rule matching on `StatementKind::FunctionCall` and
+  assumed the parser had filtered to sleep calls must now check `function_name`
+  itself — the same shape as VERICTO-070's predicate.
+- `ParsedQuery::statements` is longer for queries containing ordinary functions:
+  `SELECT count(*), lower(name), upper(email), coalesce(a,b) FROM t WHERE id=1
+  LIMIT 1` yields 4 entries where it previously yielded 1. Evaluation is linear in
+  that count, and rule predicates short-circuit on `kind`, so the cost is small —
+  but a host that assumed one statement per SQL statement, or that sizes a buffer
+  from the length, should know.
+
 ## [3.3.1] — 2026-08-09
 
 ### Fixed

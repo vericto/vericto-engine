@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 use crate::parser::{
     AlterTableKind, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, WherePresence,
+    is_sleep_function,
 };
 use crate::rules::engine::{Rule, RuleType};
 
@@ -302,8 +303,19 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
 
         // VERICTO-070: Use of SLEEP() or PG_SLEEP() — indicates intentional delays,
         // usually for DoS or timing-based SQL injection probing.
+        // VERICTO-070: Use of SLEEP() or PG_SLEEP() — indicates intentional delays,
+        // usually for DoS or timing-based SQL injection probing.
+        //
+        // The sleep-family check belongs here, in the rule, not in the walkers.
+        // They record every FuncCall so a custom rule's `func_name:` predicate can
+        // name any function; this arm previously matched *any* FunctionCall and
+        // relied on the parser having pre-filtered, which would make
+        // `SELECT now()` a Critical/High violation the moment that filter moved.
         "VERICTO-070" => find(stmts, |s| {
             s.kind == StatementKind::FunctionCall
+                && s.function_name
+                    .as_deref()
+                    .is_some_and(is_sleep_function)
         })
         .map(|s| {
             let fname = s.function_name.as_deref().unwrap_or("sleep");

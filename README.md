@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.3.1" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.4.0" }
 ```
 
 ### Quick example
@@ -255,7 +255,7 @@ Predicates under `condition:`:
 | `where_always_true: true` | DELETE/UPDATE/SELECT | WHERE that matches every row: trivially true (`1=1`, `true`, `1 IN (1,2)`) or with an always-true OR branch (`id = 5 OR 1=1`). See [what counts as always-true](#what-counts-as-always-true) |
 | `target_list: "*"` | SELECT | `SELECT *` |
 | `has_limit: false` | SELECT | No LIMIT |
-| `func_name: <name>` | FuncCall | Function by name (case-insensitive) |
+| `func_name: <name>` | FuncCall | Any function by name, case-insensitive and schema-agnostic (`pg_catalog.pg_sleep` matches `pg_sleep`) — e.g. `pg_read_file`, `dblink`, `lo_export` |
 | `object_type: <kind>` | DropStmt | `table`/`database`/`schema`/`index` |
 | `alter_kind: <kind>` | AlterTableStmt | `drop_column`/`rename`/`drop_constraint`/`alter_column_type`/`disable_trigger` |
 

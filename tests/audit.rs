@@ -737,3 +737,139 @@ fn an_arms_own_bound_is_not_leaked_to_its_sibling() {
         "`{sql}` has an unbounded arm and must trip VERICTO-050, got {m:?}"
     );
 }
+
+// ── Custom-rule `func_name` reaches any function ─────────────────────────────
+//
+// The predicate is documented as matching a function by name, but both walkers
+// only recorded a FunctionCall for the sleep family, so `func_name: pg_read_file`
+// matched nothing — the rule saved, synced, appeared in `rules list`, and never
+// fired. A silent no-op is worse than a validation error: a workspace believes it
+// is protected and is not.
+//
+// The walkers now record every call and VERICTO-070 filters the sleep family in
+// its own predicate. Both halves are required: registering every function without
+// narrowing that rule would make `SELECT now()` a High → Block violation.
+
+fn custom_func_rule(func_name: &str) -> Rule {
+    Rule {
+        rule_id: "CUSTOM-FN".into(),
+        code: "CUSTOM-FN".into(),
+        severity: Severity::High,
+        default_action: EnforcementAction::Block,
+        rule_type: RuleType::Custom,
+        ast_condition_yaml: Some(format!(
+            "node_type: FuncCall\ncondition:\n  func_name: {func_name}"
+        )),
+    }
+}
+
+#[test]
+fn custom_func_name_matches_a_function_outside_the_sleep_family() {
+    let policy = EnforcementPolicy::default();
+    // The functions a workspace would realistically want to gate: filesystem
+    // reads, outbound connections, and bulk encoding of a sensitive column.
+    for (func, sql) in [
+        ("pg_read_file", "SELECT pg_read_file('/etc/passwd')"),
+        ("dblink", "SELECT dblink('host=evil', 'SELECT 1')"),
+        ("encode", "SELECT encode(secret, 'base64') FROM credentials"),
+        ("lower", "SELECT lower(name) FROM users"),
+    ] {
+        let rule = custom_func_rule(func);
+        for d in ALL_DIALECTS {
+            if parser_for(d).parse(sql).is_err() {
+                continue;
+            }
+            let outcome = evaluate(sql, d, std::slice::from_ref(&rule), &policy);
+            assert_eq!(
+                outcome.rule_code.as_deref(),
+                Some("CUSTOM-FN"),
+                "`func_name: {func}` must match `{sql}` on {d:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn custom_func_name_still_scopes_to_the_named_function() {
+    // Recording every call must not make the predicate match everything.
+    let policy = EnforcementPolicy::default();
+    let rule = custom_func_rule("pg_read_file");
+    for sql in ["SELECT now()", "SELECT lower(name) FROM users", "SELECT 1"] {
+        for d in ALL_DIALECTS {
+            if parser_for(d).parse(sql).is_err() {
+                continue;
+            }
+            let outcome = evaluate(sql, d, std::slice::from_ref(&rule), &policy);
+            assert_eq!(
+                outcome.rule_code, None,
+                "`func_name: pg_read_file` must not match `{sql}` on {d:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn vericto_070_does_not_fire_on_an_ordinary_function() {
+    // The other half of the change, and the trap it avoids: VERICTO-070 matched
+    // *any* FunctionCall, relying on the walkers having pre-filtered. With every
+    // call now recorded, an unnarrowed rule would block routine SQL.
+    for sql in [
+        "SELECT now()",
+        "SELECT count(*) FROM users",
+        "SELECT lower(name) FROM users",
+        "SELECT coalesce(a, b) FROM t",
+        // Contains "sleep" but is not a sleep call.
+        "SELECT sleepless(5)",
+    ] {
+        for d in ALL_DIALECTS {
+            if parser_for(d).parse(sql).is_err() {
+                continue;
+            }
+            let m = matching_codes(sql, d, &ruleset(), &EnforcementPolicy::default());
+            assert!(
+                !m.contains(&"VERICTO-070".to_string()),
+                "`{sql}` is not a sleep call and must NOT trip VERICTO-070 on {d:?}, got {m:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn vericto_070_still_catches_every_sleep_variant() {
+    // Regression lock for 3.2.2: the sleep family must keep firing on every
+    // dialect now that the classifier moved from the walkers into the rule.
+    for sql in [
+        "SELECT sleep(5)",
+        "SELECT pg_sleep(5)",
+        "SELECT pg_sleep_for('5 seconds')",
+        "SELECT pg_sleep_until('tomorrow')",
+    ] {
+        for d in ALL_DIALECTS {
+            if parser_for(d).parse(sql).is_err() {
+                continue;
+            }
+            let m = matching_codes(sql, d, &ruleset(), &EnforcementPolicy::default());
+            assert!(
+                m.contains(&"VERICTO-070".to_string()),
+                "`{sql}` must trip VERICTO-070 on {d:?}, got {m:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_recorded_function_call_carries_its_own_name_in_the_evidence() {
+    // The node path is what a user sees in a finding, so it must name the
+    // function that matched rather than a generic label.
+    let rule = custom_func_rule("pg_read_file");
+    let outcome = evaluate(
+        "SELECT pg_read_file('/etc/passwd')",
+        Dialect::Postgres,
+        std::slice::from_ref(&rule),
+        &EnforcementPolicy::default(),
+    );
+    assert_eq!(
+        outcome.ast_node_path.as_deref(),
+        Some("FunctionCall > pg_read_file()")
+    );
+}
