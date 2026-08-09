@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.0] — 2026-08-09
+
+Widens what counts as an always-true `WHERE`. **This blocks queries that
+previously passed** — see the migration note at the end of this entry. Minor
+rather than patch for that reason: no API changed, but enforcement did.
+
+### Added
+
+- **Constant-only `IN`, `BETWEEN` and `LIKE '%'` are now recognised as
+  always-true.** `WHERE 1 IN (1, 2)`, `WHERE 1 BETWEEN 0 AND 2` and
+  `WHERE 'x' LIKE '%'` filter nothing — confirmed against PostgreSQL, each returns
+  every row of a test table — but the predicate only understood comparison
+  operators, so a `DELETE` guarded by one was reported as having a real `WHERE`.
+  Both walkers implement all three, so the behaviour is identical on PostgreSQL,
+  MySQL, Oracle and MS SQL.
+  This feeds five rules through one predicate: `where_presence`
+  (VERICTO-003/030/042), `has_or_tautology` (VERICTO-090) and
+  `insert_select_has_filter` (VERICTO-040). A `DELETE … WHERE 1 IN (1,2)` now trips
+  VERICTO-003, `… OR 1 IN (1,2)` trips VERICTO-090 as the injection shape it is,
+  and a constant-only `WHERE` no longer excuses an unfiltered `INSERT … SELECT`.
+
+- **Property 9: a predicate that references a column is never always-true.** The
+  guard rail for the above, and for any future widening. Asserted over 18
+  column-referencing templates × 4 column spellings × 4 dialects, checking both
+  `where_presence` and `has_or_tautology`.
+  The invariant is structural — only predicates whose operands are *all literals*
+  may qualify, since their truth value cannot otherwise depend on the row. SQL's
+  three-valued logic is what makes that sharp: `id IS NOT NULL` and
+  `name LIKE '%'` read as tautologies but drop every row where the column is NULL
+  (2 of 3 rows on a table with one NULL row), so classifying either would be a
+  false positive on a Critical rule that rejects live traffic. They are correct
+  behaviour today, not gaps.
+
+### Documentation
+
+- **The README now has a "what counts as always-true" section**, listing every
+  recognised form in one table and — more usefully — what does *not* count and
+  why. Four rules turn on this predicate and none of them documented its
+  boundaries, so a host could not tell a deliberate false negative from an
+  oversight.
+
+### Deliberate false negatives
+
+Two constant-only forms are *not* reported, because over-reporting is the
+dangerous direction for a rule that rejects traffic inline:
+
+- **`NOT IN` is never treated as the negation of `IN`.** Under three-valued logic
+  a NULL in the list makes the whole predicate NULL rather than true, so
+  `1 NOT IN (2, NULL)` matches no rows at all — verified against PostgreSQL.
+  Negating the positive result would make it a false positive on exactly the input
+  an attacker can shape, so only the positive form is decided.
+- **A NULL anywhere in an `IN` list disqualifies it**, so `1 IN (1, NULL)` is not
+  reported even though it does match every row. Accepting it would mean carrying
+  NULL semantics through the comparison path for no security gain.
+
+`LIKE` is restricted to the exact pattern `%`. `'abc' LIKE 'a%'` is also
+constant-true, but deciding it means implementing LIKE matching, which is more bug
+surface than the case is worth. `BETWEEN` is numeric only, since string ordering
+depends on the database's collation.
+
+### Migration
+
+A query whose only `WHERE` is a constant-only `IN` / `BETWEEN` / `LIKE '%'` changes
+from allowed to blocked under the default policy. In practice such a predicate is
+either generated SQL or a neutralised filter — nobody writes `WHERE 1 IN (1,2)` by
+hand — so the expected blast radius is small, but hosts that want to observe before
+enforcing can set `monitor_mode` for a cycle, or cap the affected class per channel
+(see [rule classes](README.md#rule-classes-and-per-channel-caps)); all five rules
+involved are `DataMutation` or `Security`, so a `schema_migration_cap` will not
+soften them.
+
 ## [3.2.6] — 2026-08-09
 
 Adds one re-export and fixes documentation drift. No behaviour, rule, or

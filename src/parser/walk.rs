@@ -531,8 +531,13 @@ fn where_presence(selection: Option<&Expr>) -> WherePresence {
 
 /// Detect trivially-true predicates (see the pg_ast.rs counterpart for the full
 /// rationale — ENG-009). Recognises boolean/numeric truthy literals, constant
-/// comparisons under any of `= <> != < <= > >=`, column self-equality
-/// (`id = id`), `NOT <always_false>`, and AND/OR combinations thereof.
+/// comparisons under any of `= <> != < <= > >=`, constant-only `IN` / `BETWEEN` /
+/// `LIKE '%'`, column self-equality (`id = id`), `NOT <always_false>`, and AND/OR
+/// combinations thereof.
+///
+/// Every form other than `id = id` is constant-only: a column operand disqualifies
+/// the predicate, since its truth value then depends on the row. Property 9
+/// (`rules::properties`) locks that invariant across both walkers.
 fn is_always_true(expr: &Expr) -> bool {
     use sqlparser::ast::{BinaryOperator, UnaryOperator};
     match expr {
@@ -544,6 +549,35 @@ fn is_always_true(expr: &Expr) -> bool {
             op: UnaryOperator::Not,
             expr: inner,
         } => is_always_false(inner),
+
+        // `<const> IN (<const>, …)`. Only the positive form: `NOT IN` is not the
+        // negation of `IN` under three-valued logic — with a NULL in the list the
+        // predicate is NULL rather than true, so `1 NOT IN (2, NULL)` matches no
+        // rows (verified against PostgreSQL). Mirrors the pg_query walker.
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => const_in_list_true(expr, list),
+
+        // `<const> BETWEEN <const> AND <const>`, numeric bounds only.
+        Expr::Between {
+            expr,
+            negated: false,
+            low,
+            high,
+        } => const_between_true(expr, low, high),
+
+        // `<const> LIKE '%'` — the match-everything pattern. `any: false` keeps
+        // this off Snowflake's `LIKE ANY (…)` form, whose semantics differ.
+        Expr::Like {
+            negated: false,
+            any: false,
+            expr,
+            pattern,
+            escape_char: None,
+        } => const_like_matches_all(expr, pattern),
+
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::Eq if same_column(left, right) => true,
             BinaryOperator::Eq
@@ -616,6 +650,74 @@ fn unwrap_nested(expr: &Expr) -> &Expr {
         Expr::Nested(inner) => unwrap_nested(inner),
         other => other,
     }
+}
+
+/// The literal behind an expression, if it is one and is not NULL.
+///
+/// NULL is excluded deliberately: no comparison against NULL is *true*, it is
+/// NULL, which matches no row. Admitting it is how `NOT IN (…, NULL)` would be
+/// mistaken for a tautology.
+fn non_null_literal(expr: &Expr) -> Option<&Value> {
+    match unwrap_nested(expr) {
+        Expr::Value(Value::Null) => None,
+        Expr::Value(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// `<const> IN (<const>, …)` — true when the left literal equals at least one
+/// literal in the list. Every element must be a non-NULL literal: a column
+/// anywhere makes the result row-dependent, and `1 IN (1, col)` would need the
+/// column's domain to decide.
+fn const_in_list_true(expr: &Expr, list: &[Expr]) -> bool {
+    let Some(needle) = non_null_literal(expr) else {
+        return false;
+    };
+    if list.is_empty() || !list.iter().all(|e| non_null_literal(e).is_some()) {
+        return false;
+    }
+    list.iter()
+        .filter_map(non_null_literal)
+        .any(|item| value_eq(needle, item))
+}
+
+/// `<const> BETWEEN <lo> AND <hi>` — true when all three are numeric literals and
+/// `lo <= x <= hi`. Numeric only: string `BETWEEN` depends on the database's
+/// collation, which is not knowable here.
+fn const_between_true(expr: &Expr, low: &Expr, high: &Expr) -> bool {
+    let num = |e: &Expr| match non_null_literal(e) {
+        Some(Value::Number(n, _)) => n.parse::<f64>().ok(),
+        _ => None,
+    };
+    let (Some(x), Some(lo), Some(hi)) = (num(expr), num(low), num(high)) else {
+        return false;
+    };
+    lo <= x && x <= hi
+}
+
+/// `<const> LIKE '%'` — the pattern matching every non-NULL value. Restricted to
+/// exactly `%`; deciding `'abc' LIKE 'a%'` would mean implementing LIKE matching,
+/// which is more bug surface than the case is worth. The left side must be a
+/// literal, since `col LIKE '%'` drops NULL rows and is a real filter.
+fn const_like_matches_all(expr: &Expr, pattern: &Expr) -> bool {
+    if non_null_literal(expr).is_none() {
+        return false;
+    }
+    matches!(
+        non_null_literal(pattern),
+        Some(Value::SingleQuotedString(s)) if s == "%"
+    )
+}
+
+/// Equality between two non-NULL literals: numerically when both are numbers,
+/// otherwise by the same debug-string identity `const_cmp_true` uses.
+fn value_eq(a: &Value, b: &Value) -> bool {
+    if let (Value::Number(x, _), Value::Number(y, _)) = (a, b) {
+        if let (Ok(x), Ok(y)) = (x.parse::<f64>(), y.parse::<f64>()) {
+            return x == y;
+        }
+    }
+    format!("{a:?}") == format!("{b:?}")
 }
 
 /// Statically evaluate `<const> <op> <const>`. Numbers compare numerically;

@@ -1,6 +1,6 @@
 [package]
 name = "vericto-engine"
-version = "3.2.6"
+version = "3.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Vericto — Deterministic SQL AST evaluation engine (open core)"
