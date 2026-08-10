@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.4.0" }
+//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.5.0" }
 //! ```
 //!
 //! ```rust
@@ -41,8 +41,8 @@ pub mod rules;
 pub use error::{ProxyError, Result};
 pub use parser::Dialect;
 pub use rules::engine::{
-    Decision, EnforcementAction, EnforcementPolicy, EvaluationOutcome, ParseErrorAction, Rule,
-    RuleClass, RuleEngine, RuleType, Severity,
+    Decision, EnforcementAction, EnforcementPolicy, EvaluationOutcome, ParseErrorAction,
+    ReportedViolation, Rule, RuleClass, RuleEngine, RuleType, Severity,
 };
 
 /// Convenience function: parse + evaluate in one call.
@@ -71,6 +71,11 @@ pub fn evaluate(
             ast_node_path: Some(format!("PARSE_ERROR: {e}")),
             estimated_rows_affected: None,
             suggested_safe_query: None,
+            // A parse error is not a rule violation: nothing was evaluated, so
+            // there is no set to report. The pseudo-code in `rule_code` is
+            // telemetry, not a catalogue entry, and putting it here would make
+            // `violations` disagree with "every rule this query broke".
+            violations: Vec::new(),
         },
     }
 }

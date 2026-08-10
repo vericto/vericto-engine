@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.4.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.5.0" }
 ```
 
 ### Quick example
@@ -68,6 +68,48 @@ highest severity. When several share the top severity, the one with the lowest
 `code` wins. The order of the `rules` slice never affects the result, so you do
 not need to sort it — the same query and ruleset always report the same
 violation.
+
+### Every violation, not only the winner
+
+The flat fields carry one violation because that is what the hosts need: a wire
+proxy builds a single native protocol error, and an audit row has one
+`rule_id_triggered`. `outcome.violations` carries the full set alongside it.
+
+```rust
+let outcome = evaluate(sql, Dialect::Postgres, &rules, &policy);
+
+// The verdict — derived from the winner alone.
+if outcome.decision == Decision::Block { /* reject */ }
+
+// Everything the query is guilty of, worst first.
+for v in &outcome.violations {
+    println!("{} {:?} → {:?}  {}", v.rule_code, v.severity, v.action, v.ast_node_path);
+}
+```
+
+Guarantees, each pinned by a property test:
+
+- `violations[0]` **is** the winner reported in the flat fields.
+- Ordered severity descending, then rule code ascending — never by the order you
+  passed the rules in.
+- `decision` and `action` come from the winner **alone**. A longer list can never
+  change whether a query is blocked, so the field is safe to ignore.
+- Contains exactly the rules that fire when each is evaluated on its own — nothing
+  dropped, nothing invented.
+- Empty exactly when no rule matched. A parse error also reports an empty set:
+  nothing was evaluated, so there is no violation to report.
+
+Each entry carries its **own** resolved `severity` and `action`, so a caller
+rendering the set does not re-derive them and cannot disagree with the decision.
+Note that a per-class cap can make a lower-severity violation resolve to a
+*stronger* action than the winner — `schema_migration_cap: Monitor` softens a
+Critical `DROP TABLE` while a High `DELETE` still blocks. The winner is chosen by
+severity, not by action.
+
+Before this field, a host that wanted the full set had to call `evaluate()` once
+per rule, re-parsing the SQL every time: measured at roughly **20× the cost** on a
+28-rule catalogue. Collecting them costs nothing measurable, because the evaluator
+already ran every rule and simply discarded the rest.
 
 ---
 

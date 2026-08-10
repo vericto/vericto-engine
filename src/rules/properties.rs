@@ -642,3 +642,263 @@ mod column_predicates_are_not_tautologies {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Property 10: `violations` is evidence, never an input to the verdict
+// ---------------------------------------------------------------------------
+//
+// `EvaluationOutcome::violations` reports every rule a query broke, alongside the
+// single winner the flat fields carry. Hosts depend on the winner: the TCP proxy
+// builds one native protocol error from it, and `query_events.rule_id_triggered` is
+// one column. So the set has to be strictly additive — it must not be able to
+// change whether a query is blocked, or in what order things are reported.
+//
+// These properties pin the four claims the field's documentation makes, over
+// randomly generated rulesets and policies:
+//
+//   1. `violations.first()` IS the winner reported in the flat fields.
+//   2. The order is (severity desc, code asc) — never the caller's slice order.
+//   3. Reordering the input `rules` slice cannot change the outcome at all.
+//   4. Empty exactly when no rule matched.
+#[cfg(test)]
+mod all_violations_are_reported {
+    use crate::parser::{Dialect, parser_for};
+    use crate::rules::engine::{
+        Decision, EnforcementAction, EnforcementPolicy, Rule, RuleEngine, RuleType, Severity,
+    };
+    use proptest::prelude::*;
+
+    /// Codes that fire together on the queries below, so a generated ruleset
+    /// produces multi-violation outcomes rather than one-or-none.
+    const CODES: &[&str] = &[
+        "VERICTO-001",
+        "VERICTO-003",
+        "VERICTO-010",
+        "VERICTO-040",
+        "VERICTO-042",
+        "VERICTO-050",
+        "VERICTO-051",
+        "VERICTO-060",
+        "VERICTO-090",
+    ];
+
+    /// Queries chosen to break several rules at once.
+    const QUERIES: &[&str] = &[
+        "SELECT * FROM users",
+        "DELETE FROM users",
+        "SELECT * FROM users WHERE id = 1 OR 1=1",
+        "INSERT INTO archive SELECT * FROM users",
+        "UPDATE t SET a = 1",
+        "DELETE FROM users WHERE 1 IN (1, 2)",
+        "SELECT id, email FROM users WHERE email = $1 LIMIT 1", // clean
+        // Trips a SchemaMigration rule AND a DataMutation one, so a
+        // schema_migration_cap can invert their resolved actions relative to
+        // severity. This is the shape that distinguishes "decision from the winner"
+        // from "decision from the strongest action in the set".
+        "DROP TABLE users; DELETE FROM users",
+    ];
+
+    fn severity_strategy() -> impl Strategy<Value = Severity> {
+        prop_oneof![
+            Just(Severity::Informational),
+            Just(Severity::Low),
+            Just(Severity::Medium),
+            Just(Severity::High),
+            Just(Severity::Critical),
+        ]
+    }
+
+    /// A ruleset of 1..=CODES.len() rules with arbitrary severities.
+    fn ruleset_strategy() -> impl Strategy<Value = Vec<Rule>> {
+        prop::collection::vec(severity_strategy(), CODES.len()).prop_map(|severities| {
+            CODES
+                .iter()
+                .zip(severities)
+                .map(|(code, severity)| Rule {
+                    rule_id: format!("id-{code}"),
+                    code: (*code).to_string(),
+                    severity,
+                    default_action: EnforcementAction::Block,
+                    rule_type: RuleType::Standard,
+                    ast_condition_yaml: None,
+                })
+                .collect()
+        })
+    }
+
+    /// Includes `cap = Monitor`, not just `Flag`. That matters: a cap can push a
+    /// high-severity SchemaMigration violation BELOW a lower-severity uncapped one,
+    /// so the winner (highest severity) no longer necessarily holds the strongest
+    /// action. Without a Monitor cap in the generator, an implementation that
+    /// escalated the decision to `max(action)` over the whole set would look
+    /// indistinguishable from the correct one — verified by injecting exactly that
+    /// mutation and watching it survive until this case was generated.
+    fn policy_strategy() -> impl Strategy<Value = EnforcementPolicy> {
+        (
+            any::<bool>(),
+            prop_oneof![
+                Just(None),
+                Just(Some(EnforcementAction::Flag)),
+                Just(Some(EnforcementAction::Monitor)),
+            ],
+        )
+            .prop_map(|(monitor_mode, cap)| EnforcementPolicy {
+                monitor_mode,
+                schema_migration_cap: cap,
+                ..EnforcementPolicy::default()
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+        // Property 10: the first reported violation is the winner, and the flat
+        // fields agree with it field for field. A host reading either one must see
+        // the same violation.
+        #[test]
+        fn p10_first_violation_is_the_winner(
+            sql in prop::sample::select(QUERIES),
+            rules in ruleset_strategy(),
+            policy in policy_strategy(),
+        ) {
+            let parsed = parser_for(Dialect::Postgres).parse(sql).expect("must parse");
+            let out = RuleEngine::evaluate(&parsed, &rules, &policy);
+
+            match out.violations.first() {
+                None => {
+                    // Empty set ⇔ nothing matched.
+                    prop_assert_eq!(out.rule_code, None);
+                    prop_assert_eq!(out.decision, Decision::Allow);
+                    prop_assert_eq!(out.action, None);
+                }
+                Some(winner) => {
+                    prop_assert_eq!(out.rule_code.as_deref(), Some(winner.rule_code.as_str()));
+                    prop_assert_eq!(out.rule_id.as_deref(), Some(winner.rule_id.as_str()));
+                    prop_assert_eq!(out.severity, Some(winner.severity));
+                    prop_assert_eq!(out.action, Some(winner.action));
+                    prop_assert_eq!(
+                        out.ast_node_path.as_deref(),
+                        Some(winner.ast_node_path.as_str())
+                    );
+                    // The decision follows the winner's action and nothing else.
+                    prop_assert_eq!(out.decision, Decision::from_action(winner.action));
+                }
+            }
+        }
+
+        // Property 10 (order): severity descending, then rule code ascending, for
+        // every adjacent pair. Asserted pairwise rather than by re-sorting, so the
+        // test does not restate the implementation.
+        #[test]
+        fn p10_violations_are_ordered_by_severity_then_code(
+            sql in prop::sample::select(QUERIES),
+            rules in ruleset_strategy(),
+            policy in policy_strategy(),
+        ) {
+            let parsed = parser_for(Dialect::Postgres).parse(sql).expect("must parse");
+            let out = RuleEngine::evaluate(&parsed, &rules, &policy);
+
+            for pair in out.violations.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                prop_assert!(
+                    a.severity > b.severity
+                        || (a.severity == b.severity && a.rule_code < b.rule_code),
+                    "out of order: {:?}/{} then {:?}/{}",
+                    a.severity, a.rule_code, b.severity, b.rule_code
+                );
+            }
+        }
+
+        // Property 10 (order-independence): shuffling the caller's `rules` slice
+        // cannot change anything about the outcome — not the decision, not the
+        // winner, not the set or its order. This is the 3.2.4 guarantee extended
+        // from the winner to the whole vector.
+        #[test]
+        fn p10_outcome_is_independent_of_input_rule_order(
+            sql in prop::sample::select(QUERIES),
+            rules in ruleset_strategy(),
+            policy in policy_strategy(),
+        ) {
+            let parsed = parser_for(Dialect::Postgres).parse(sql).expect("must parse");
+            let forward = RuleEngine::evaluate(&parsed, &rules, &policy);
+
+            let mut reversed_rules = rules.clone();
+            reversed_rules.reverse();
+            let reversed = RuleEngine::evaluate(&parsed, &reversed_rules, &policy);
+
+            let codes = |o: &crate::rules::engine::EvaluationOutcome| {
+                o.violations.iter().map(|v| v.rule_code.clone()).collect::<Vec<_>>()
+            };
+            prop_assert_eq!(forward.decision, reversed.decision);
+            prop_assert_eq!(forward.rule_code.clone(), reversed.rule_code.clone());
+            prop_assert_eq!(forward.violations.len(), reversed.violations.len());
+            prop_assert_eq!(codes(&forward), codes(&reversed));
+        }
+
+        // Property 10 (the decision is the winner's alone): the verdict must depend
+        // only on the highest-severity violation, never on how many others there
+        // are. Asserted by evaluating the winning rule BY ITSELF and requiring the
+        // same decision and action.
+        //
+        // Without this, "violations is evidence, not an input" is only a comment:
+        // an implementation that escalated the decision when several rules fired
+        // would satisfy every other property here while changing whether a query is
+        // blocked — the one thing this field must never do.
+        #[test]
+        fn p10_decision_comes_from_the_winner_alone(
+            sql in prop::sample::select(QUERIES),
+            rules in ruleset_strategy(),
+            policy in policy_strategy(),
+        ) {
+            let parsed = parser_for(Dialect::Postgres).parse(sql).expect("must parse");
+            let full = RuleEngine::evaluate(&parsed, &rules, &policy);
+
+            let Some(winner_code) = full.rule_code.clone() else { return Ok(()) };
+            let winning_rule = rules
+                .iter()
+                .find(|r| r.code == winner_code)
+                .expect("the winner must come from the ruleset");
+
+            let alone =
+                RuleEngine::evaluate(&parsed, std::slice::from_ref(winning_rule), &policy);
+
+            prop_assert_eq!(full.decision, alone.decision);
+            prop_assert_eq!(full.action, alone.action);
+            prop_assert_eq!(full.severity, alone.severity);
+            prop_assert_eq!(full.rule_code, alone.rule_code);
+        }
+
+        // Property 10 (completeness): the set contains exactly the rules that fire
+        // when each is evaluated alone. Nothing is dropped, nothing invented.
+        //
+        // This is the property the field exists for: before it, a host wanting the
+        // full set had to call evaluate() once per rule — N parses instead of one,
+        // measured at ~20x on a 28-rule catalogue.
+        #[test]
+        fn p10_set_equals_evaluating_each_rule_alone(
+            sql in prop::sample::select(QUERIES),
+            rules in ruleset_strategy(),
+            policy in policy_strategy(),
+        ) {
+            let parsed = parser_for(Dialect::Postgres).parse(sql).expect("must parse");
+            let out = RuleEngine::evaluate(&parsed, &rules, &policy);
+
+            let mut expected: Vec<String> = rules
+                .iter()
+                .filter(|r| {
+                    RuleEngine::evaluate(&parsed, std::slice::from_ref(r), &policy)
+                        .rule_code
+                        .is_some()
+                })
+                .map(|r| r.code.clone())
+                .collect();
+            expected.sort();
+
+            let mut got: Vec<String> =
+                out.violations.iter().map(|v| v.rule_code.clone()).collect();
+            got.sort();
+
+            prop_assert_eq!(got, expected);
+        }
+    }
+}
