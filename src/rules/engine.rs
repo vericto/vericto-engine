@@ -273,6 +273,33 @@ impl Decision {
     }
 }
 
+/// One rule violation, with its severity and action already resolved.
+///
+/// The winner is reported in the flat fields of [`EvaluationOutcome`] because the
+/// hosts need exactly one: the TCP proxy builds a native protocol error carrying a
+/// single rule code and node path, and `query_events.rule_id_triggered` is one
+/// column. `EvaluationOutcome::violations` carries the full set alongside it, for
+/// the callers that want everything a query is guilty of rather than only the worst
+/// of it — a CI run reporting every problem in one pass, or an audit trail keeping
+/// the evidence that a statement was both a WHERE-less DELETE *and* an injection
+/// tautology.
+///
+/// `action` is resolved per violation through the same per-class path the winner
+/// uses, so a caller rendering the set does not have to re-derive it — and cannot
+/// get it wrong in a way that disagrees with the decision.
+#[derive(Debug, Clone)]
+pub struct ReportedViolation {
+    pub rule_id: String,
+    pub rule_code: String,
+    pub severity: Severity,
+    /// Action this violation resolves to on its own, via
+    /// [`EnforcementPolicy::action_for_class`].
+    pub action: EnforcementAction,
+    pub ast_node_path: String,
+    pub estimated_rows_affected: Option<i64>,
+    pub suggested_safe_query: Option<String>,
+}
+
 /// Result of evaluating a query against the active ruleset (R3.5, R3.7).
 #[derive(Debug, Clone)]
 pub struct EvaluationOutcome {
@@ -285,6 +312,18 @@ pub struct EvaluationOutcome {
     pub ast_node_path: Option<String>,
     pub estimated_rows_affected: Option<i64>,
     pub suggested_safe_query: Option<String>,
+    /// Every violation the query triggered, including the one reported above.
+    ///
+    /// Ordered exactly as the winner is chosen — severity descending, then rule
+    /// code ascending — so `violations.first()` IS the winner and the order never
+    /// depends on how the host assembled the `rules` slice.
+    ///
+    /// `decision` is derived from the winner alone. Adding to this vector cannot
+    /// change whether a query is blocked, which is what makes it safe to consume
+    /// or ignore.
+    ///
+    /// Empty exactly when no rule matched, i.e. when `rule_code` is `None`.
+    pub violations: Vec<ReportedViolation>,
 }
 
 impl EvaluationOutcome {
@@ -298,6 +337,7 @@ impl EvaluationOutcome {
             ast_node_path: None,
             estimated_rows_affected: None,
             suggested_safe_query: None,
+            violations: Vec::new(),
         }
     }
 }
@@ -325,51 +365,60 @@ impl RuleEngine {
         rules: &[Rule],
         policy: &EnforcementPolicy,
     ) -> EvaluationOutcome {
-        let mut best: Option<(Severity, evaluator::Violation)> = None;
-
-        for rule in rules {
-            if let Some(violation) = evaluator::evaluate_rule(rule, parsed) {
-                let is_better = match &best {
-                    None => true,
-                    Some((sev, current)) => match rule.severity.cmp(sev) {
-                        Ordering::Greater => true,
-                        // Equal severity: decide on the rule code rather than on
-                        // whichever came first in `rules`. The host supplies that
-                        // slice — the control plane serves it from a query with no
-                        // ORDER BY — so position is not a property of the query
-                        // being evaluated, and letting it decide would make the
-                        // reported code vary between runs on identical input.
-                        // Lowest code wins, which favours the lower-numbered and
-                        // therefore more fundamental rule.
-                        Ordering::Equal => rule.code < current.rule_code,
-                        Ordering::Less => false,
-                    },
-                };
-                if is_better {
-                    best = Some((rule.severity, violation));
-                }
-            }
-        }
-
-        match best {
-            None => EvaluationOutcome::allowed(),
-            Some((severity, v)) => {
-                // Resolve the action through the per-class path so a channel's
-                // schema-migration cap (if any) can soften DDL without touching
-                // DataMutation / Security violations. Class is derived from the
-                // winning rule's code — a static property, not a channel input.
-                let action = policy.action_for_class(severity, RuleClass::for_code(&v.rule_code));
-                EvaluationOutcome {
-                    decision: Decision::from_action(action),
-                    action: Some(action),
-                    severity: Some(severity),
-                    rule_id: Some(v.rule_id),
-                    rule_code: Some(v.rule_code),
-                    ast_node_path: Some(v.ast_node_path),
+        // Collect every violation, then order them. The loop already evaluated
+        // every rule to find the worst one — the previous version simply discarded
+        // the rest — so keeping them costs a push, not extra evaluation.
+        let mut violations: Vec<ReportedViolation> = rules
+            .iter()
+            .filter_map(|rule| {
+                evaluator::evaluate_rule(rule, parsed).map(|v| ReportedViolation {
+                    // Resolve each action through the per-class path so a channel's
+                    // schema-migration cap (if any) softens DDL without touching
+                    // DataMutation / Security violations. Class comes from the rule
+                    // code — a static property, not a channel input.
+                    action: policy
+                        .action_for_class(rule.severity, RuleClass::for_code(&v.rule_code)),
+                    severity: rule.severity,
+                    rule_id: v.rule_id,
+                    rule_code: v.rule_code,
+                    ast_node_path: v.ast_node_path,
                     estimated_rows_affected: v.estimated_rows_affected,
                     suggested_safe_query: v.suggested_safe_query,
-                }
-            }
+                })
+            })
+            .collect();
+
+        // Highest severity first, then lowest rule code. This is the same
+        // comparison that used to pick the winner inline, lifted to a total order
+        // so the whole set is deterministic and `violations[0]` is the winner.
+        //
+        // Sorting on (severity, code) — never on position in `rules` — is the point:
+        // the host supplies that slice, the control plane serves it from a query
+        // with no ORDER BY, so position is not a property of the query being
+        // evaluated. Letting it decide made the reported code vary between runs on
+        // identical input (fixed in 3.2.4).
+        violations.sort_by(|a, b| match b.severity.cmp(&a.severity) {
+            Ordering::Equal => a.rule_code.cmp(&b.rule_code),
+            other => other,
+        });
+
+        let Some(winner) = violations.first() else {
+            return EvaluationOutcome::allowed();
+        };
+
+        // `decision` and `action` come from the winner alone, exactly as before.
+        // The vector is additional evidence, never an input to the verdict.
+        let action = winner.action;
+        EvaluationOutcome {
+            decision: Decision::from_action(action),
+            action: Some(action),
+            severity: Some(winner.severity),
+            rule_id: Some(winner.rule_id.clone()),
+            rule_code: Some(winner.rule_code.clone()),
+            ast_node_path: Some(winner.ast_node_path.clone()),
+            estimated_rows_affected: winner.estimated_rows_affected,
+            suggested_safe_query: winner.suggested_safe_query.clone(),
+            violations,
         }
     }
 }

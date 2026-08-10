@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.5.0] — 2026-08-10
+
+### Added
+
+- **`EvaluationOutcome::violations` reports every rule a query broke**, alongside
+  the single winner the flat fields already carried. `ReportedViolation` is
+  re-exported at the crate root and carries each violation's own resolved
+  `severity` and `action`, so a caller rendering the set does not re-derive them.
+  The flat fields are unchanged, so this is additive: a host that ignores the new
+  field behaves exactly as before.
+  What it fixes is lost evidence. `SELECT * FROM users WHERE id=1 OR 1=1;
+  DELETE FROM audit_log` reported only VERICTO-001 — the injection tautology
+  (VERICTO-090) was detected, outranked on the code tie-break, and dropped. Both
+  are Critical so the decision was identical either way, but the audit trail lost
+  the fact that an injection was attempted. For a security product that is a real
+  loss, not a cosmetic one.
+  It also removes a 20× cost. A host that wanted the full set had to call
+  `evaluate()` once per rule, re-parsing the SQL each time: measured at 854 µs
+  against 41 µs for a single call on a 28-rule catalogue. The engine's own
+  `tests/audit.rs` had a helper doing exactly that.
+
+  Guarantees, each pinned by a property test in `rules::properties`:
+  - `violations[0]` **is** the winner in the flat fields, field for field.
+  - Ordered severity descending, then rule code ascending — never by the caller's
+    slice order. This extends the 3.2.4 determinism fix from the winner to the
+    whole set.
+  - `decision` and `action` derive from the winner **alone**, verified by
+    evaluating the winning rule by itself and requiring the same verdict. That is
+    what makes the field safe to consume or ignore.
+  - The set equals evaluating each rule on its own — nothing dropped or invented.
+  - Empty exactly when no rule matched. A parse error reports an empty set too:
+    nothing was evaluated, so there is no violation, and the `VERICTO-PARSE-ERROR`
+    pseudo-code stays telemetry rather than a catalogue entry.
+
+  Collecting the set costs nothing measurable — 13.4 µs/query before, 13.3 µs
+  after, on 28 rules — because the evaluator already ran every rule and discarded
+  all but the best. A clean query allocates nothing.
+
+### Notes for hosts
+
+`decision` is unchanged for every input, so adopting this needs no behaviour
+review. Two things are worth knowing before rendering the set:
+
+- A per-class cap can make a *lower*-severity violation resolve to a *stronger*
+  action than the winner: `schema_migration_cap: Monitor` softens a Critical
+  `DROP TABLE` while a High `DELETE` still blocks. The winner is chosen by
+  severity, not by action — so do not assume `violations[0].action` is the maximum
+  in the set. Finding this is what closed a real gap in the property tests: a
+  mutation that escalated the decision to `max(action)` survived until the
+  generator was widened to produce a `Monitor` cap.
+- `violations` is not `#[non_exhaustive]`-guarded, and neither is
+  `EvaluationOutcome`; a host constructing the struct literally will need the new
+  field. Both first-party hosts read it rather than build it.
+
 ## [3.4.0] — 2026-08-09
 
 ### Fixed
