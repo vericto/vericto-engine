@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.5.1] — 2026-08-13
+
+### Fixed
+
+- **A single statement could kill the process (denial of service).** Roughly 950
+  nested `NOT`s — about 4 KB of SQL, well under the published 64 KiB
+  `MAX_QUERY_SIZE_BYTES` — overflowed the stack while the parser was still building
+  the tree. The overflow happens inside `pg_query`/`sqlparser` during recursive
+  descent, before any engine code sees a node, so `MAX_AST_DEPTH` could not reach
+  it: that guard bounds a walk over a tree that already exists.
+
+  A stack overflow in Rust is not a catchable panic — `catch_unwind` does not see
+  it, the process aborts — and both consumers compile with `panic = "abort"`. So an
+  unauthenticated sender could terminate an eval sidecar or a proxy worker with one
+  request, at no cost to themselves. Measured threshold is between 920 and 950
+  levels of nesting; it reproduced identically on all four dialects.
+
+  Added `error::guard_nesting_depth`, called at the top of `parse_postgres` and
+  `parse_with_dialect`, which refuses input whose textual nesting exceeds
+  `MAX_NESTING_DEPTH` (200) with `ProxyError::AstTooDeep`. It counts parenthesis
+  depth and runs of consecutive `NOT` on the raw string, because the decision has to
+  be made *before* handing the text to something that will recurse on it. The
+  keyword match is case-insensitive and on word boundaries, so a column named
+  `notes` or `not_deleted` is not mistaken for the operator.
+
+  The limit leaves an order of magnitude of headroom over the overflow point and far
+  more over real traffic: no ORM emits 200 levels of nesting. `tests/nesting_dos.rs`
+  pins the behaviour on every dialect and asserts that legitimate chained `NOT`,
+  nested parentheses and `not`-containing identifiers still parse. Verified the test
+  is meaningful by removing the guard again — the test binary aborts with the
+  original stack overflow.
+
 ## [3.5.0] — 2026-08-10
 
 ### Added
