@@ -5,7 +5,7 @@
 //! subqueries / CTEs. Also detects INSERT patterns, SELECT * / no-LIMIT,
 //! and function calls (SLEEP, PG_SLEEP).
 
-use crate::error::{MAX_AST_DEPTH, ProxyError, Result};
+use crate::error::{MAX_AST_DEPTH, ProxyError, Result, guard_nesting_depth};
 use crate::parser::{
     AlterTableKind, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, WherePresence,
 };
@@ -22,6 +22,12 @@ use sqlparser::parser::Parser as SqlAstParser;
 // ---------------------------------------------------------------------------
 
 pub fn parse_with_dialect<D: SqlDialect>(dialect: &D, sql: &str) -> Result<ParsedQuery> {
+    // Before the parser recurses on this string. `parse_sql` descends recursively,
+    // so deeply nested input overflows the stack inside sqlparser — which aborts the
+    // process rather than returning an error we could map. See
+    // `guard_nesting_depth`.
+    guard_nesting_depth(sql)?;
+
     let statements =
         SqlAstParser::parse_sql(dialect, sql).map_err(|e| ProxyError::ParseError(e.to_string()))?;
 

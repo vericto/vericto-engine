@@ -7,7 +7,7 @@
 //! UPDATE, DROP, and TRUNCATE — including those nested inside data-modifying
 //! CTEs (`WITH x AS (DELETE ...)`), which sqlparser-rs does not handle.
 
-use crate::error::{MAX_AST_DEPTH, ProxyError, Result};
+use crate::error::{MAX_AST_DEPTH, ProxyError, Result, guard_nesting_depth};
 use crate::parser::{
     AlterTableKind, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, WherePresence,
 };
@@ -18,6 +18,13 @@ use pg_query::protobuf::{Node, ObjectType, RangeVar, WithClause};
 /// Parse a PostgreSQL query with libpg_query and return the normalized
 /// representation. Returns `ParseError` on invalid syntax.
 pub fn parse_postgres(sql: &str) -> Result<ParsedQuery> {
+    // Before `pg_query::parse` sees the string. libpg_query builds the tree by
+    // recursive descent and its prost decoder recurses again over the protobuf, so
+    // deeply nested input overflows the stack in there — measured at ~950 nested
+    // `NOT`s. That is an abort, not an `Err`, so it cannot be mapped or caught; the
+    // only place to stop it is here. See `guard_nesting_depth`.
+    guard_nesting_depth(sql)?;
+
     let result = pg_query::parse(sql).map_err(|e| ProxyError::ParseError(e.to_string()))?;
 
     let mut out: Vec<StatementInfo> = Vec::new();
