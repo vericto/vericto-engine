@@ -116,9 +116,35 @@ fn walk_node(
                         AlterTableKind::AlterColumnType,
                         "AlterTableStmt > AlterColumnType",
                     ),
+                    // `DISABLE ROW LEVEL SECURITY` belongs here and was missing.
+                    //
+                    // VERICTO-019 is named "ALTER TABLE DISABLE TRIGGER / RLS" and
+                    // `AlterTableKind::DisableTrigger` is documented as covering both,
+                    // but this walker only mapped the three trigger subtypes, so
+                    // `AtDisableRowSecurity` fell through to `_ => continue` and no
+                    // `StatementInfo` was emitted at all — the statement became
+                    // invisible to every rule, not just to VERICTO-019. Measured
+                    // against a live proxy before the fix: `DISABLE TRIGGER ALL` and
+                    // `DISABLE TRIGGER USER` were blocked, `DISABLE ROW LEVEL
+                    // SECURITY` was reported ALLOWED with no rule attributed.
+                    //
+                    // This is the sleep-function drift again and in the direction that
+                    // matters most: `walk.rs` has mapped `DisableRowLevelSecurity`
+                    // since it was written, so MySQL/Oracle/MS SQL detected it while
+                    // PostgreSQL — the only dialect here that actually implements RLS
+                    // — did not. Both walkers now agree, and
+                    // `tests/audit.rs::vericto_019_detects_rls_disable_on_every_dialect`
+                    // pins that.
+                    //
+                    // Deliberately NOT included: `AtDisableRule` and
+                    // `AtNoForceRowSecurity`. Neither is what this rule's name
+                    // promises, `NO FORCE` only stops RLS applying to the table owner
+                    // (the default state, where `FORCE` is the opt-in hardening), and
+                    // this is a blocking firewall where a false positive is an outage.
                     Ok(AlterTableType::AtDisableTrig)
                     | Ok(AlterTableType::AtDisableTrigAll)
-                    | Ok(AlterTableType::AtDisableTrigUser) => (
+                    | Ok(AlterTableType::AtDisableTrigUser)
+                    | Ok(AlterTableType::AtDisableRowSecurity) => (
                         AlterTableKind::DisableTrigger,
                         "AlterTableStmt > DisableTrigger",
                     ),

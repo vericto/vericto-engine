@@ -367,6 +367,61 @@ fn vericto_070_detects_every_sleep_variant_on_every_dialect() {
 }
 
 #[test]
+fn vericto_019_detects_rls_disable_on_every_dialect() {
+    // The regression this pins: `pg_ast.rs` mapped only the three trigger subtypes,
+    // so `AtDisableRowSecurity` hit its `_ => continue` and PostgreSQL emitted no
+    // StatementInfo at all for `DISABLE ROW LEVEL SECURITY` — the statement was
+    // invisible to every rule. `walk.rs` had always mapped it, so MySQL/Oracle/
+    // MS SQL detected what PostgreSQL missed, and PostgreSQL is the only dialect
+    // here that actually implements RLS.
+    //
+    // Same shape as vericto_070_detects_every_sleep_variant_on_every_dialect, and
+    // for the same reason: a semantic change that lands in one walker and not the
+    // other is this repo's main drift hazard.
+    for sql in [
+        "ALTER TABLE users DISABLE ROW LEVEL SECURITY",
+        "ALTER TABLE users DISABLE TRIGGER ALL",
+        "ALTER TABLE users DISABLE TRIGGER USER",
+    ] {
+        for dialect in [
+            Dialect::Postgres,
+            Dialect::Mysql,
+            Dialect::Oracle,
+            Dialect::MsSql,
+        ] {
+            let m = matching_codes(sql, dialect, &ruleset(), &EnforcementPolicy::default());
+            assert!(
+                m.contains(&"VERICTO-019".to_string()),
+                "{sql} on {dialect:?} got {m:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn vericto_019_leaves_protection_enabling_alone() {
+    // The other half of the fix: widening detection must not start reporting the
+    // statements that ADD protection. `ENABLE ROW LEVEL SECURITY` and
+    // `ENABLE TRIGGER` are the hardening direction, and this is a blocking
+    // firewall where a false positive is an outage.
+    for sql in [
+        "ALTER TABLE users ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE users ENABLE TRIGGER ALL",
+    ] {
+        let m = matching_codes(
+            sql,
+            Dialect::Postgres,
+            &ruleset(),
+            &EnforcementPolicy::default(),
+        );
+        assert!(
+            !m.contains(&"VERICTO-019".to_string()),
+            "{sql} must not be reported, got {m:?}"
+        );
+    }
+}
+
+#[test]
 fn eng_007_dangerous_pg_statements() {
     assert_matches(
         "ENG-007 copy program",
