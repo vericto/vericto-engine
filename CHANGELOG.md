@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.6.0] — 2026-09-30
+
+### Fixed
+
+- **VERICTO-019 did not detect `DISABLE ROW LEVEL SECURITY` on PostgreSQL**, the one
+  dialect here that implements RLS. The rule is named "ALTER TABLE DISABLE TRIGGER /
+  RLS", `AlterTableKind::DisableTrigger` is documented as "`DISABLE TRIGGER` /
+  `DISABLE ROW LEVEL SECURITY` — disables a protection", and the README catalogue row
+  says the same. Every piece of documentation was right; `pg_ast.rs` was the only
+  thing that disagreed.
+
+  Its `match` on the libpg_query subtype covered `AtDisableTrig`,
+  `AtDisableTrigAll` and `AtDisableTrigUser`, so `AtDisableRowSecurity` fell through
+  to the arm's `_ => continue`. The consequence is wider than one rule missing: no
+  `StatementInfo` was emitted at all, so the statement was invisible to the whole
+  evaluator. Measured against a live proxy before the fix, `ALTER TABLE t DISABLE
+  TRIGGER ALL` and `... DISABLE TRIGGER USER` were blocked while `... DISABLE ROW
+  LEVEL SECURITY` came back ALLOWED with no rule attributed — a statement that
+  removes tenant isolation, passing silently.
+
+  This is the sleep-function drift the contributor notes already warn about, in the
+  direction that costs the most: `walk.rs` has mapped
+  `AlterTableOperation::DisableRowLevelSecurity` since it was written, so
+  MySQL/Oracle/MS SQL detected what PostgreSQL did not.
+  `tests/audit.rs::vericto_019_detects_rls_disable_on_every_dialect` now asserts all
+  three disabling forms on all four dialects, and a companion test asserts that
+  `ENABLE ROW LEVEL SECURITY` and `ENABLE TRIGGER` stay unreported — widening
+  detection must not start flagging the hardening direction. Verified both tests are
+  meaningful by removing the new match arm again: the dialect test fails on
+  PostgreSQL and passes everywhere else, which is exactly the drift it exists to
+  catch.
+
+  `AtDisableRule` and `AtNoForceRowSecurity` are deliberately still unmapped. Neither
+  is what this rule's name promises, and `NO FORCE` only stops RLS applying to the
+  table owner — the default state, where `FORCE` is the opt-in hardening. This is a
+  blocking firewall and a false positive is an outage, so they are left as their own
+  decision rather than folded in here.
+
+  **Minor rather than patch, on purpose.** Nothing about the fix is optional, but it
+  changes outcomes: a migration running `ALTER TABLE … DISABLE ROW LEVEL SECURITY`
+  against a workspace with VERICTO-019 active goes from passing to blocked. Consumers
+  should adopt this tag deliberately, not as a routine patch. The blast radius is
+  bounded by the rule's class — VERICTO-019 is `RuleClass::SchemaMigration`, so a
+  channel that passes `schema_migration_cap: Some(Flag)` (CI does) reports instead of
+  blocking, and by the host's catalogue, which decides whether the rule is active at
+  all.
+
 ## [3.5.1] — 2026-08-13
 
 ### Fixed
