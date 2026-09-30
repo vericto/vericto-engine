@@ -7,7 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [3.6.0] — 2026-09-30
+## [3.5.2] — 2026-09-30
+
+Cross-dialect rule parity. No API changes, and no behaviour changes beyond
+VERICTO-019 now firing where it previously did not.
 
 ### Fixed
 
@@ -45,14 +48,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocking firewall and a false positive is an outage, so they are left as their own
   decision rather than folded in here.
 
-  **Minor rather than patch, on purpose.** Nothing about the fix is optional, but it
-  changes outcomes: a migration running `ALTER TABLE … DISABLE ROW LEVEL SECURITY`
-  against a workspace with VERICTO-019 active goes from passing to blocked. Consumers
-  should adopt this tag deliberately, not as a routine patch. The blast radius is
-  bounded by the rule's class — VERICTO-019 is `RuleClass::SchemaMigration`, so a
-  channel that passes `schema_migration_cap: Some(Flag)` (CI does) reports instead of
-  blocking, and by the host's catalogue, which decides whether the rule is active at
-  all.
+  **Patch, matching how this catalogue has always versioned parity fixes.** No public
+  API changes, and no consumer has to do anything beyond moving the tag. The direct
+  precedent is 3.2.2, the same defect in mirror image — VERICTO-070 not firing on
+  `pg_sleep_until` outside PostgreSQL because the two walkers had drifted — whose own
+  header reads "No API or behaviour changes beyond VERICTO-070 now firing where it
+  previously did not." 3.5.1 went further on the same footing: it began rejecting
+  deeply nested input that previously parsed, also as a patch. The minors in this
+  catalogue are earned by API additions (3.2.0 added `RuleClass`) or by changing what
+  an already-written rule means (3.4.0 redefined `func_name`, with migration notes).
+  Neither applies here.
+
+  It does change outcomes, and that is worth knowing before adopting: a migration
+  running `ALTER TABLE … DISABLE ROW LEVEL SECURITY` against a workspace with
+  VERICTO-019 active goes from passing to blocked. The blast radius is bounded by the
+  rule's class — VERICTO-019 is `RuleClass::SchemaMigration`, so a channel that passes
+  `schema_migration_cap: Some(Flag)` (CI does) reports instead of blocking — and by
+  the host's catalogue, which decides whether the rule is active at all.
 
 ## [3.5.1] — 2026-08-13
 
