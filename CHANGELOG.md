@@ -759,8 +759,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/donkan168/vericto-engine/compare/v3.0.0...HEAD
-[3.0.0]: https://github.com/donkan168/vericto-engine/compare/v2.1.0...v3.0.0
-[2.1.0]: https://github.com/donkan168/vericto-engine/compare/v2.0.0...v2.1.0
-[2.0.0]: https://github.com/donkan168/vericto-engine/compare/v1.0.0...v2.0.0
-[1.0.0]: https://github.com/donkan168/vericto-engine/releases/tag/v1.0.0
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/vericto/vericto-engine/compare/v2.1.0...v3.0.0
+[2.1.0]: https://github.com/vericto/vericto-engine/compare/v2.0.0...v2.1.0
+[2.0.0]: https://github.com/vericto/vericto-engine/compare/v1.0.0...v2.0.0
+[1.0.0]: https://github.com/vericto/vericto-engine/releases/tag/v1.0.0
