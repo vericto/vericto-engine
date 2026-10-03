@@ -708,45 +708,45 @@ mod tests {
 
     // ── VERICTO-001 ──────────────────────────────────────────────────────────
     #[test]
-    fn vetro_001_blocks_delete_without_where() {
+    fn vericto_001_blocks_delete_without_where() {
         let p = parse("DELETE FROM users", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-001"), &p).is_some());
     }
 
     #[test]
-    fn vetro_001_allows_delete_with_where() {
+    fn vericto_001_allows_delete_with_where() {
         let p = parse("DELETE FROM users WHERE id = 1", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-001"), &p).is_none());
     }
 
     // ── VERICTO-003 ──────────────────────────────────────────────────────────
     #[test]
-    fn vetro_003_blocks_delete_where_always_true() {
+    fn vericto_003_blocks_delete_where_always_true() {
         let p = parse("DELETE FROM users WHERE 1 = 1", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-003"), &p).is_some());
     }
 
     // ── VERICTO-010 ──────────────────────────────────────────────────────────
     #[test]
-    fn vetro_010_blocks_drop_table() {
+    fn vericto_010_blocks_drop_table() {
         let p = parse("DROP TABLE users", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-010"), &p).is_some());
     }
 
     #[test]
-    fn vetro_010_blocks_drop_database() {
+    fn vericto_010_blocks_drop_database() {
         let p = parse("DROP DATABASE prod", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-010"), &p).is_some());
     }
 
     #[test]
-    fn vetro_010_blocks_drop_table_mysql() {
+    fn vericto_010_blocks_drop_table_mysql() {
         let p = parse("DROP TABLE users", Dialect::Mysql);
         assert!(evaluate_rule(&make_rule("VERICTO-010"), &p).is_some());
     }
 
     #[test]
-    fn vetro_010_blocks_drop_database_mysql() {
+    fn vericto_010_blocks_drop_database_mysql() {
         // Regression: DROP DATABASE on MySQL used to map to DropObjectKind::Other
         // (walk.rs) and only matched via the old catch-all denylist. It must
         // still fire now that the rule uses an explicit Table|Database allowlist.
@@ -757,7 +757,7 @@ mod tests {
     // Regression for the DROP POLICY false positive (and its DDL siblings): none
     // of these are destructive table/data drops, so VERICTO-010 must NOT fire.
     #[test]
-    fn vetro_010_ignores_drop_policy() {
+    fn vericto_010_ignores_drop_policy() {
         let p = parse(
             "DROP POLICY IF EXISTS service_role_all ON public.oidc_trust_policies",
             Dialect::Postgres,
@@ -769,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn vetro_010_ignores_drop_view_and_trigger() {
+    fn vericto_010_ignores_drop_view_and_trigger() {
         for sql in ["DROP VIEW v", "DROP TRIGGER t ON users", "DROP SEQUENCE s"] {
             let p = parse(sql, Dialect::Postgres);
             assert!(
@@ -780,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn vetro_010_ignores_drop_index_and_schema() {
+    fn vericto_010_ignores_drop_index_and_schema() {
         // These have their own rules (013 / 012); 010 must leave them alone.
         let idx = parse("DROP INDEX idx_users_email", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-010"), &idx).is_none());
@@ -790,55 +790,55 @@ mod tests {
 
     // ── VERICTO-011 ──────────────────────────────────────────────────────────
     #[test]
-    fn vetro_011_blocks_truncate() {
+    fn vericto_011_blocks_truncate() {
         let p = parse("TRUNCATE TABLE orders", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-011"), &p).is_some());
     }
 
     // ── VERICTO-012 ──────────────────────────────────────────────────────────
     #[test]
-    fn vetro_012_blocks_drop_schema() {
+    fn vericto_012_blocks_drop_schema() {
         let p = parse("DROP SCHEMA analytics CASCADE", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-012"), &p).is_some());
     }
 
     // ── VERICTO-013 ──────────────────────────────────────────────────────────
     #[test]
-    fn vetro_013_blocks_drop_index_without_if_exists() {
+    fn vericto_013_blocks_drop_index_without_if_exists() {
         let p = parse("DROP INDEX idx_users_email", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-013"), &p).is_some());
     }
 
     #[test]
-    fn vetro_013_allows_drop_index_with_if_exists() {
+    fn vericto_013_allows_drop_index_with_if_exists() {
         let p = parse("DROP INDEX IF EXISTS idx_users_email", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-013"), &p).is_none());
     }
 
     // ── VERICTO-015 ──────────────────────────────────────────────────────────
     #[test]
-    fn vetro_015_blocks_alter_table_drop_column() {
+    fn vericto_015_blocks_alter_table_drop_column() {
         let p = parse("ALTER TABLE users DROP COLUMN email", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-015"), &p).is_some());
     }
 
     // ── VERICTO-016 ──────────────────────────────────────────────────────────
     #[test]
-    fn vetro_016_blocks_alter_table_rename() {
+    fn vericto_016_blocks_alter_table_rename() {
         let p = parse("ALTER TABLE users RENAME TO accounts", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-016"), &p).is_some());
     }
 
     // ── VERICTO-030 / VERICTO-042 ──────────────────────────────────────────────
     #[test]
-    fn vetro_042_blocks_update_without_where() {
+    fn vericto_042_blocks_update_without_where() {
         let p = parse("UPDATE products SET price = 0", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-042"), &p).is_some());
         assert!(evaluate_rule(&make_rule("VERICTO-030"), &p).is_some());
     }
 
     #[test]
-    fn vetro_042_allows_update_with_where() {
+    fn vericto_042_allows_update_with_where() {
         let p = parse(
             "UPDATE products SET price = 0 WHERE id = 1",
             Dialect::Postgres,
@@ -848,7 +848,7 @@ mod tests {
 
     // ── VERICTO-031 ──────────────────────────────────────────────────────────
     #[test]
-    fn vetro_031_blocks_update_in_cte_without_where() {
+    fn vericto_031_blocks_update_in_cte_without_where() {
         let sql = "WITH x AS (UPDATE sessions SET status = 'expired' RETURNING id) SELECT * FROM x";
         let p = parse(sql, Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-031"), &p).is_some());
@@ -856,13 +856,13 @@ mod tests {
 
     // ── VERICTO-060 ──────────────────────────────────────────────────────────
     #[test]
-    fn vetro_060_blocks_insert_without_columns() {
+    fn vericto_060_blocks_insert_without_columns() {
         let p = parse("INSERT INTO users VALUES (1, 'a')", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-060"), &p).is_some());
     }
 
     #[test]
-    fn vetro_060_allows_insert_with_columns() {
+    fn vericto_060_allows_insert_with_columns() {
         let p = parse(
             "INSERT INTO users (id, name) VALUES (1, 'a')",
             Dialect::Postgres,
@@ -873,13 +873,13 @@ mod tests {
     // ── VERICTO-090: SQL injection tautology ─────────────────────────────────
 
     #[test]
-    fn vetro_090_blocks_select_with_or_one_equals_one() {
+    fn vericto_090_blocks_select_with_or_one_equals_one() {
         let p = parse("SELECT * FROM users WHERE id = 1 OR 1=1", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-090"), &p).is_some());
     }
 
     #[test]
-    fn vetro_090_blocks_select_with_or_string_tautology() {
+    fn vericto_090_blocks_select_with_or_string_tautology() {
         let p = parse(
             "SELECT * FROM users WHERE name = 'x' OR 'a'='a'",
             Dialect::Postgres,
@@ -888,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn vetro_090_blocks_delete_with_or_true() {
+    fn vericto_090_blocks_delete_with_or_true() {
         let p = parse(
             "DELETE FROM sessions WHERE user_id = $1 OR 1=1",
             Dialect::Postgres,
@@ -897,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn vetro_090_blocks_update_with_or_tautology() {
+    fn vericto_090_blocks_update_with_or_tautology() {
         let p = parse(
             "UPDATE users SET role = 'admin' WHERE id = 1 OR 1=1",
             Dialect::Postgres,
@@ -906,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn vetro_090_allows_select_with_legitimate_or() {
+    fn vericto_090_allows_select_with_legitimate_or() {
         // Legitimate: OR with two real conditions, neither always-true
         let p = parse(
             "SELECT * FROM products WHERE category = 'A' OR category = 'B'",
@@ -916,13 +916,13 @@ mod tests {
     }
 
     #[test]
-    fn vetro_090_allows_select_without_where() {
+    fn vericto_090_allows_select_without_where() {
         let p = parse("SELECT * FROM config", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-090"), &p).is_none());
     }
 
     #[test]
-    fn vetro_090_allows_select_with_normal_where() {
+    fn vericto_090_allows_select_with_normal_where() {
         let p = parse(
             "SELECT * FROM users WHERE id = $1 AND status = 'active'",
             Dialect::Postgres,
@@ -931,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn vetro_090_blocks_deeply_nested_or_tautology() {
+    fn vericto_090_blocks_deeply_nested_or_tautology() {
         // Tautology buried inside AND: `a AND (b OR 1=1)` — still caught
         let p = parse(
             "SELECT * FROM users WHERE status = 'active' AND (role = 'user' OR 1=1)",
@@ -943,7 +943,7 @@ mod tests {
     // ── VERICTO-050 / VERICTO-051: SELECT limit & star (Postgres path) ─────────
 
     #[test]
-    fn vetro_050_allows_select_with_limit() {
+    fn vericto_050_allows_select_with_limit() {
         // Regression: `SELECT 1 LIMIT 1` was blocked because the pg_query
         // path never populated select_has_limit. It must now pass.
         let p = parse("SELECT 1 LIMIT 1", Dialect::Postgres);
@@ -951,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn vetro_050_allows_parameterized_select_with_where_and_limit() {
+    fn vericto_050_allows_parameterized_select_with_where_and_limit() {
         // Regression lock for the vericto-regression suite case
         // (tests/proxy/allow-safe-queries.spec.ts): a parameterized SELECT with
         // explicit columns, a WHERE, and a LIMIT must NOT be flagged by
@@ -968,19 +968,19 @@ mod tests {
     }
 
     #[test]
-    fn vetro_050_flags_select_without_limit() {
+    fn vericto_050_flags_select_without_limit() {
         let p = parse("SELECT id FROM users WHERE id = 1", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-050"), &p).is_some());
     }
 
     #[test]
-    fn vetro_051_flags_select_star_without_where() {
+    fn vericto_051_flags_select_star_without_where() {
         let p = parse("SELECT * FROM users", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-051"), &p).is_some());
     }
 
     #[test]
-    fn vetro_051_allows_select_star_with_where() {
+    fn vericto_051_allows_select_star_with_where() {
         let p = parse("SELECT * FROM users WHERE id = 1", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-051"), &p).is_none());
     }

@@ -23,7 +23,7 @@ cargo test --all                       # 143 tests: unit, proptest, integration
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 
-cargo test vetro_010                   # one test (or any substring)
+cargo test vericto_010                  # one test (or any substring)
 cargo test --test audit                # one integration test file
 cargo test -- --nocapture              # see println!/tracing output
 ```
@@ -101,9 +101,9 @@ Any new recursive walker function must take `depth: usize` and return `Err(Proxy
 Two integration tests fail the build on documentation drift, both via `include_str!` so they need no filesystem access:
 
 - `tests/rule_catalogue_sync.rs` — parses `VERICTO-NNN =>` match arms out of the evaluator and `| VERICTO-NNN` rows out of the README table, and fails if they diverge. **Adding a rule without its README row breaks the build.**
-- `tests/usage_snippet_sync.rs` — asserts the ```toml dependency snippet in `lib.rs` names this repo and this version. It exists because the snippet pointed at the pre-transfer `donkan168/vericto-engine` with `tag = "v2.1.0"` while the crate was at 3.2.1, silently pinning downstream repos to an old parser.
+- `tests/usage_snippet_sync.rs` — asserts the ```toml dependency snippet in `lib.rs` names this repo and this version. It exists because the snippet pointed at the repository's pre-transfer URL with `tag = "v2.1.0"` while the crate was at 3.2.1, silently pinning downstream repos to an old parser.
 
-Neither guard covers the README's prose or links. Known stale content there: several `vetro-*` / `donkan168` / `vetro.dev` references from before the rebrand, and a dialect table claiming `pg_query` 5.1 when `Cargo.toml` pins 6.2. `RuleClass` and `schema_migration_cap` are also absent from the README and not re-exported at the crate root (`lib.rs`), so a consumer has to reach them via `rules::engine::`.
+Neither guard covers the README's prose or links, so review those by hand when a release changes names, versions or public exports.
 
 ## Conventions
 

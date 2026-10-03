@@ -3,7 +3,7 @@
 //!
 //! The snippet is a ```toml block, so unlike the Rust example below it in
 //! `lib.rs` it is never compiled — nothing catches it going stale. It did: it
-//! pointed at the pre-transfer `donkan168/vericto-engine` URL and `tag =
+//! pointed at the repository's pre-transfer URL and `tag =
 //! "v2.1.0"` while the crate was at 3.2.1, and it is the line downstream repos
 //! copy to depend on the engine, so a wrong tag silently pins them to an old
 //! parser.
