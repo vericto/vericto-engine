@@ -1,6 +1,6 @@
 # Security Policy
 
-Vericto Proxy is a security product. We take vulnerabilities seriously and
+Vericto is a security product. We take vulnerabilities seriously and
 appreciate responsible disclosure.
 
 ## Reporting a vulnerability
@@ -24,8 +24,11 @@ High-priority issues for this engine include:
 - **Evasion** — a destructive query that bypasses a rule that should block it
   (e.g. a `DELETE` without `WHERE` that is incorrectly allowed).
 - **Parser denial of service** — input that causes excessive CPU/memory
-  (deeply nested ASTs, pathological queries). The engine enforces a 64KB query
-  limit and 50-level AST depth limit as defenses; bypasses of these are in scope.
+  (deeply nested ASTs, pathological queries). The engine refuses statements whose
+  text nests more than 200 levels before handing them to a parser, and stops
+  walking an AST deeper than 50 levels; bypasses of either are in scope. The 64 KB
+  query-size limit (`MAX_QUERY_SIZE_BYTES`) is published for hosts to apply — the
+  engine itself does not check it.
 - **Fail-open behavior** — any path where an unparseable or malformed query is
   allowed instead of blocked.
 

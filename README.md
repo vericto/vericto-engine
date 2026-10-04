@@ -349,7 +349,7 @@ vericto-engine/
 
 ## License
 
-Elastic License 2.0 — source-available, community PRs welcome, no managed-service
-resale. See [LICENSE](LICENSE).
+Copyright 2026 Vericto S.A.S. Elastic License 2.0 — source-available, community PRs
+welcome, no managed-service resale. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-For a managed-service license contact [hola@vericto.com](mailto:hola@vericto.com).
+For a managed-service license contact [enterprise@vericto.com](mailto:enterprise@vericto.com).
