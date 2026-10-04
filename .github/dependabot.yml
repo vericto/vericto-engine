@@ -1,0 +1,12 @@
+# Keeps the SHA-pinned GitHub Actions in ci.yml current. Security updates for
+# Cargo dependencies are enabled in the repository settings; routine Cargo version
+# bumps are deliberately left out — a pg_query or sqlparser upgrade can change how
+# SQL is parsed, so it is done by hand with its own CHANGELOG entry.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci

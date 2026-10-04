@@ -7,10 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Documentation only, ahead of the repository going public. No API, behaviour, or
-rule changes.
+Documentation and CI only, ahead of and right after the repository going public.
+No API, behaviour, or rule changes.
+
+### Changed
+
+- **CI pins its third-party actions to full commit SHAs.** `actions/checkout`
+  was referenced by tag and `dtolnay/rust-toolchain` by the `stable` branch; both
+  can be moved to different code after review, a SHA cannot. The pins are the
+  same commits CI was already running, so the build is unchanged. A new
+  `.github/dependabot.yml` proposes weekly bumps for the actions only — Cargo
+  version bumps stay manual, because a `pg_query` or `sqlparser` upgrade can change
+  how SQL is parsed.
 
 ### Documentation
+
+- **`SECURITY.md` lists GitHub private vulnerability reporting** as a second
+  channel next to `security@vericto.com`, now that the repository is public and
+  the feature is enabled.
 
 - **`SECURITY.md` said the engine enforces a 64 KB query limit. It does not.**
   `MAX_QUERY_SIZE_BYTES` has been documented as host-applied since 3.2.1, and

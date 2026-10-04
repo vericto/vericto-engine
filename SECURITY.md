@@ -7,7 +7,14 @@ appreciate responsible disclosure.
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
-Email **security@vericto.com** with:
+Report it privately, by either channel:
+
+- Email **security@vericto.com**.
+- Open a private report on GitHub:
+  [Report a vulnerability](https://github.com/vericto/vericto-engine/security/advisories/new)
+  (Security tab → "Report a vulnerability"). Only the maintainers can see it.
+
+Include:
 
 - A description of the vulnerability and its impact.
 - Steps to reproduce (a minimal SQL payload or AST input is ideal).
