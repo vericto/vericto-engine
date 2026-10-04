@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Documentation only, ahead of the repository going public. No API, behaviour, or
+rule changes.
+
+### Documentation
+
+- **`SECURITY.md` said the engine enforces a 64 KB query limit. It does not.**
+  `MAX_QUERY_SIZE_BYTES` has been documented as host-applied since 3.2.1, and
+  nothing in this crate checks it. A security policy that overstates a defence
+  sends reporters to probe the wrong boundary, so the scope now names the two
+  guards the engine does enforce — the 200-level textual nesting check before
+  parsing and the 50-level AST walk limit — and says the size limit belongs to the
+  host. The policy also called the product "Vericto Proxy".
+- **Added a `NOTICE` naming the licensor, Vericto S.A.S.** The Elastic License 2.0
+  text refers to "the licensor" throughout without naming it.
+- **Managed-service licensing questions now go to `enterprise@vericto.com`.** The
+  README pointed at `hola@vericto.com`, an address the site does not publish.
+
 ## [3.5.2] — 2026-09-30
 
 Cross-dialect rule parity. No API changes, and no behaviour changes beyond

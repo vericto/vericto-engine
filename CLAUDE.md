@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `vericto-engine` is the **open core** of Vericto: a synchronous Rust library that parses SQL into an AST and evaluates it against a ruleset deterministically — same input always produces the same result, no ML, no thresholds. It holds all of the product's detection IP. It is a `lib` only: no binary, no async, no I/O.
 
-Licensed Elastic-2.0 (source-available). The GitHub repo stays **private until the official product launch** — do not propose making it public.
+Licensed Elastic-2.0 (source-available); the licensor is Vericto S.A.S. (`NOTICE`). The GitHub repo is **public**: issues, PRs, commit messages and the CHANGELOG are read by anyone, so keep customer names, infrastructure details and the internals of the private repos out of them.
 
 Two first-party consumers pin it by git tag in their `Cargo.toml`:
 - `vericto-proxy` — customer-facing TCP wire proxy, calls the engine in-process
