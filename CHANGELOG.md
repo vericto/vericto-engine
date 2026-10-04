@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Documentation and CI only, ahead of and right after the repository going public.
-No API, behaviour, or rule changes.
+## [3.5.3] — 2026-10-04
+
+Documentation and CI only, released as the repository goes public. No API,
+behaviour, or rule changes: a host pinned to `v3.5.2` has nothing to adopt beyond
+the `NOTICE` and the corrected security policy.
 
 ### Changed
 
@@ -22,10 +25,6 @@ No API, behaviour, or rule changes.
 
 ### Documentation
 
-- **`SECURITY.md` lists GitHub private vulnerability reporting** as a second
-  channel next to `security@vericto.com`, now that the repository is public and
-  the feature is enabled.
-
 - **`SECURITY.md` said the engine enforces a 64 KB query limit. It does not.**
   `MAX_QUERY_SIZE_BYTES` has been documented as host-applied since 3.2.1, and
   nothing in this crate checks it. A security policy that overstates a defence
@@ -33,10 +32,16 @@ No API, behaviour, or rule changes.
   guards the engine does enforce — the 200-level textual nesting check before
   parsing and the 50-level AST walk limit — and says the size limit belongs to the
   host. The policy also called the product "Vericto Proxy".
+- **`SECURITY.md` lists GitHub private vulnerability reporting** as a second
+  channel next to `security@vericto.com`, now that the repository is public and
+  the feature is enabled.
 - **Added a `NOTICE` naming the licensor, Vericto S.A.S.** The Elastic License 2.0
   text refers to "the licensor" throughout without naming it.
 - **Managed-service licensing questions now go to `enterprise@vericto.com`.** The
   README pointed at `hola@vericto.com`, an address the site does not publish.
+- **Pre-rebrand names removed from tests and links.** The evaluator's tests were
+  still named `vetro_NNN_*`; they now follow the `VERICTO-NNN` codes they cover.
+  The CHANGELOG's version links pointed at the repository's pre-transfer owner.
 
 ## [3.5.2] — 2026-09-30
 
@@ -790,7 +795,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.5.3...HEAD
+[3.5.3]: https://github.com/vericto/vericto-engine/compare/v3.5.2...v3.5.3
 [3.0.0]: https://github.com/vericto/vericto-engine/compare/v2.1.0...v3.0.0
 [2.1.0]: https://github.com/vericto/vericto-engine/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/vericto/vericto-engine/compare/v1.0.0...v2.0.0

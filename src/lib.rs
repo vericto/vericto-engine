@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.5.2" }
+//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.5.3" }
 //! ```
 //!
 //! ```rust
