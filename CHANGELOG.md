@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Contributions need the Vericto Contributor License Agreement.** `CONTRIBUTING.md`
+  said a CLA *or* a DCO sign-off was required without saying how to give either, and
+  the pull request template asked for `git commit -s`. Both now describe the CLA:
+  sign it before the first pull request is merged, through the bot's link, with
+  contributions on behalf of an employer going through legal@vericto.com first.
+
 ## [3.5.3] — 2026-10-04
 
 Documentation and CI only, released as the repository goes public. No API,

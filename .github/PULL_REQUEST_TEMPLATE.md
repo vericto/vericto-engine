@@ -26,5 +26,6 @@
 
 - [ ] No `unwrap()` / `expect()` on runtime paths
 - [ ] Public functions documented with `///`
-- [ ] Commits follow Conventional Commits and are signed (`git commit -s`)
+- [ ] Commits follow Conventional Commits
+- [ ] I have signed the Vericto Contributor License Agreement (the CLA bot asks on your first pull request)
 - [ ] Rule documented in `README.md` (if adding a rule)
