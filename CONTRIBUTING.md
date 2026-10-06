@@ -63,8 +63,15 @@ export LIBCLANG_PATH=$(brew --prefix llvm)/lib
    code silently falls back to `DataMutation`, so a missing entry does not fail
    any test
 
-## License
+## License and Contributor License Agreement
 
-By contributing you agree that your contribution is licensed under the
-[Elastic License 2.0](LICENSE). All contributions require a CLA or DCO sign-off
-— details in the pull request template.
+vericto-engine is source-available under the [Elastic License 2.0](LICENSE).
+Before your first pull request can be merged, you need to sign the Vericto
+Contributor License Agreement (CLA). It gives Vericto S.A.S. the rights it needs to
+distribute your contribution as part of the project, under the Elastic License 2.0 and
+under the commercial licenses it offers.
+
+A bot comments on your first pull request with a link to read and sign the agreement
+with your GitHub account. The signature is recorded once and applies to your later
+pull requests. If you contribute on behalf of an employer, write to
+[legal@vericto.com](mailto:legal@vericto.com) before opening the pull request.
