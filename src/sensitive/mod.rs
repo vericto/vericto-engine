@@ -40,6 +40,7 @@
 //! Nothing here runs when `sensitive_columns` is empty: the engine checks the
 //! vector before calling in, so a host that sends no tags pays one `is_empty()`.
 
+pub(crate) mod mysql;
 pub(crate) mod pg;
 pub(crate) mod sql;
 
@@ -67,7 +68,8 @@ pub const SENSITIVE_RULE_CODE: &str = "VERICTO-085";
 pub enum SensitivePolicy {
     /// Allow the query, record and alert.
     Flag,
-    /// Rewrite the projection so the column's value is masked (Postgres).
+    /// Rewrite the projection so the column's value is masked (Postgres and
+    /// MySQL; Oracle and SQL Server block).
     Mask,
     /// Reject the query.
     Block,
@@ -727,14 +729,42 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, cols: &[SensitiveColumn]) -> Option
     let tags = Tags::new(cols);
     let any_mask = cols.iter().any(|c| c.policy == SensitivePolicy::Mask);
 
-    let analysis = match &parsed.ast {
-        SourceAst::Pg(tree) => pg::analyze(tree, &tags, any_mask),
-        SourceAst::Sql { statements, .. } => sql::analyze(statements, &tags),
-        SourceAst::None => return None,
-    };
     let dialect = match &parsed.ast {
         SourceAst::Pg(_) => Dialect::Postgres,
         SourceAst::Sql { dialect, .. } => *dialect,
+        SourceAst::None => return None,
+    };
+    let analysis = match &parsed.ast {
+        SourceAst::Pg(tree) => pg::analyze(tree, &tags, any_mask),
+        SourceAst::Sql {
+            sql: Some(sql),
+            dialect: Dialect::Mysql,
+            ..
+        } => match sql::analyze_mysql(sql, &tags, any_mask) {
+            Ok(found) => Ok(found),
+            Err(sql::Failure::TooDeep(e)) => Err(e),
+            Err(sql::Failure::Unreadable(why)) => {
+                // sqlparser and MySQL would read this text differently: it
+                // cannot be shown not to read a tagged column. Resolved like a
+                // parse error: blocked when any tag is `block` or `mask`,
+                // flagged when every tag is `flag`.
+                let protective = cols.iter().any(|c| c.policy != SensitivePolicy::Flag);
+                return Some(SensitiveVerdict {
+                    outcome: if protective {
+                        SensitivePolicy::Block
+                    } else {
+                        SensitivePolicy::Flag
+                    },
+                    ast_node_path: format!(
+                        "SensitiveColumn > query could not be analysed for sensitive columns ({why})"
+                    ),
+                    suggested_safe_query: None,
+                    rewritten_query: None,
+                    touched: Vec::new(),
+                });
+            }
+        },
+        SourceAst::Sql { statements, .. } => sql::analyze(statements, &tags).map(|t| (t, None)),
         SourceAst::None => return None,
     };
 
@@ -858,10 +888,11 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, cols: &[SensitiveColumn]) -> Option
                 rewritten_query: None,
                 touched: touched.clone(),
             };
-            if dialect != Dialect::Postgres {
-                // Phase 2 rewrites Postgres only. Forwarding the unmasked value
-                // (flag) would silently downgrade "never in clear" to "tell me
-                // afterwards"; block is the fail-safe direction.
+            if !matches!(dialect, Dialect::Postgres | Dialect::Mysql) {
+                // Oracle and SQL Server have no rewrite. Forwarding the
+                // unmasked value (flag) would silently downgrade "never in
+                // clear" to "tell me afterwards"; block is the fail-safe
+                // direction.
                 blocked(
                     format!(
                         "no rewrite for {} yet; tag the column block or flag, or leave it out of the projection",
@@ -899,7 +930,7 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, cols: &[SensitiveColumn]) -> Option
                         touched,
                     },
                     // Never send the unmasked query: any failure blocks.
-                    Some(Err(e)) => blocked(format!("rewrite failed ({e})"), None),
+                    Some(Err(reason)) => blocked(reason, None),
                     None => blocked("rewrite produced no query".to_string(), None),
                 }
             }

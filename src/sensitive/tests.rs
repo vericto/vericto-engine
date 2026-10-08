@@ -847,9 +847,7 @@ fn the_output_column_keeps_its_name() {
     let t = || vec![masked("customers", "email", Email)];
     assert!(rewrite("SELECT email AS e FROM customers", t()).contains(" AS e FROM"));
     assert!(rewrite("SELECT c.email FROM customers c", t()).contains(" AS email FROM"));
-    assert!(
-        rewrite("SELECT lower(email) FROM customers", t()).contains("'[redacted]'::text AS lower")
-    );
+    assert!(rewrite("SELECT lower(email) FROM customers", t()).contains("0)) AS lower"));
     assert!(rewrite("SELECT email::text FROM customers", t()).contains("AS email FROM"));
     assert!(rewrite("SELECT email || '' FROM customers", t()).contains("AS \"?column?\""));
 }
@@ -861,12 +859,16 @@ fn computed_expressions_are_masked_full_whatever_the_style() {
         "SELECT substring(card, 1, 4) AS p FROM customers",
         vec![masked("customers", "card", Last4)],
     );
-    assert_eq!(rw, "SELECT '[redacted]'::text AS p FROM customers");
+    assert_eq!(
+        rw,
+        "SELECT concat('[redacted]'::text, \"left\"(\"substring\"(card, 1, 4)::text, 0)) AS p FROM customers"
+    );
     let rw = rewrite(
         "SELECT card::varchar(4) FROM customers",
         vec![masked("customers", "card", Hash)],
     );
-    assert_eq!(rw, "SELECT '[redacted]'::text AS card FROM customers");
+    assert!(rw.starts_with("SELECT concat('[redacted]'::text,"), "{rw}");
+    assert!(rw.ends_with(" AS card FROM customers"), "{rw}");
     // Computed inside a CTE, then passed through bare: still computed.
     let rw = rewrite(
         "WITH x AS (SELECT left(card, 4) AS card FROM customers) SELECT card FROM x",
@@ -874,7 +876,7 @@ fn computed_expressions_are_masked_full_whatever_the_style() {
     );
     assert!(
         rw.ends_with("SELECT '[redacted]'::text AS card FROM x"),
-        "{rw}"
+        "a bare reference to the CTE column is a plain value: {rw}"
     );
     // Two masked columns with different styles in one value: full.
     let rw = rewrite(
@@ -884,7 +886,26 @@ fn computed_expressions_are_masked_full_whatever_the_style() {
             masked("customers", "card", Last4),
         ],
     );
-    assert!(rw.contains("'[redacted]'::text AS x"), "{rw}");
+    assert!(
+        rw.contains("concat('[redacted]'::text,") && rw.contains(" AS x"),
+        "{rw}"
+    );
+}
+
+#[test]
+fn a_masked_aggregate_still_aggregates() {
+    // 3.6.1 replaced `string_agg(email, ',')` with the constant
+    // '[redacted]', which returns one row per customer instead of one row.
+    // The computed value is kept and discarded, so the row count is the
+    // original's (tests/mask_equivalence.rs runs it).
+    let rw = rewrite(
+        "SELECT string_agg(email, ',') AS all_emails FROM customers",
+        vec![masked("customers", "email", Email)],
+    );
+    assert_eq!(
+        rw,
+        "SELECT concat('[redacted]'::text, \"left\"(string_agg(email, ',')::text, 0)) AS all_emails FROM customers"
+    );
 }
 
 #[test]
@@ -975,7 +996,7 @@ fn a_failed_deparse_blocks_and_never_returns_the_original() {
 // ── MySQL (and the other sqlparser dialects) ───────────────────────────────
 
 #[test]
-fn mysql_block_and_flag_work_and_mask_blocks() {
+fn mysql_block_and_flag_work_and_mask_rewrites() {
     let my = |sql: &str, tags| eval_on(sql, Dialect::Mysql, tags);
     let o = my("SELECT email FROM customers", email_block());
     assert_eq!(o.decision, Decision::Block);
@@ -986,17 +1007,17 @@ fn mysql_block_and_flag_work_and_mask_blocks() {
     assert_eq!(o.decision, Decision::Flag);
     assert!(o.rewritten_query.is_none());
 
+    // 3.7.0: MySQL masks are rewritten (tests/mysql_mask.rs has the rest).
     let o = my(
         "SELECT email FROM customers",
         vec![masked("customers", "email", Email)],
     );
-    assert_eq!(
-        o.decision,
-        Decision::Block,
-        "no MySQL rewrite yet: fail-safe block"
+    assert_eq!(o.decision, Decision::Flag, "{o:?}");
+    let rw = o.rewritten_query.expect("MySQL mask rewrites");
+    assert!(
+        rw.contains("LOCATE('@'") && rw.ends_with("AS `email` FROM customers"),
+        "{rw}"
     );
-    assert!(o.rewritten_query.is_none());
-    assert!(o.ast_node_path.unwrap().contains("mysql"));
 
     for sql in [
         "SELECT * FROM customers",
@@ -1048,6 +1069,191 @@ fn mysql_syntax_the_parser_rejects_cannot_smuggle_a_read() {
         assert_eq!(o.decision, Decision::Block, "{sql}");
         assert_eq!(o.rule_code.as_deref(), Some("VERICTO-PARSE-ERROR"));
     }
+}
+
+#[test]
+fn mysql_text_sqlparser_reads_differently_cannot_hide_a_read() {
+    // Each of these reads `email` (or `card`) in MySQL while sqlparser sees a
+    // comment, because the two read comments and string escapes differently.
+    // They resolve like a parse error: blocked under a block or
+    // mask tag, flagged under flag-only tags. 3.6.1 allowed all of them.
+    let tags = || {
+        vec![
+            tag("customers", "email", Block),
+            tag("customers", "card", Block),
+        ]
+    };
+    for sql in [
+        "SELECT id, /*! email, */ id FROM customers",
+        "SELECT id /*!50000 , email */ FROM customers",
+        "SELECT id /*M! , email */ FROM customers",
+        // MySQL and sqlparser disagree on where the comment ends.
+        "SELECT id /* /* */ , email FROM customers -- */",
+        "SELECT 0 --card\n FROM customers",
+        // The literal ends at a different place in each string-escape mode
+        // (measured on 8.0).
+        r"SELECT 'a\', email, '' FROM customers -- '",
+    ] {
+        let o = eval_on(sql, Dialect::Mysql, tags());
+        assert_eq!(o.decision, Decision::Block, "{sql}: {o:?}");
+        assert!(
+            o.ast_node_path
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not be analysed"),
+            "{sql}: {o:?}"
+        );
+        let o = eval_on(sql, Dialect::Mysql, vec![tag("customers", "email", Flag)]);
+        assert_eq!(o.decision, Decision::Flag, "flag-only tags flag: {sql}");
+        let o = eval_on(sql, Dialect::Mysql, vec![]);
+        assert_eq!(o.decision, Decision::Allow, "no tags: unchanged: {sql}");
+    }
+    // A real comment, and `-- ` with a space, are fine.
+    for sql in [
+        "SELECT id /* email */ FROM customers",
+        "SELECT id -- email\n FROM customers",
+        "SELECT id # email\n FROM customers",
+        r"SELECT id, 'a\\b', 'it''s' FROM customers",
+    ] {
+        let o = eval_on(sql, Dialect::Mysql, tags());
+        assert_eq!(o.decision, Decision::Allow, "{sql}: {o:?}");
+    }
+}
+
+#[test]
+fn mysql_text_handling_is_inert_without_tags() {
+    // 3.7.0 re-reads MySQL text only inside the sensitive-column analysis,
+    // which never runs without tags: untagged evaluation of these forms is
+    // exactly 3.6.1's (no new PARSE_ERROR, no new block).
+    for sql in [
+        r"SELECT id, 'it\'s' FROM customers",
+        "SELECT id, /*! name, */ id FROM customers",
+        "SELECT id /* /* */ , name FROM customers -- */",
+        "SELECT 0 --x\n FROM customers",
+        "SELECT HIGH_PRIORITY name FROM customers",
+        "SELECT SQL_CALC_FOUND_ROWS id FROM customers LIMIT 10",
+        "SELECT /*+ BKA(c) */ name FROM customers",
+        "SELECT b'101', name FROM customers",
+        "SELECT \"name\" FROM customers",
+    ] {
+        super::ANALYSES.with(|n| n.set(0));
+        for pe in [ParseErrorAction::AllowReport, ParseErrorAction::Block] {
+            let p = EnforcementPolicy {
+                parse_error: pe,
+                ..EnforcementPolicy::default()
+            };
+            let o = crate::evaluate(sql, Dialect::Mysql, &[], &p);
+            assert_eq!(o.decision, Decision::Allow, "{sql}: {o:?}");
+            assert!(o.rule_code.is_none(), "{sql}: {o:?}");
+            assert!(o.rewritten_query.is_none() && o.sensitive_columns.is_empty());
+        }
+        assert_eq!(super::ANALYSES.with(|n| n.get()), 0, "{sql}");
+    }
+}
+
+#[test]
+fn mysql_select_modifiers_do_not_hide_a_read() {
+    // sqlparser 0.52 misreads a SELECT modifier and the column after it as a
+    // column with an alias; MySQL reads the column. 3.6.1 allowed it.
+    for sql in [
+        "SELECT HIGH_PRIORITY email FROM customers",
+        "SELECT SQL_CALC_FOUND_ROWS email FROM customers",
+        "SELECT STRAIGHT_JOIN email FROM customers",
+        "SELECT SQL_NO_CACHE email FROM customers",
+        "SELECT DISTINCTROW email FROM customers",
+        "SELECT DISTINCT SQL_BUFFER_RESULT SQL_SMALL_RESULT email FROM customers",
+        "SELECT id FROM orders WHERE cid IN (SELECT SQL_NO_CACHE id FROM x) UNION SELECT HIGH_PRIORITY email FROM customers",
+    ] {
+        let o = eval_on(sql, Dialect::Mysql, email_block());
+        assert_eq!(o.decision, Decision::Block, "{sql}: {o:?}");
+        // Read (or, where the original does not parse at all, a parse error,
+        // which blocks too).
+        assert!(
+            read(&o) == vec!["email"] || o.rule_code.as_deref() == Some("VERICTO-PARSE-ERROR"),
+            "{sql}: {o:?}"
+        );
+    }
+    let o = eval_on(
+        "SELECT SQL_NO_CACHE id FROM customers",
+        Dialect::Mysql,
+        email_block(),
+    );
+    assert_eq!(o.decision, Decision::Allow, "{o:?}");
+}
+
+#[test]
+fn mysql_session_variables_and_upserts_are_copies() {
+    for sql in [
+        "SET @v = (SELECT email FROM customers LIMIT 1)",
+        "SET @a = 1, @v = (SELECT MAX(email) FROM customers)",
+        "INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE a = (SELECT email FROM customers LIMIT 1)",
+        "INSERT INTO archive (contact) SELECT id FROM users ON DUPLICATE KEY UPDATE contact = (SELECT email FROM customers LIMIT 1)",
+    ] {
+        let o = eval_on(sql, Dialect::Mysql, email_block());
+        assert_eq!(o.decision, Decision::Block, "{sql}: {o:?}");
+        let o = eval_on(
+            sql,
+            Dialect::Mysql,
+            vec![masked("customers", "email", Email)],
+        );
+        assert_eq!(o.decision, Decision::Block, "{sql}");
+        assert!(o.ast_node_path.unwrap().contains("copied"), "{sql}");
+    }
+    // Writing a column into itself is not a copy out.
+    let o = eval_on(
+        "INSERT INTO customers (id, email) VALUES (1, 'x') ON DUPLICATE KEY UPDATE email = VALUES(email)",
+        Dialect::Mysql,
+        email_block(),
+    );
+    assert_eq!(o.decision, Decision::Allow, "{o:?}");
+    let o = eval_on("SET @v = 1", Dialect::Mysql, email_block());
+    assert_eq!(o.decision, Decision::Allow);
+}
+
+#[test]
+fn mysql_double_quoted_strings_may_be_columns() {
+    // Under ANSI_QUOTES (server-wide or through a SET_VAR hint) MySQL reads
+    // "email" as the column; the engine cannot see the SQL mode.
+    let o = eval_on(
+        "SELECT \"email\" FROM customers",
+        Dialect::Mysql,
+        email_block(),
+    );
+    assert_eq!(o.decision, Decision::Block, "{o:?}");
+    let o = eval_on(
+        "SELECT 'email' FROM customers",
+        Dialect::Mysql,
+        email_block(),
+    );
+    assert_eq!(o.decision, Decision::Allow, "{o:?}");
+}
+
+#[test]
+fn a_failed_mysql_render_blocks_and_never_returns_the_original() {
+    super::sql::FORCE_RENDER_FAILURE.with(|f| f.set(true));
+    let o = eval_on(
+        "SELECT email FROM customers",
+        Dialect::Mysql,
+        vec![masked("customers", "email", Full)],
+    );
+    super::sql::FORCE_RENDER_FAILURE.with(|f| f.set(false));
+    assert_eq!(o.decision, Decision::Block);
+    assert!(o.rewritten_query.is_none());
+    assert!(o.ast_node_path.unwrap().contains("forced by test"));
+}
+
+#[test]
+fn mysql_mask_full_never_reveals_null_or_the_value() {
+    // `full` over a bare column: a constant, nothing of the value is read.
+    let o = eval_on(
+        "SELECT created FROM customers",
+        Dialect::Mysql,
+        vec![masked("customers", "created", Full)],
+    );
+    assert_eq!(
+        o.rewritten_query.as_deref(),
+        Some("SELECT '[redacted]' AS `created` FROM customers")
+    );
 }
 
 #[test]
@@ -1215,10 +1421,11 @@ fn a_kept_parameter_is_in_a_no_op_that_reveals_nothing() {
         rw,
         "SELECT concat('[redacted]'::text, \"left\"(\"substring\"(card, $1, 4)::text, 0)) AS p FROM customers"
     );
-    // Without parameters the plain constant is kept: nothing is evaluated.
+    // A bare column without parameters becomes the plain constant: nothing
+    // of it is evaluated.
     let rw = rewrite(
-        "SELECT substring(card, 1, 4) AS p FROM customers",
-        vec![masked("customers", "card", Last4)],
+        "SELECT card AS p FROM customers",
+        vec![masked("customers", "card", Full)],
     );
     assert_eq!(rw, "SELECT '[redacted]'::text AS p FROM customers");
 }

@@ -1,44 +1,103 @@
 //! Sensitive-column derivation over the `sqlparser-rs` AST (MySQL, Oracle,
 //! MS SQL). Same model as [`super::pg`] — same scopes, same sinks, same
-//! conservative rules — with no rewrite: `mask` is not applied on these
-//! dialects in this phase, and the verdict turns it into a block.
+//! conservative rules. On MySQL the walk also applies the mask rewrite to the
+//! client-visible projections (Oracle and MS SQL still block a mask); the
+//! text it walks and the text it emits go through [`super::mysql`], which
+//! reads and prints them the way MySQL does.
 
 use sqlparser::ast::{
     Assignment, AssignmentTarget, Cte, Expr, FromTable, FunctionArg, FunctionArgExpr,
-    FunctionArguments, Ident, MergeAction, MergeInsertKind, ObjectName, Query, SelectItem, SetExpr,
-    Statement, TableAlias, TableFactor, TableWithJoins,
+    FunctionArguments, GroupByExpr, Ident, MergeAction, MergeInsertKind, ObjectName,
+    OnConflictAction, OnInsert, OrderBy, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
+    TableFactor, TableWithJoins, Value,
 };
 
 use crate::error::{MAX_AST_DEPTH, ProxyError, Result};
+use crate::sensitive::mysql::{self, Prepared};
 use crate::sensitive::{
-    Item, Lineage, OutCol, Scopes, Sink, Tags, Touches, ieq, indirect, merge, outcol_all,
-    outcols_all, starred,
+    Item, Lineage, OutCol, Scopes, Sink, Tags, Touches, ieq, indirect, mask_style_for, merge,
+    outcol_all, outcols_all, starred,
 };
 
-pub(crate) fn analyze(
-    statements: &[Statement],
-    tags: &Tags,
-) -> Result<(Touches, super::pg::Rewrite)> {
-    let mut w = Walker {
-        tags,
-        scopes: Scopes::default(),
-        ctes: Vec::new(),
-        touches: Touches::default(),
-    };
-    for s in statements {
-        w.stmt(s, 0)?;
-    }
-    Ok((w.touches, None))
+/// Why the MySQL analysis could not run.
+pub(crate) enum Failure {
+    /// Nesting past [`MAX_AST_DEPTH`].
+    TooDeep(ProxyError),
+    /// The text cannot be read the way MySQL reads it (see [`mysql`]).
+    Unreadable(String),
 }
 
-/// Never rewritten on these dialects.
-const VISIBLE: Sink = Sink::Projected { rewrite: false };
+/// Oracle / MS SQL: derivation only.
+pub(crate) fn analyze(statements: &[Statement], tags: &Tags) -> Result<Touches> {
+    let mut statements = statements.to_vec();
+    let mut w = Walker::new(tags, false, None);
+    for s in statements.iter_mut() {
+        w.stmt(s, 0)?;
+    }
+    Ok(w.touches)
+}
 
-struct Walker<'a, 't> {
+/// MySQL: derivation over the text as MySQL reads it, and the mask rewrite
+/// when `any_mask`.
+pub(crate) fn analyze_mysql(
+    sql: &str,
+    tags: &Tags,
+    any_mask: bool,
+) -> std::result::Result<(Touches, super::pg::Rewrite), Failure> {
+    let mut prepared = mysql::prepare(sql).map_err(|e| Failure::Unreadable(e.0))?;
+    let mut statements = std::mem::take(&mut prepared.statements);
+    // The unmodified tree, for the fidelity check; only needed if a rewrite
+    // can happen.
+    let original = any_mask.then(|| statements.clone());
+    let mut w = Walker::new(tags, any_mask, Some(&prepared));
+    for s in statements.iter_mut() {
+        w.stmt(s, 0).map_err(Failure::TooDeep)?;
+    }
+    let (touches, rewrote, refused) = (w.touches, w.rewrote, w.refused);
+    if !rewrote {
+        return Ok((touches, None));
+    }
+    #[cfg(test)]
+    if FORCE_RENDER_FAILURE.with(|f| f.get()) {
+        return Ok((touches, Some(Err("forced by test".to_string()))));
+    }
+    let faithful = |why: String| {
+        format!(
+            "the MySQL text cannot be reproduced faithfully ({why}); tag the column block or flag, or simplify the query"
+        )
+    };
+    let rewrite = match refused {
+        Some(why) => Err(why),
+        None => prepared
+            .check_original(original.as_deref().unwrap_or_default())
+            .and_then(|()| prepared.render(&statements))
+            .map_err(faithful),
+    };
+    Ok((touches, Some(rewrite)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lets a test prove that a render failure blocks.
+    pub(crate) static FORCE_RENDER_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A masked projection: (position, output name, original expression).
+type Rewritten = (usize, String, Expr);
+
+struct Walker<'a, 't, 'p, 's> {
     tags: &'a Tags<'t>,
     scopes: Scopes,
     ctes: Vec<Vec<(String, Vec<OutCol>)>>,
     touches: Touches,
+    /// Client-visible projections may be rewritten (MySQL, some tag a mask).
+    rewrite: bool,
+    rewrote: bool,
+    /// Set when a rewrite would change what the query means (e.g. `HAVING`
+    /// over a masked alias): the verdict blocks with this reason.
+    refused: Option<String>,
+    /// MySQL only: the client's text (output names, `"…"` handling).
+    mysql: Option<&'p Prepared<'s>>,
 }
 
 fn too_deep(depth: usize) -> Result<()> {
@@ -74,13 +133,64 @@ fn rename(mut cols: Vec<OutCol>, alias: Option<&TableAlias>) -> Vec<OutCol> {
     cols
 }
 
-impl Walker<'_, '_> {
-    fn stmt(&mut self, s: &Statement, depth: usize) -> Result<()> {
+/// The bare column an expression is, through parentheses (`(email)`).
+fn bare_column(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Some(e),
+        Expr::Nested(x) => bare_column(x),
+        _ => None,
+    }
+}
+
+fn column_name(e: &Expr) -> Option<&str> {
+    match bare_column(e)? {
+        Expr::Identifier(i) => Some(&i.value),
+        Expr::CompoundIdentifier(ids) => ids.last().map(|i| i.value.as_str()),
+        _ => None,
+    }
+}
+
+/// A 1-based position (`ORDER BY 2`, `GROUP BY 1`) → 0-based index.
+fn position(e: &Expr) -> Option<usize> {
+    match e {
+        Expr::Value(Value::Number(n, _)) => n.parse::<usize>().ok()?.checked_sub(1),
+        _ => None,
+    }
+}
+
+impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
+    fn new(tags: &'a Tags<'t>, rewrite: bool, mysql: Option<&'p Prepared<'s>>) -> Self {
+        Walker {
+            tags,
+            scopes: Scopes::default(),
+            ctes: Vec::new(),
+            touches: Touches::default(),
+            rewrite,
+            rewrote: false,
+            refused: None,
+            mysql,
+        }
+    }
+
+    fn visible(&self) -> Sink {
+        Sink::Projected {
+            rewrite: self.rewrite,
+        }
+    }
+
+    fn refuse(&mut self, why: String) {
+        if self.refused.is_none() {
+            self.refused = Some(why);
+        }
+    }
+
+    fn stmt(&mut self, s: &mut Statement, depth: usize) -> Result<()> {
         too_deep(depth)?;
         let d = depth + 1;
+        let visible = self.visible();
         match s {
             Statement::Query(q) => {
-                self.query(q, Some(VISIBLE), d)?;
+                self.query(q, Some(visible), d)?;
             }
             Statement::Insert(ins) => {
                 let (schema, table) = split_name(&ins.table_name);
@@ -93,7 +203,7 @@ impl Walker<'_, '_> {
                     schema,
                     table,
                 };
-                if let Some(src) = &ins.source {
+                if let Some(src) = ins.source.as_deref_mut() {
                     let outs = self.query(src, None, d)?;
                     for (j, c) in outs.iter().enumerate() {
                         let mut lin = outcol_all(self.tags, c);
@@ -105,10 +215,27 @@ impl Walker<'_, '_> {
                         self.touches.record(&lin, Sink::Copy);
                     }
                 }
-                if let Some(ret) = &ins.returning {
+                // `ON DUPLICATE KEY UPDATE x = <expr>` / `ON CONFLICT DO
+                // UPDATE SET x = <expr>` store a value like `UPDATE … SET`.
+                let upsert = match ins.on.as_mut() {
+                    Some(OnInsert::DuplicateKeyUpdate(a)) => Some(a),
+                    Some(OnInsert::OnConflict(oc)) => match &mut oc.action {
+                        OnConflictAction::DoUpdate(u) => Some(&mut u.assignments),
+                        OnConflictAction::DoNothing => None,
+                    },
+                    _ => None,
+                };
+                if let Some(assignments) = upsert {
+                    self.scopes.push();
+                    self.scopes.add(target.clone());
+                    let r = self.assignments(assignments, Some(&target), d);
+                    self.scopes.pop();
+                    r?;
+                }
+                if let Some(ret) = ins.returning.as_mut() {
                     self.scopes.push();
                     self.scopes.add(target);
-                    let r = self.projection(ret, Some(VISIBLE), d);
+                    let r = self.projection(ret, Some(visible), d);
                     self.scopes.pop();
                     r?;
                 }
@@ -134,7 +261,7 @@ impl Walker<'_, '_> {
                     }
                     self.assignments(assignments, target.as_ref(), d)?;
                     if let Some(ret) = returning {
-                        self.projection(ret, Some(VISIBLE), d)?;
+                        self.projection(ret, Some(visible), d)?;
                     }
                     Ok(())
                 })();
@@ -142,18 +269,20 @@ impl Walker<'_, '_> {
                 r?;
             }
             Statement::Delete(del) => {
-                if let Some(ret) = &del.returning {
+                if del.returning.is_some() {
                     self.scopes.push();
                     let r = (|| -> Result<()> {
-                        let from = match &del.from {
+                        let from = match &mut del.from {
                             FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
                         };
-                        for twj in from.iter().chain(del.using.iter().flatten()) {
+                        for twj in from.iter_mut().chain(del.using.iter_mut().flatten()) {
                             for it in self.table_with_joins(twj, d)? {
                                 self.scopes.add(it);
                             }
                         }
-                        self.projection(ret, Some(VISIBLE), d)?;
+                        if let Some(ret) = del.returning.as_mut() {
+                            self.projection(ret, Some(visible), d)?;
+                        }
                         Ok(())
                     })();
                     self.scopes.pop();
@@ -161,7 +290,7 @@ impl Walker<'_, '_> {
                 }
             }
             Statement::CreateTable(ct) => {
-                if let Some(q) = &ct.query {
+                if let Some(q) = ct.query.as_deref_mut() {
                     self.query(q, Some(Sink::Copy), d)?;
                 }
             }
@@ -173,7 +302,7 @@ impl Walker<'_, '_> {
             }
             Statement::Copy { source, to, .. } if *to => match source {
                 sqlparser::ast::CopySource::Query(q) => {
-                    self.query(q, Some(VISIBLE), d)?;
+                    self.query(q, Some(visible), d)?;
                 }
                 sqlparser::ast::CopySource::Table {
                     table_name,
@@ -197,18 +326,26 @@ impl Walker<'_, '_> {
             },
             Statement::Declare { stmts } => {
                 for decl in stmts {
-                    if let Some(q) = &decl.for_query {
-                        self.query(q, Some(VISIBLE), d)?;
+                    if let Some(q) = decl.for_query.as_deref_mut() {
+                        self.query(q, Some(visible), d)?;
                     }
                 }
             }
             Statement::Prepare { statement, .. } => self.stmt(statement, d)?,
             Statement::Explain { statement, .. } => {
                 // A plan, not rows. Data copies inside still count.
-                if let Statement::Query(q) = statement.as_ref() {
+                if let Statement::Query(q) = statement.as_mut() {
                     self.query(q, None, d)?;
                 } else {
                     self.stmt(statement, d)?;
+                }
+            }
+            // `SET @v = (SELECT email …)`: the value moves into a session
+            // variable the next statement reads freely — a copy.
+            Statement::SetVariable { value, .. } => {
+                for e in value.iter_mut() {
+                    let lin = self.expr(e, d)?;
+                    self.touches.record(&lin, Sink::Copy);
                 }
             }
             Statement::Merge {
@@ -226,15 +363,15 @@ impl Walker<'_, '_> {
                     for it in self.table_factor(source, d)? {
                         self.scopes.add(it);
                     }
-                    for c in clauses {
-                        match &c.action {
+                    for c in clauses.iter_mut() {
+                        match &mut c.action {
                             MergeAction::Update { assignments } => {
                                 self.assignments(assignments, target.as_ref(), d)?
                             }
                             MergeAction::Insert(ins) => {
-                                if let MergeInsertKind::Values(v) = &ins.kind {
-                                    for row in &v.rows {
-                                        for (j, e) in row.iter().enumerate() {
+                                if let MergeInsertKind::Values(v) = &mut ins.kind {
+                                    for row in v.rows.iter_mut() {
+                                        for (j, e) in row.iter_mut().enumerate() {
                                             let mut lin = self.expr(e, d)?;
                                             if let (Some(dest), Some(t)) =
                                                 (ins.columns.get(j), target.as_ref())
@@ -263,12 +400,12 @@ impl Walker<'_, '_> {
 
     fn assignments(
         &mut self,
-        list: &[Assignment],
+        list: &mut [Assignment],
         target: Option<&Item>,
         depth: usize,
     ) -> Result<()> {
-        for a in list {
-            let mut lin = self.expr(&a.value, depth + 1)?;
+        for a in list.iter_mut() {
+            let mut lin = self.expr(&mut a.value, depth + 1)?;
             if let (AssignmentTarget::ColumnName(n), Some(t)) = (&a.target, target) {
                 if let Some(col) = n.0.last() {
                     for k in t.column(self.tags, &col.value).keys() {
@@ -283,12 +420,13 @@ impl Walker<'_, '_> {
 
     // ── queries ─────────────────────────────────────────────────────────────
 
-    fn query(&mut self, q: &Query, sink: Option<Sink>, depth: usize) -> Result<Vec<OutCol>> {
+    fn query(&mut self, q: &mut Query, sink: Option<Sink>, depth: usize) -> Result<Vec<OutCol>> {
         too_deep(depth)?;
-        let pushed = if let Some(with) = &q.with {
+        let pushed = if let Some(with) = q.with.as_mut() {
             self.ctes.push(Vec::new());
-            for cte in &with.cte_tables {
-                let cols = if with.recursive {
+            let recursive = with.recursive;
+            for cte in with.cte_tables.iter_mut() {
+                let cols = if recursive {
                     self.recursive_cte(cte, depth + 1)?
                 } else {
                     self.cte_cols(cte, depth + 1)?
@@ -301,19 +439,34 @@ impl Walker<'_, '_> {
         } else {
             false
         };
-        let out = self.set_expr(&q.body, sink, depth + 1);
+        let out = if let SetExpr::Select(sel) = q.body.as_mut() {
+            // A simple SELECT: its ORDER BY lives on the query.
+            self.select(sel, sink, depth + 1)
+                .map(|(outs, rw, star, distinct)| {
+                    if !rw.is_empty() && !distinct {
+                        if let Some(ob) = q.order_by.as_mut() {
+                            if let Err(why) = fix_order_by(ob, &rw, star) {
+                                self.refuse(why);
+                            }
+                        }
+                    }
+                    outs
+                })
+        } else {
+            self.set_expr(&mut q.body, sink, depth + 1)
+        };
         if pushed {
             self.ctes.pop();
         }
         out
     }
 
-    fn cte_cols(&mut self, cte: &Cte, depth: usize) -> Result<Vec<OutCol>> {
-        let cols = self.query(&cte.query, None, depth + 1)?;
+    fn cte_cols(&mut self, cte: &mut Cte, depth: usize) -> Result<Vec<OutCol>> {
+        let cols = self.query(&mut cte.query, None, depth + 1)?;
         Ok(rename(cols, Some(&cte.alias)))
     }
 
-    fn recursive_cte(&mut self, cte: &Cte, depth: usize) -> Result<Vec<OutCol>> {
+    fn recursive_cte(&mut self, cte: &mut Cte, depth: usize) -> Result<Vec<OutCol>> {
         let name = cte.alias.name.value.clone();
         let mut cols: Vec<OutCol> = Vec::new();
         let mut last = Lineage::new();
@@ -352,32 +505,14 @@ impl Walker<'_, '_> {
 
     fn set_expr(
         &mut self,
-        body: &SetExpr,
+        body: &mut SetExpr,
         sink: Option<Sink>,
         depth: usize,
     ) -> Result<Vec<OutCol>> {
         too_deep(depth)?;
         let d = depth + 1;
         match body {
-            SetExpr::Select(sel) => {
-                // `SELECT … INTO t` / `INTO OUTFILE`: a copy, not a read.
-                let sink = if sel.into.is_some() {
-                    Some(Sink::Copy)
-                } else {
-                    sink
-                };
-                self.scopes.push();
-                let r = (|| -> Result<Vec<OutCol>> {
-                    for twj in &sel.from {
-                        for it in self.table_with_joins(twj, d)? {
-                            self.scopes.add(it);
-                        }
-                    }
-                    self.projection(&sel.projection, sink, d)
-                })();
-                self.scopes.pop();
-                r
-            }
+            SetExpr::Select(sel) => Ok(self.select(sel, sink, d)?.0),
             SetExpr::Query(q) => self.query(q, sink, d),
             SetExpr::SetOperation { left, right, .. } => {
                 let l = self.set_expr(left, sink, d)?;
@@ -386,11 +521,17 @@ impl Walker<'_, '_> {
             }
             SetExpr::Values(v) => {
                 let mut cols: Vec<Lineage> = Vec::new();
-                for row in &v.rows {
-                    for (j, e) in row.iter().enumerate() {
+                for row in v.rows.iter_mut() {
+                    for (j, e) in row.iter_mut().enumerate() {
                         let lin = self.expr(e, d)?;
                         if let Some(sink) = sink {
                             self.touches.record(&lin, sink);
+                            if let Sink::Projected { rewrite: true } = sink {
+                                if let Some(style) = mask_style_for(self.tags, &lin) {
+                                    *e = mysql::mask_expr(style, e);
+                                    self.rewrote = true;
+                                }
+                            }
                         }
                         if cols.len() <= j {
                             cols.resize_with(j + 1, Lineage::new);
@@ -426,6 +567,90 @@ impl Walker<'_, '_> {
         }
     }
 
+    /// One `SELECT`: (output columns, masked projections, whether the list
+    /// has a star, whether it is DISTINCT).
+    #[allow(clippy::type_complexity)]
+    fn select(
+        &mut self,
+        sel: &mut Select,
+        sink: Option<Sink>,
+        depth: usize,
+    ) -> Result<(Vec<OutCol>, Vec<Rewritten>, bool, bool)> {
+        // `SELECT … INTO t` / `INTO OUTFILE` / `INTO @v`: a copy, not a read.
+        let sink = if sel.into.is_some() {
+            Some(Sink::Copy)
+        } else {
+            sink
+        };
+        self.scopes.push();
+        let r = (|| -> Result<(Vec<OutCol>, Vec<Rewritten>, bool)> {
+            for twj in sel.from.iter_mut() {
+                for it in self.table_with_joins(twj, depth)? {
+                    self.scopes.add(it);
+                }
+            }
+            self.projection(&mut sel.projection, sink, depth)
+        })();
+        self.scopes.pop();
+        let (outs, rw, star) = r?;
+        if !rw.is_empty() {
+            self.fix_group_and_having(sel, &rw, star);
+        }
+        Ok((outs, rw, star, sel.distinct.is_some()))
+    }
+
+    /// After masking, `GROUP BY` / `HAVING` items naming a masked output could
+    /// now see the MASKED value. MySQL resolves a `GROUP BY` name against the
+    /// FROM columns first and the select aliases second, so whether `x` is the
+    /// column or the alias depends on a schema the engine does not have:
+    /// - `GROUP BY 2` (a position) always meant the select item: it is pointed
+    ///   at the original expression;
+    /// - `GROUP BY email` over a masked `email` column groups by that column
+    ///   either way: unchanged;
+    /// - any other masked output name in `GROUP BY`, and any masked output
+    ///   name in `HAVING` (which prefers the alias), cannot be resolved safely:
+    ///   the rewrite is refused, i.e. the query is blocked.
+    fn fix_group_and_having(&mut self, sel: &mut Select, rw: &[Rewritten], star: bool) {
+        // A masked bare column keeps its own name (`email` over `email`): in
+        // GROUP BY that name is the FROM column either way, which is unchanged.
+        let captured: Vec<&str> = rw
+            .iter()
+            .filter(|(_, n, orig)| !column_name(orig).is_some_and(|c| ieq(c, n)))
+            .map(|(_, n, _)| n.as_str())
+            .collect();
+        if let GroupByExpr::Expressions(exprs, _) = &mut sel.group_by {
+            for e in exprs.iter_mut() {
+                if let Some(p) = position(e).filter(|_| !star) {
+                    if let Some((_, _, orig)) = rw.iter().find(|(i, _, _)| *i == p) {
+                        *e = orig.clone();
+                    }
+                    continue;
+                }
+                // A qualified name is a column, never an alias.
+                if matches!(e, Expr::CompoundIdentifier(_) | Expr::Value(_)) {
+                    continue;
+                }
+                if !captured.is_empty() && mysql::mentions(e, &captured) {
+                    self.refuse(format!(
+                        "GROUP BY uses the masked output name(s) {}; group by the expression itself",
+                        captured.join(", ")
+                    ));
+                }
+            }
+        }
+        // HAVING resolves a name to the select alias even when a FROM column
+        // has it (measured): every masked name counts.
+        let names: Vec<&str> = rw.iter().map(|(_, n, _)| n.as_str()).collect();
+        if let Some(h) = &sel.having {
+            if mysql::mentions(h, &names) {
+                self.refuse(format!(
+                    "HAVING uses the masked output name(s) {}; MySQL would compare the masked value",
+                    names.join(", ")
+                ));
+            }
+        }
+    }
+
     fn combine(&self, l: Vec<OutCol>, r: Vec<OutCol>) -> Vec<OutCol> {
         let all_named = |v: &[OutCol]| v.iter().all(|c| matches!(c, OutCol::Named { .. }));
         if l.len() == r.len() && all_named(&l) && all_named(&r) {
@@ -446,56 +671,100 @@ impl Walker<'_, '_> {
         }
     }
 
+    /// MySQL's name for an unaliased select item: a column's name as written,
+    /// otherwise the expression's own text as the client wrote it.
+    fn output_name(&self, e: &Expr) -> String {
+        if let Some(c) = column_name(e) {
+            return c.to_string();
+        }
+        if let Expr::Value(Value::SingleQuotedString(s) | Value::DoubleQuotedString(s)) = e {
+            return s.clone();
+        }
+        let text = match self.mysql {
+            Some(p) => p
+                .verbatim(e)
+                .unwrap_or_else(|| mysql::plain_placeholders(&e.to_string())),
+            None => e.to_string(),
+        };
+        // MySQL truncates a generated name to 255 characters.
+        text.chars().take(255).collect()
+    }
+
     fn projection(
         &mut self,
-        items: &[SelectItem],
+        items: &mut [SelectItem],
         sink: Option<Sink>,
         depth: usize,
-    ) -> Result<Vec<OutCol>> {
+    ) -> Result<(Vec<OutCol>, Vec<Rewritten>, bool)> {
         let mut outs = Vec::new();
-        for item in items {
-            let (lin, cols) = match item {
-                SelectItem::Wildcard(_) => self.scopes.star(self.tags, &[]),
-                SelectItem::QualifiedWildcard(name, _) => {
-                    let q: Vec<&str> = name.0.iter().map(|i| i.value.as_str()).collect();
-                    self.scopes.star(self.tags, &q)
+        let mut rewritten = Vec::new();
+        let mut has_star = false;
+        for (idx, item) in items.iter_mut().enumerate() {
+            let (lin, name) = match item {
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                    has_star = true;
+                    let (lin, cols) = match item {
+                        SelectItem::QualifiedWildcard(name, _) => {
+                            let q: Vec<&str> = name.0.iter().map(|i| i.value.as_str()).collect();
+                            self.scopes.star(self.tags, &q)
+                        }
+                        _ => self.scopes.star(self.tags, &[]),
+                    };
+                    if let Some(sink) = sink {
+                        self.touches.record(&lin, sink);
+                    }
+                    outs.extend(cols);
+                    continue;
                 }
                 SelectItem::UnnamedExpr(e) => {
                     let lin = self.expr(e, depth + 1)?;
-                    let name = figure(e);
-                    (lin.clone(), vec![OutCol::Named { name, lin }])
+                    // Only a bare column's name matters for resolution through
+                    // derived tables; the exact MySQL name of an expression is
+                    // looked up only when the item is rewritten (below).
+                    let name = column_name(e).map_or_else(|| e.to_string(), str::to_string);
+                    (lin, name)
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
                     let lin = self.expr(expr, depth + 1)?;
-                    (
-                        lin.clone(),
-                        vec![OutCol::Named {
-                            name: alias.value.clone(),
-                            lin,
-                        }],
-                    )
+                    (lin, alias.value.clone())
                 }
             };
             if let Some(sink) = sink {
                 self.touches.record(&lin, sink);
+                if let Sink::Projected { rewrite: true } = sink {
+                    if let Some(style) = mask_style_for(self.tags, &lin) {
+                        let (orig, name) = match item {
+                            SelectItem::UnnamedExpr(e) => (e.clone(), self.output_name(e)),
+                            SelectItem::ExprWithAlias { expr, .. } => (expr.clone(), name.clone()),
+                            _ => unreachable!("stars are handled above"),
+                        };
+                        *item = SelectItem::ExprWithAlias {
+                            expr: mysql::mask_expr(style, &orig),
+                            // Keep the client-visible column name.
+                            alias: Ident::with_quote('`', name.clone()),
+                        };
+                        rewritten.push((idx, name.clone(), orig));
+                        self.rewrote = true;
+                    }
+                }
             }
-            outs.extend(cols);
+            outs.push(OutCol::Named { name, lin });
         }
-        Ok(outs)
+        Ok((outs, rewritten, has_star))
     }
 
     // ── FROM ────────────────────────────────────────────────────────────────
 
-    fn table_with_joins(&mut self, twj: &TableWithJoins, depth: usize) -> Result<Vec<Item>> {
+    fn table_with_joins(&mut self, twj: &mut TableWithJoins, depth: usize) -> Result<Vec<Item>> {
         too_deep(depth)?;
-        let mut items = self.table_factor(&twj.relation, depth + 1)?;
-        for j in &twj.joins {
+        let mut items = self.table_factor(&mut twj.relation, depth + 1)?;
+        for j in twj.joins.iter_mut() {
             // LATERAL on the right side may reference the left.
             let mark = self.scopes.levels.last().map_or(0, Vec::len);
             for it in &items {
                 self.scopes.add(it.clone());
             }
-            let right = self.table_factor(&j.relation, depth + 1);
+            let right = self.table_factor(&mut j.relation, depth + 1);
             if let Some(level) = self.scopes.levels.last_mut() {
                 level.truncate(mark);
             }
@@ -504,7 +773,7 @@ impl Walker<'_, '_> {
         Ok(items)
     }
 
-    fn table_factor(&mut self, tf: &TableFactor, depth: usize) -> Result<Vec<Item>> {
+    fn table_factor(&mut self, tf: &mut TableFactor, depth: usize) -> Result<Vec<Item>> {
         too_deep(depth)?;
         let d = depth + 1;
         let alias_name = |a: &Option<TableAlias>| a.as_ref().map(|a| a.name.value.clone());
@@ -517,7 +786,7 @@ impl Walker<'_, '_> {
                 if let Some(args) = args {
                     // A table-valued function call.
                     let mut lin = Lineage::new();
-                    for a in &args.args {
+                    for a in args.args.iter_mut() {
                         merge(&mut lin, self.function_arg(a, d)?);
                     }
                     return Ok(vec![Item::Opaque {
@@ -569,7 +838,7 @@ impl Walker<'_, '_> {
             }],
             TableFactor::Function { args, alias, .. } => {
                 let mut lin = Lineage::new();
-                for a in args {
+                for a in args.iter_mut() {
                     merge(&mut lin, self.function_arg(a, d)?);
                 }
                 vec![Item::Opaque {
@@ -581,7 +850,7 @@ impl Walker<'_, '_> {
                 alias, array_exprs, ..
             } => {
                 let mut lin = Lineage::new();
-                for e in array_exprs {
+                for e in array_exprs.iter_mut() {
                     merge(&mut lin, self.expr(e, d)?);
                 }
                 vec![Item::Opaque {
@@ -621,7 +890,7 @@ impl Walker<'_, '_> {
 
     // ── expressions ─────────────────────────────────────────────────────────
 
-    fn function_arg(&mut self, a: &FunctionArg, depth: usize) -> Result<Lineage> {
+    fn function_arg(&mut self, a: &mut FunctionArg, depth: usize) -> Result<Lineage> {
         let arg = match a {
             FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => arg,
         };
@@ -640,20 +909,20 @@ impl Walker<'_, '_> {
         })
     }
 
-    fn exprs(&mut self, list: &[Expr], depth: usize) -> Result<Lineage> {
+    fn exprs(&mut self, list: &mut [Expr], depth: usize) -> Result<Lineage> {
         let mut out = Lineage::new();
-        for e in list {
+        for e in list.iter_mut() {
             merge(&mut out, self.expr(e, depth)?);
         }
         Ok(out)
     }
 
-    fn query_value(&mut self, q: &Query, depth: usize) -> Result<Lineage> {
+    fn query_value(&mut self, q: &mut Query, depth: usize) -> Result<Lineage> {
         let cols = self.query(q, None, depth)?;
         Ok(outcols_all(self.tags, &cols))
     }
 
-    fn expr(&mut self, e: &Expr, depth: usize) -> Result<Lineage> {
+    fn expr(&mut self, e: &mut Expr, depth: usize) -> Result<Lineage> {
         too_deep(depth)?;
         let d = depth + 1;
         let lin = match e {
@@ -663,18 +932,24 @@ impl Walker<'_, '_> {
                 return Ok(l);
             }
             Expr::CompoundIdentifier(ids) => return Ok(self.compound(ids)),
+            // With `ANSI_QUOTES` (server-wide, or per statement through a
+            // `SET_VAR` hint) MySQL reads `"email"` as the column. The engine
+            // cannot see the SQL mode: treat it as a possible column.
+            Expr::Value(Value::DoubleQuotedString(s)) if self.mysql.is_some() => {
+                self.scopes.column(self.tags, &[], s)
+            }
             Expr::Value(_) | Expr::TypedString { .. } | Expr::IntroducedString { .. } => {
                 Lineage::new()
             }
             Expr::Nested(x) => return self.expr(x, d),
             // Only the arguments are values; FILTER / OVER / WITHIN GROUP decide
             // which rows and in what order, like WHERE.
-            Expr::Function(f) => match &f.args {
+            Expr::Function(f) => match &mut f.args {
                 FunctionArguments::None => Lineage::new(),
                 FunctionArguments::Subquery(q) => self.query_value(q, d)?,
                 FunctionArguments::List(list) => {
                     let mut l = Lineage::new();
-                    for a in &list.args {
+                    for a in list.args.iter_mut() {
                         merge(&mut l, self.function_arg(a, d)?);
                     }
                     l
@@ -827,26 +1102,26 @@ impl Walker<'_, '_> {
                 l
             }
             Expr::Tuple(list) => self.exprs(list, d)?,
-            Expr::Array(a) => self.exprs(&a.elem, d)?,
-            Expr::Interval(i) => self.expr(&i.value, d)?,
+            Expr::Array(a) => self.exprs(&mut a.elem, d)?,
+            Expr::Interval(i) => self.expr(&mut i.value, d)?,
             Expr::GroupingSets(sets) | Expr::Cube(sets) | Expr::Rollup(sets) => {
                 let mut l = Lineage::new();
-                for s in sets {
+                for s in sets.iter_mut() {
                     merge(&mut l, self.exprs(s, d)?);
                 }
                 l
             }
             Expr::MapAccess { column, keys } => {
                 let mut l = self.expr(column, d)?;
-                for k in keys {
-                    merge(&mut l, self.expr(&k.key, d)?);
+                for k in keys.iter_mut() {
+                    merge(&mut l, self.expr(&mut k.key, d)?);
                 }
                 l
             }
             Expr::Subscript { expr, .. } => self.expr(expr, d)?,
             Expr::MatchAgainst { columns, .. } => {
                 let mut l = Lineage::new();
-                for c in columns {
+                for c in columns.iter() {
                     merge(&mut l, self.scopes.column(self.tags, &[], &c.value));
                 }
                 l
@@ -887,15 +1162,47 @@ impl Walker<'_, '_> {
     }
 }
 
-/// MySQL's output name for an unaliased expression is its text; only the
-/// bare-column case matters for resolution through derived tables.
-fn figure(e: &Expr) -> String {
-    match e {
-        Expr::Identifier(i) => i.value.clone(),
-        Expr::CompoundIdentifier(ids) => ids.last().map(|i| i.value.clone()).unwrap_or_default(),
-        Expr::Nested(x) => figure(x),
-        other => other.to_string(),
+/// After masking, an `ORDER BY` item that refers to a masked output — by
+/// name, or by position when no `*` precedes it — would sort by the MASKED
+/// value: MySQL resolves an `ORDER BY` name against the select aliases first.
+/// Point it back at the original expression. A bare column is wrapped in
+/// `COALESCE()`: inside an expression MySQL resolves the name to the column
+/// first (measured on 5.7 and 8.0), so the alias can no longer capture it.
+/// An expression over the name of a masked alias that is not itself a column
+/// (`ORDER BY LENGTH(le)`) would sort by the masked value: refused.
+fn fix_order_by(ob: &mut OrderBy, rw: &[Rewritten], star: bool) -> std::result::Result<(), String> {
+    let captured: Vec<&str> = rw
+        .iter()
+        .filter(|(_, n, orig)| !column_name(orig).is_some_and(|c| ieq(c, n)))
+        .map(|(_, n, _)| n.as_str())
+        .collect();
+    for item in ob.exprs.iter_mut() {
+        let hit = match &item.expr {
+            Expr::Identifier(id) => rw.iter().find(|(_, n, _)| ieq(n, &id.value)),
+            e => position(e)
+                .filter(|_| !star)
+                .and_then(|p| rw.iter().find(|(i, _, _)| *i == p)),
+        };
+        let Some((_, _, orig)) = hit else {
+            let plain = matches!(
+                item.expr,
+                Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_)
+            );
+            if !plain && !captured.is_empty() && mysql::mentions(&item.expr, &captured) {
+                return Err(format!(
+                    "ORDER BY uses the masked output name(s) {} inside an expression; order by the expression itself",
+                    captured.join(", ")
+                ));
+            }
+            continue;
+        };
+        item.expr = match bare_column(orig) {
+            Some(c @ Expr::Identifier(_)) => mysql::coalesce(c),
+            Some(c) => c.clone(),
+            None => orig.clone(),
+        };
     }
+    Ok(())
 }
 
 impl Item {

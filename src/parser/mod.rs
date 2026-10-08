@@ -231,6 +231,11 @@ pub(crate) enum SourceAst {
     Sql {
         statements: std::sync::Arc<Vec<sqlparser::ast::Statement>>,
         dialect: Dialect,
+        /// The client's text, kept for MySQL only: the sensitive-column analysis
+        /// re-reads it the way MySQL does (comments, `?` order, string literals
+        /// verbatim), which the tree alone cannot tell. One copy of the query,
+        /// only walked when the policy carries tags.
+        sql: Option<std::sync::Arc<str>>,
     },
 }
 

@@ -21,8 +21,8 @@ use crate::sensitive::{
 };
 
 /// Rewrite outcome: `Some(Ok(sql))` when at least one projection was masked,
-/// `Some(Err(reason))` when the rewritten tree could not be deparsed, `None`
-/// when nothing was rewritten.
+/// `Some(Err(reason))` when the rewrite cannot be forwarded (the reason is
+/// shown after `mask unsupported: `), `None` when nothing was rewritten.
 pub(crate) type Rewrite = Option<std::result::Result<String, String>>;
 
 /// Derives every tagged column the statements read and, when any tag is a
@@ -50,9 +50,12 @@ pub(crate) fn analyze(
     let rewrite = if w.rewrote {
         #[cfg(test)]
         if FORCE_DEPARSE_FAILURE.with(|f| f.get()) {
-            return Ok((w.touches, Some(Err("forced by test".to_string()))));
+            return Ok((
+                w.touches,
+                Some(Err("rewrite failed (forced by test)".to_string())),
+            ));
         }
-        Some(pg_query::deparse(&tree).map_err(|e| e.to_string()))
+        Some(pg_query::deparse(&tree).map_err(|e| format!("rewrite failed ({e})")))
     } else {
         None
     };
@@ -1198,12 +1201,28 @@ fn has_param(node: &Node) -> bool {
     serde_json::to_value(node).map_or(true, |v| walk(&v))
 }
 
-/// The mask expression for `style` applied to `orig`. `full` discards `orig`
-/// entirely, so nothing of the value (not even its NULL-ness) reaches the
-/// client — unless `orig` holds bind parameters, which must stay in the
-/// statement (see [`full_keeping_params`]).
+/// A bare column or a scalar subquery: replacing it with a constant changes
+/// nothing but the value. Any other expression may be an aggregate
+/// (`string_agg(email, ',')`) or a set-returning function, and replacing it
+/// with a constant would change how many rows come back.
+fn plain_value(node: &Node) -> bool {
+    match node.node.as_ref() {
+        Some(NodeEnum::ColumnRef(_)) => true,
+        Some(NodeEnum::SubLink(sl)) => sl.sub_link_type == SubLinkType::ExprSublink as i32,
+        _ => false,
+    }
+}
+
+/// The mask expression for `style` applied to `orig`. `full` over a bare
+/// column discards `orig` entirely, so nothing of the value (not even its
+/// NULL-ness) reaches the client. Over a computed expression it keeps the
+/// expression and discards its value at run time ([`full_keeping_params`]):
+/// bind parameters must stay in the statement, and an aggregate or a
+/// set-returning function must still decide how many rows come back
+/// (`'[redacted]'` in place of `string_agg(email, ',')` returns one row per
+/// input row instead of one).
 pub(crate) fn mask_node(style: MaskStyle, orig: Node) -> Node {
-    let base = if style == MaskStyle::Full && has_param(&orig) {
+    let base = if style == MaskStyle::Full && (has_param(&orig) || !plain_value(&orig)) {
         full_keeping_params()
     } else {
         template(style)

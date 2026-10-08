@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.7.0] — 2026-10-08
+
+VERICTO-085 `mask` now rewrites on MySQL (and MariaDB / Aurora MySQL through the
+same dialect) instead of blocking, and the MySQL analysis reads the text the way
+MySQL does, closing several ways to hide a read from it. No API change: the same
+types, fields, JSON and decision mapping as 3.6; `rewritten_query` is now `Some`
+for a successful MySQL mask too.
+
+### Added
+
+- **MySQL mask rewrite.** Each client-visible projection derived from a masked
+  column is replaced by its mask, aliased to the name MySQL would have given it
+  (a column's name as written; an unaliased expression's own text, as the client
+  typed it), and the statement is printed back from the sqlparser tree into
+  `rewritten_query`. The masks use only functions MySQL 5.7, 8.0, Aurora MySQL 2/3
+  and MariaDB all have (no `REGEXP_REPLACE`), and return exactly what the Postgres
+  masks return for the same text — NULL, `''`, one character, multibyte and 4-byte
+  characters, no `@`, an `@` first, the same SHA-256 hex — which
+  `tests/mysql_mask_equivalence.rs` checks against both servers side by side. The
+  value is first converted with `CONVERT(… USING utf8mb4) COLLATE utf8mb4_bin`:
+  the same characters and UTF-8 bytes whatever the column's or the connection's
+  charset, codepoint-exact `LOCATE('@', …)` (an accent-insensitive collation would
+  match a full-width `＠`), and an explicit collation, so the masked value can be
+  `UNION`ed, compared or concatenated with a column of any collation. The obvious
+  `CAST(col AS CHAR)` raises "Illegal mix of collations" against a non-default
+  collation on both 5.7 and 8.0. As on Postgres, a computed value is masked
+  `full`; `ORDER BY` items that named a masked output sort by the original value
+  (a bare column is wrapped in `COALESCE()`, which MySQL resolves to the column
+  rather than to the alias), and `GROUP BY` positions are pointed back at the
+  original expression.
+
+  The rewrite is only forwarded when three checks pass, and blocks otherwise: the
+  unmodified tree must print to the client's own tokens (up to keyword case, an
+  inserted `AS`, `LIMIT a, b` / `LIMIT b OFFSET a` and `INNER`/`OUTER` before
+  `JOIN`), with string literals compared verbatim so the result does not depend on
+  the server's string-escape mode; the rewritten text must parse back to exactly the
+  rewritten tree; and every `?` must still be there, once, in the same order. MySQL
+  binds `?` by position, so a shifted parameter would bind a value to the wrong
+  place: the engine numbers the client's `?` before parsing, checks the numbering
+  survives, and keeps `LIMIT ?, ?` in its comma form (the renderer would print
+  `LIMIT ? OFFSET ?`, swapping the two bindings). Statements it cannot reproduce
+  block with `mask unsupported: the MySQL text cannot be reproduced faithfully (…)`:
+  optimizer hints, the SELECT modifiers sqlparser does not know and bit literals. A `GROUP BY`, `HAVING` or `ORDER BY`
+  expression that names a masked alias MySQL may resolve to the masked value
+  blocks too. Oracle and SQL Server still block a `mask`.
+
+### Fixed
+
+- **MySQL text that sqlparser and MySQL read differently could hide a read from
+  VERICTO-085, under every policy.** Differences between MySQL's and sqlparser's
+  reading of comments, string escapes and SELECT modifiers could return a tagged
+  column from MySQL while 3.6 saw no read. The MySQL analysis now re-reads the
+  client's text the way MySQL does: text it cannot analyse resolves like a parse
+  error (blocked with a `block` or `mask` tag, flagged with `flag`-only tags), and
+  the SELECT modifiers are removed before the analysis so it sees what MySQL
+  reads. Only hosts that send tags are affected; with no tags nothing changes.
+
+  **Scope:** this re-reading runs only inside the sensitive-column analysis. A
+  host that sends no tags gets exactly the 3.6.1 outcome for every one of these
+  forms of text (no new `PARSE_ERROR`, no new block, under either `parse_error`
+  setting); the rule engine's own parsing is unchanged. Pinned by
+  `mysql_text_handling_is_inert_without_tags`.
+
+- **More copies are reads on MySQL (and the other sqlparser dialects).**
+  `SET @v = (SELECT email …)` and `ON DUPLICATE KEY UPDATE x = (SELECT email …)` /
+  `ON CONFLICT DO UPDATE SET …` moved a tagged value into a session variable or
+  another column without VERICTO-085 noticing; they are now copies, blocked under
+  `block` and `mask`. A double-quoted string `"email"` is treated as a possible
+  column on MySQL, since a server (or a `SET_VAR` hint) in `ANSI_QUOTES` mode reads
+  it as one.
+
+- **A masked aggregate keeps aggregating, on Postgres too.** A computed value
+  masked `full` was replaced by the constant `'[redacted]'`; for an aggregate
+  (`string_agg(email, ',')`, `GROUP_CONCAT(email)`) that turned one aggregated row
+  into one row per input row. A computed value is now always masked in the form
+  3.6.1 used for expressions with parameters,
+  `concat('[redacted]'::text, left((expr)::text, 0))` on Postgres and
+  `CONCAT('[redacted]', COALESCE(LEFT(x, 0), ''))` on MySQL: the expression still
+  runs and still decides the row count, and the output is still exactly
+  `'[redacted]'`. A bare column masked `full` is still the plain constant.
+
 ## [3.6.1] — 2026-10-08
 
 ### Fixed

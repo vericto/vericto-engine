@@ -45,6 +45,7 @@ pub fn parse_with_dialect<D: SqlDialect>(
         ast: crate::parser::SourceAst::Sql {
             statements: std::sync::Arc::new(statements),
             dialect: which,
+            sql: (which == crate::parser::Dialect::Mysql).then(|| std::sync::Arc::from(sql)),
         },
     })
 }
