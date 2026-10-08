@@ -1130,9 +1130,10 @@ const MASK_ARG: &str = "vericto_mask_arg";
 ///   (`'^(.).*(@.*)$'` would not match it and return it in clear);
 /// - `hash` hashes `convert_to(x::text, 'UTF8')` instead of `x::text::bytea`,
 ///   which fails on any text containing a backslash.
+static TEMPLATES: OnceLock<[Node; 5]> = OnceLock::new();
+
 fn template(style: MaskStyle) -> &'static Node {
-    static T: OnceLock<[Node; 4]> = OnceLock::new();
-    let all = T.get_or_init(|| {
+    let all = TEMPLATES.get_or_init(|| {
         let parse = |sql: &str| -> Node {
             let tree = pg_query::parse(sql).expect("mask template parses");
             let stmt = tree.protobuf.stmts[0]
@@ -1153,6 +1154,7 @@ fn template(style: MaskStyle) -> &'static Node {
             parse("SELECT '****' || right(vericto_mask_arg::text, 4)"),
             parse(r"SELECT regexp_replace(vericto_mask_arg::text, '^(.)[^@]*(@.*)?$', '\1***\2')"),
             parse("SELECT encode(sha256(convert_to(vericto_mask_arg::text, 'UTF8')), 'hex')"),
+            parse("SELECT concat('[redacted]'::text, left(vericto_mask_arg::text, 0))"),
         ]
     });
     match style {
@@ -1163,11 +1165,50 @@ fn template(style: MaskStyle) -> &'static Node {
     }
 }
 
+/// `full` for an expression that contains bind parameters:
+/// `concat('[redacted]'::text, left((expr)::text, 0))`.
+///
+/// Plain `'[redacted]'` would drop every `$n` inside the replaced expression,
+/// and a client that binds them then fails the extended protocol on a
+/// parameter-count mismatch. This keeps the original expression, so every
+/// parameter stays present AND keeps the type Postgres infers for it from the
+/// same context (`substring(card, $1, 4)` still types `$1` as integer). A
+/// `CASE WHEN $1 IS NULL …` wrapper would keep the count but leave an
+/// untyped `$1` ("could not determine data type of parameter"), and CASE /
+/// COALESCE reject set-returning functions. `left(x, 0)` is `''` for any
+/// non-NULL x and NULL for NULL, and `concat` ignores NULL, so the result is
+/// always exactly `'[redacted]'`: neither the value nor its NULL-ness leaks.
+fn full_keeping_params() -> &'static Node {
+    // `template` initialises every entry, including this one.
+    let _ = template(MaskStyle::Full);
+    &TEMPLATES.get().expect("templates initialised")[4]
+}
+
+/// Whether a node contains a bind parameter anywhere inside it.
+fn has_param(node: &Node) -> bool {
+    fn walk(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Object(m) => m.contains_key("ParamRef") || m.values().any(walk),
+            serde_json::Value::Array(a) => a.iter().any(walk),
+            _ => false,
+        }
+    }
+    // Serialization of the protobuf cannot fail; if it ever did, keep the
+    // expression (the parameter-preserving form is correct either way).
+    serde_json::to_value(node).map_or(true, |v| walk(&v))
+}
+
 /// The mask expression for `style` applied to `orig`. `full` discards `orig`
 /// entirely, so nothing of the value (not even its NULL-ness) reaches the
-/// client.
+/// client — unless `orig` holds bind parameters, which must stay in the
+/// statement (see [`full_keeping_params`]).
 pub(crate) fn mask_node(style: MaskStyle, orig: Node) -> Node {
-    let mut out = template(style).clone();
+    let base = if style == MaskStyle::Full && has_param(&orig) {
+        full_keeping_params()
+    } else {
+        template(style)
+    };
+    let mut out = base.clone();
     let mut orig = Some(orig);
     splice(&mut out, &mut orig);
     out

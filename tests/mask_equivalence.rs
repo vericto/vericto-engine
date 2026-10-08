@@ -112,6 +112,14 @@ const CASES: &[Case] = &[
         &[("ssn", MaskStyle::Hash)],
     ),
     (
+        // A computed value with bind parameters: masked `full`, and `$1`/`$2`
+        // must stay in the statement with the types inferred from the same
+        // context (PREPARE without declared types fails otherwise).
+        "SELECT id, substring(card, $1, $2) AS part FROM customers WHERE id <> $3 ORDER BY id",
+        Some("(2, 4, 0)"),
+        &[("part", MaskStyle::Full)],
+    ),
+    (
         "SELECT id, substring(card, 1, 6) AS bin FROM customers ORDER BY id",
         None,
         &[("bin", MaskStyle::Full)],

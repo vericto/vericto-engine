@@ -1153,3 +1153,72 @@ fn verdict_is_deterministic_regardless_of_tag_order() {
     assert_eq!(x.rewritten_query, y.rewritten_query);
     assert_eq!(x.ast_node_path, y.ast_node_path);
 }
+
+// ── bind parameters ────────────────────────────────────────────────────────
+
+/// The `$n` a statement references, from Postgres's own parse tree.
+fn params(sql: &str) -> std::collections::BTreeSet<i64> {
+    fn walk(v: &serde_json::Value, out: &mut std::collections::BTreeSet<i64>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                if let Some(n) = m.get("ParamRef").and_then(|p| p.get("number")) {
+                    out.insert(n.as_i64().unwrap_or_default());
+                }
+                m.values().for_each(|c| walk(c, out));
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|c| walk(c, out)),
+            _ => {}
+        }
+    }
+    let tree = pg_query::parse(sql).expect("parses").protobuf;
+    let mut out = std::collections::BTreeSet::new();
+    walk(&serde_json::to_value(&tree).unwrap(), &mut out);
+    out
+}
+
+#[test]
+fn a_rewrite_never_drops_a_bind_parameter() {
+    // A masked projection that is replaced wholesale (`full`, or any computed
+    // value) used to drop every `$n` inside it: the client still binds them,
+    // and the extended protocol fails on a parameter-count mismatch.
+    for (sql, style) in [
+        ("SELECT substring(card, $1, 4) FROM customers", Last4),
+        (
+            "SELECT id, substring(card, $1, $2) AS p FROM customers WHERE id = $3",
+            Last4,
+        ),
+        ("SELECT card || $1 FROM customers", Hash),
+        (
+            "SELECT CASE WHEN id = $1 THEN card END FROM customers",
+            Email,
+        ),
+        ("SELECT (SELECT card FROM customers WHERE id = $1)", Full),
+        ("SELECT string_agg(card, $1) FROM customers", Full),
+        (
+            "VALUES ((SELECT left(card, $1) FROM customers LIMIT 1))",
+            Full,
+        ),
+        ("SELECT id, card FROM customers WHERE id = $1", Full),
+    ] {
+        let rw = rewrite(sql, vec![masked("customers", "card", style)]);
+        assert_eq!(params(sql), params(&rw), "{sql}\n  → {rw}");
+    }
+}
+
+#[test]
+fn a_kept_parameter_is_in_a_no_op_that_reveals_nothing() {
+    let rw = rewrite(
+        "SELECT substring(card, $1, 4) AS p FROM customers",
+        vec![masked("customers", "card", Last4)],
+    );
+    assert_eq!(
+        rw,
+        "SELECT concat('[redacted]'::text, \"left\"(\"substring\"(card, $1, 4)::text, 0)) AS p FROM customers"
+    );
+    // Without parameters the plain constant is kept: nothing is evaluated.
+    let rw = rewrite(
+        "SELECT substring(card, 1, 4) AS p FROM customers",
+        vec![masked("customers", "card", Last4)],
+    );
+    assert_eq!(rw, "SELECT '[redacted]'::text AS p FROM customers");
+}

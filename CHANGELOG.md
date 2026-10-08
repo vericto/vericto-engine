@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.6.1] — 2026-10-08
+
+### Fixed
+
+- **A masked projection no longer drops bind parameters.** When VERICTO-085
+  replaced a computed expression over a masked column with `'[redacted]'`, every
+  `$n` that appeared only inside it disappeared from the rewritten statement:
+  `SELECT substring(card, $1, 4) FROM t` became `SELECT '[redacted]'::text …`, so a
+  client binding one parameter failed the extended protocol on a parameter-count
+  mismatch, and Postgres could not type the parameters that were left. Such an
+  expression is now masked as `concat('[redacted]'::text, left((expr)::text, 0))`:
+  the original expression stays in the statement, so every parameter keeps both
+  its position and the type Postgres infers for it from the same context. The
+  result is still exactly `'[redacted]'` — `left(x, 0)` is empty or NULL and
+  `concat` ignores NULL, so neither the value nor its NULL-ness is revealed.
+  Masks without parameters are unchanged. (A `CASE WHEN $1 IS NULL …` wrapper was
+  rejected: it keeps the count but leaves `$1` untyped, and CASE refuses
+  set-returning functions.) Only affects hosts using `mask` tags on Postgres.
+
 ## [3.6.0] — 2026-10-07
 
 Sensitive Column Protection: a new rule, VERICTO-085, that blocks, flags or masks
@@ -875,7 +894,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.6.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.6.1...HEAD
+[3.6.1]: https://github.com/vericto/vericto-engine/compare/v3.6.0...v3.6.1
 [3.6.0]: https://github.com/vericto/vericto-engine/compare/v3.5.3...v3.6.0
 [3.5.3]: https://github.com/vericto/vericto-engine/compare/v3.5.2...v3.5.3
 [3.0.0]: https://github.com/vericto/vericto-engine/compare/v2.1.0...v3.0.0
