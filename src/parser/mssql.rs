@@ -30,7 +30,7 @@ impl Default for MsSqlParser {
 
 impl SqlParser for MsSqlParser {
     fn parse(&self, sql: &str) -> Result<ParsedQuery> {
-        parse_with_dialect(&self.dialect, sql)
+        parse_with_dialect(&self.dialect, crate::parser::Dialect::MsSql, sql)
     }
 
     fn dialect_name(&self) -> &'static str {

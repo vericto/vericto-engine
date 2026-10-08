@@ -19,7 +19,7 @@ Bumping the version here means bumping the tag in both consumers (they are usual
 Requires `libclang` and `protobuf` on the system — `pg_query` builds vendored PostgreSQL sources via bindgen.
 
 ```bash
-cargo test --all                       # 143 tests: unit, proptest, integration
+cargo test --all                       # 220 tests: unit, proptest, integration
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 
@@ -67,9 +67,9 @@ The v3.2.4 fix is the reference case: equal-severity ties used `>` (strictly gre
 
 Never let anything caller-supplied-but-unordered (slice position, HashMap iteration) influence an outcome. `src/rules/properties.rs` holds 8 proptest properties covering totality, the total order, monitor_mode safety/monotonicity, the schema-cap invariant, and serde round-trips.
 
-### Rule catalogue: 28 codes
+### Rule catalogue: 29 codes
 
-10 Critical / 14 High / 3 Medium / 1 Low, documented in the README table. Codes are grouped by number: `001-042` DML scope, `010-019` DDL, `050-061` performance, `070-090` security.
+10 Critical / 15 High / 3 Medium / 1 Low, documented in the README table. VERICTO-085 (sensitive columns, `src/sensitive/`) is the exception to "rules read `StatementInfo`": it walks the AST itself, is driven by `EnforcementPolicy::sensitive_columns` rather than the `rules` slice (its evaluator arm is a no-op), and is the only code that rewrites SQL (`EvaluationOutcome::rewritten_query`). It has its own two walkers (`pg.rs`, `sql.rs`) over shared scope/lineage logic in `sensitive/mod.rs`; the same both-walkers rule applies. Codes are grouped by number: `001-042` DML scope, `010-019` DDL, `050-061` performance, `070-090` security.
 
 Custom rules are YAML (`ast_condition_yaml`) with a required `node_type` and 8 optional `condition:` predicates. `condition` deserializes to a raw `serde_yaml::Value` specifically so `where_clause: null` (key present, value null) is distinguishable from the key being absent — a typed `Option<T>` would collapse both to `None`.
 

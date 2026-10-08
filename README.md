@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.5.3" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.6.0" }
 ```
 
 ### Quick example
@@ -169,6 +169,7 @@ Low/Informational → Monitor).
 | VERICTO-082 | GRANT / REVOKE | A `GRANT` or `REVOKE` — privilege escalation or accidental lockout. |
 | VERICTO-083 | MERGE | `MERGE INTO …` — can mass-mutate the target like an UPDATE/DELETE with no effective WHERE. |
 | VERICTO-084 | CREATE TABLE AS SELECT | `CREATE TABLE … AS SELECT …` / `SELECT … INTO` — bulk data copy that can duplicate a whole table. |
+| VERICTO-085 | Read of a sensitive column | A query projects (or copies elsewhere) a column the host tagged as sensitive. Driven by `EnforcementPolicy::sensitive_columns`, not by the rules slice; High for `block`/`mask`, Medium for `flag`. See [Sensitive columns](#sensitive-columns-vericto-085). |
 
 ### Medium
 
@@ -250,7 +251,7 @@ Every built-in code carries a static [`RuleClass`](src/rules/engine.rs) — the
 |---|---|---|
 | `SchemaMigration` | 010–019 | DROP TABLE/DATABASE/SCHEMA, TRUNCATE, ALTER TABLE, DROP INDEX. Destructive against a live database, but normal in a versioned migration. |
 | `DataMutation` | 001, 002, 003, 030, 031, 033, 040, 042, 083, 084 | Data mutation without adequate scope. Dangerous on *any* channel — a WHERE-less DELETE is never intended, even in a migration. |
-| `Security` | 070, 080, 081, 082, 090 | Injection tautologies, `COPY … PROGRAM`, `DO` blocks, GRANT/REVOKE, sleep-based probing. |
+| `Security` | 070, 080, 081, 082, 085, 090 | Injection tautologies, `COPY … PROGRAM`, `DO` blocks, GRANT/REVOKE, sleep-based probing, reads of sensitive columns. |
 | `Performance` | 050, 051, 060, 061 | Best-practice / performance hints. Advisory. |
 
 Custom rules and any unrecognized code classify as `DataMutation` — the
@@ -278,6 +279,121 @@ Under that policy `DROP TABLE users` resolves to `Flag` while
 action and can never make a channel more aggressive than the base policy. Left
 as `None` (the default) it has no effect at all, which is also how older
 serialized policies that predate the field deserialize.
+
+## Sensitive columns (VERICTO-085)
+
+The rules above protect the database from the query. Sensitive-column protection
+protects the data from whoever sent it: an agent that runs
+`SELECT email, card FROM customers` breaks nothing, and still puts personal data
+into an LLM's context. The host tags columns and gives each a policy; the engine
+decides, on the AST alone, whether the query **reads** one.
+
+```rust
+use vericto_engine::{
+    evaluate, Decision, Dialect, EnforcementPolicy, MaskStyle, SensitiveColumn, SensitivePolicy,
+};
+
+let policy = EnforcementPolicy {
+    sensitive_columns: vec![SensitiveColumn {
+        schema: None, // any schema
+        table: "customers".into(),
+        column: "email".into(),
+        policy: SensitivePolicy::Mask,
+        mask_style: MaskStyle::Email,
+    }],
+    ..EnforcementPolicy::default()
+};
+
+let outcome = evaluate("SELECT id, email FROM customers WHERE id = $1", Dialect::Postgres, &[], &policy);
+assert_eq!(outcome.decision, Decision::Flag);
+assert_eq!(outcome.rule_code.as_deref(), Some("VERICTO-085"));
+// Execute this instead of the original:
+assert_eq!(
+    outcome.rewritten_query.as_deref(),
+    Some(r"SELECT id, regexp_replace(email::text, '^(.)[^@]*(@.*)?$', E'\\1***\\2') AS email FROM customers WHERE id = $1")
+);
+assert_eq!(outcome.sensitive_columns[0].column, "email"); // for the audit trail
+```
+
+A tag is JSON-serializable as
+`{"schema": "public", "table": "customers", "column": "email", "policy": "mask", "mask_style": "email"}`
+(`schema` and `mask_style` optional). An unknown `policy` deserializes as `block`
+and an unknown `mask_style` as `full`, so a value this engine does not know never
+weakens the protection. With no tags the rule does not run at all — the only cost
+is an `is_empty()` — and every outcome is exactly what it was before.
+
+### What counts as a read
+
+A column is read when it is a source of a **projected** expression: the select
+list the client receives (every arm of a `UNION`), `RETURNING`, `COPY … TO`,
+`DECLARE … CURSOR`, `PREPARE`. Derivation follows aliases, expressions, functions,
+aggregates, casts, `CASE`, scalar subqueries, derived tables and CTEs (nested,
+recursive and data-modifying). Using a column only to filter, join, group or order
+— `WHERE`, `JOIN … ON`, `GROUP BY`, `HAVING`, `ORDER BY`, aggregate `FILTER`,
+`OVER`, `EXISTS` — is not a read: nothing of it is projected.
+
+Two things are deliberately treated as reads:
+
+- **`*`, `t.*`, whole-row references** (`to_jsonb(c)`, `row_to_json(c)`,
+  `SELECT c FROM customers c`) and `COPY table TO` touch **every** tagged column
+  of the table. The engine has no schema, so it cannot tell which columns `*`
+  expands to.
+- **Copies** — `INSERT … SELECT`, `CREATE TABLE … AS`, `SELECT … INTO`,
+  `CREATE VIEW`, `UPDATE … SET x = <tagged>`, `MERGE` — because they move the value
+  somewhere untagged that the next query reads freely. Writing a tagged column
+  into itself (`SET email = lower(email)`) is not a copy.
+
+Names resolve conservatively: an unqualified table matches a tag in any schema, a
+tag without a schema matches every schema, an unqualified column resolves against
+every relation in scope, and identifiers compare case-insensitively. A false
+positive is a blocked query with a clear message; a false negative is a leak.
+
+### Decision
+
+| Strictest policy read | Decision | `rewritten_query` |
+|---|---|---|
+| `flag` | `Flag` | `None` |
+| `mask`, rewritten (Postgres) | `Flag` — forward the **rewritten** query, record it | `Some(sql)` |
+| `mask` that cannot be applied | `Block` | `None` |
+| `block` | `Block` | `None` |
+
+Strictness is `block > mask > flag`. A mask cannot be applied to `*` / whole-row /
+`COPY table TO` (nothing to name — the message says to list the columns), to a
+copy (masking would change stored data), or on MySQL, Oracle and SQL Server in
+this release (no rewrite yet; blocking is the fail-safe direction). The column
+verdict is a **floor** over the rules: the final decision is the stricter of the
+two, and VERICTO-085 takes the flat fields only when it is the stricter one.
+`monitor_mode` turns a column block into a flag and never applies a mask (the
+would-be rewrite is in `suggested_safe_query`). With a `block` or `mask` tag
+configured, a parse error always blocks
+([`EnforcementPolicy::effective_parse_error`](src/rules/engine.rs)): a query the
+engine cannot read cannot be shown not to read a tagged column.
+
+### Mask rewrite (Postgres)
+
+Each projected expression that derives from a masked column is replaced and
+aliased to its original output name, and the statement is regenerated with
+`pg_query`'s deparser (`$n` parameters are kept; comments and formatting are not,
+so audit the original too). If anything about the rewrite fails, the query is
+**blocked** — the unmasked query is never returned as approved.
+
+| Style | Expression |
+|---|---|
+| `full` | `'[redacted]'::text` |
+| `last4` | `'****' \|\| right(col::text, 4)` |
+| `email` | `regexp_replace(col::text, '^(.)[^@]*(@.*)?$', '\1***\2')` |
+| `hash` | `encode(sha256(convert_to(col::text, 'UTF8')), 'hex')` |
+
+The tag's style applies only when the projected value **is** the column (a bare
+reference, possibly through CTEs and subqueries). Any computed value —
+`substring(card, 1, 4)`, `lower(email)`, `string_agg(…)` — is masked `full`:
+applying `last4` to a caller-chosen substring would hand out any four characters.
+A masked column becomes `text`. `ORDER BY` / `GROUP BY` items that referred to a
+masked output keep sorting and grouping by the original value.
+
+`tests/mask_equivalence.rs` runs every rewrite against a real Postgres and checks
+that unmasked columns are identical row for row and masked ones match their style
+(set `VERICTO_EQUIV_PSQL` to a `psql` command line).
 
 ## Custom rules (YAML)
 
@@ -329,6 +445,10 @@ vericto-engine/
 ├── src/
 │   ├── lib.rs          ← public API + evaluate() convenience fn
 │   ├── error.rs        ← ProxyError, Result
+│   ├── sensitive/      ← VERICTO-085: sensitive-column derivation + mask rewrite
+│   │   ├── mod.rs      ← tags, scopes, lineage, verdict
+│   │   ├── pg.rs       ← pg_query walker + rewrite
+│   │   └── sql.rs      ← sqlparser walker (MySQL/Oracle/MSSQL)
 │   ├── parser/
 │   │   ├── mod.rs      ← SqlParser trait, parser_for(), Dialect enum
 │   │   ├── postgres.rs ← pg_query backend

@@ -7,7 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.6.0] — 2026-10-07
+
+Sensitive Column Protection: a new rule, VERICTO-085, that blocks, flags or masks
+any query that reads a column the host marks as sensitive. Additive: a host that
+sends no tags gets exactly the outcome it got from 3.5.3, at the cost of one
+`is_empty()` check.
+
+### Added
+
+- **VERICTO-085 — read of a sensitive column.** Blocking a destructive statement
+  protects the database from an agent; it does nothing about an agent that reads
+  what it should not. `SELECT email, card FROM customers` is harmless to the
+  database and still puts personal and payment data into an LLM's context. Hosts
+  now pass tagged columns in the new `EnforcementPolicy::sensitive_columns`
+  (`SensitiveColumn { schema, table, column, policy, mask_style }`), each with a
+  policy — `block`, `flag` or `mask` — and the engine decides from the AST alone
+  whether the query reads one. Strictest wins: `block > mask > flag`. The rule is
+  driven by the tags, not by the `rules` slice (listing the code there is a
+  no-op), and is classified `Security`, so no channel cap softens it.
+
+  A read is a projection, not a mention. The engine follows every projected
+  expression back to its source columns — through aliases, expressions, functions,
+  aggregates, casts, scalar subqueries, derived tables and nested, recursive and
+  data-modifying CTEs — across the select list, every arm of a set operation,
+  `RETURNING`, `COPY … TO`, cursors and `PREPARE`. A column used only in `WHERE`,
+  `JOIN … ON`, `GROUP BY`, `HAVING`, `ORDER BY`, `FILTER`, `OVER` or `EXISTS` is not
+  read. Two cases are reads on purpose: `*`, `t.*` and whole-row references
+  (`to_jsonb(c)`) touch every tagged column of the table, because the engine has
+  no schema to expand them with; and copies (`INSERT … SELECT`, `CREATE TABLE AS`,
+  `SELECT INTO`, `CREATE VIEW`, `UPDATE … SET`, `MERGE`) count, because they move
+  the value somewhere untagged that the next query reads freely. Names resolve
+  conservatively — unqualified tables match any schema, unqualified columns every
+  relation in scope, identifiers case-insensitively — since a false positive is a
+  blocked query with a clear message and a false negative is a leak. Both walkers
+  implement it: `pg_query` for Postgres, `sqlparser` for MySQL, Oracle and SQL
+  Server.
+
+- **Masking by rewrite, Postgres only.** Under `mask`, each projected expression
+  derived from a masked column is replaced by its mask (`full`, `last4`, `email`,
+  `hash`) under its original output name, and the statement is regenerated with
+  `pg_query`'s deparser into the new `EvaluationOutcome::rewritten_query`, which a
+  host must execute instead of the original. `$n` parameters survive. The tag's
+  style applies only when the value *is* the column; any computed value is masked
+  `full`, because `last4` over a caller-chosen `substring` would hand out any four
+  characters and the hash of one character is a lookup. `ORDER BY`/`GROUP BY` items
+  that named a masked output keep using the original value. Any failure to rewrite
+  or deparse blocks: the unmasked query is never returned as approved. A mask that
+  cannot be applied — `*`, a copy, or a non-Postgres dialect in this release —
+  blocks too, with a message saying why. A successful mask resolves to `Flag`
+  (forward the rewrite, record it), between a flag and a block.
+
+- **`EvaluationOutcome::sensitive_columns`**, every tagged column a query reads,
+  sorted, for the audit trail, and **`EnforcementPolicy::effective_parse_error()`**:
+  with a `block` or `mask` tag configured, a parse error blocks regardless of
+  `parse_error`, since a query the engine cannot read cannot be shown not to read a
+  tagged column, and syntax the parser rejects but the database accepts would
+  otherwise be a way around every tag. Hosts that branch on the parse-error action
+  themselves should call it instead of reading the field.
+
+### Changed
+
+- **`EnforcementPolicy` is no longer `Copy`**, because it now carries the tags. It
+  is still `Clone`, `Eq` and serde-compatible, and a serialized policy without
+  `sensitive_columns` deserializes as before. Code that built it with
+  `..EnforcementPolicy::default()` and passed `&policy` — both first-party hosts —
+  compiles unchanged; code that relied on implicit copies needs `.clone()`.
+- `ParsedQuery` keeps the parser's syntax tree (moved, not copied) so the
+  sensitive-column pass does not parse twice. It has a private field, so it can no
+  longer be built with a struct literal outside the crate; nothing constructed it
+  that way.
+
 ### Documentation
+
 
 - **Contributions need the Vericto Contributor License Agreement.** `CONTRIBUTING.md`
   said a CLA *or* a DCO sign-off was required without saying how to give either, and
@@ -803,7 +875,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.5.3...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.6.0...HEAD
+[3.6.0]: https://github.com/vericto/vericto-engine/compare/v3.5.3...v3.6.0
 [3.5.3]: https://github.com/vericto/vericto-engine/compare/v3.5.2...v3.5.3
 [3.0.0]: https://github.com/vericto/vericto-engine/compare/v2.1.0...v3.0.0
 [2.1.0]: https://github.com/vericto/vericto-engine/compare/v2.0.0...v2.1.0

@@ -21,7 +21,11 @@ use sqlparser::parser::Parser as SqlAstParser;
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub fn parse_with_dialect<D: SqlDialect>(dialect: &D, sql: &str) -> Result<ParsedQuery> {
+pub fn parse_with_dialect<D: SqlDialect>(
+    dialect: &D,
+    which: crate::parser::Dialect,
+    sql: &str,
+) -> Result<ParsedQuery> {
     // Before the parser recurses on this string. `parse_sql` descends recursively,
     // so deeply nested input overflows the stack inside sqlparser — which aborts the
     // process rather than returning an error we could map. See
@@ -38,6 +42,10 @@ pub fn parse_with_dialect<D: SqlDialect>(dialect: &D, sql: &str) -> Result<Parse
 
     Ok(ParsedQuery {
         statements: collected,
+        ast: crate::parser::SourceAst::Sql {
+            statements: std::sync::Arc::new(statements),
+            dialect: which,
+        },
     })
 }
 
@@ -844,7 +852,8 @@ mod tests {
     use sqlparser::dialect::PostgreSqlDialect;
 
     fn parse_pg(sql: &str) -> ParsedQuery {
-        parse_with_dialect(&PostgreSqlDialect {}, sql).expect("must parse")
+        parse_with_dialect(&PostgreSqlDialect {}, crate::parser::Dialect::Postgres, sql)
+            .expect("must parse")
     }
 
     #[test]

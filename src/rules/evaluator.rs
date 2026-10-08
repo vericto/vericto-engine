@@ -395,6 +395,13 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
+        // VERICTO-085: read of a sensitive column. Not a predicate over
+        // `StatementInfo`: it is driven by `EnforcementPolicy::sensitive_columns`
+        // and evaluated in `RuleEngine::evaluate` (see `crate::sensitive`),
+        // because it needs the projections and the host's tags. Listing the
+        // code in the `rules` slice is therefore a no-op.
+        "VERICTO-085" => None,
+
         // ── SQL injection ─────────────────────────────────────────────────
 
         // VERICTO-090: SQL injection tautology — OR branch in WHERE is always true

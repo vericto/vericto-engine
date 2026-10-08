@@ -36,7 +36,7 @@ impl Default for OracleParser {
 
 impl SqlParser for OracleParser {
     fn parse(&self, sql: &str) -> Result<ParsedQuery> {
-        parse_with_dialect(&self.dialect, sql)
+        parse_with_dialect(&self.dialect, crate::parser::Dialect::Oracle, sql)
     }
 
     fn dialect_name(&self) -> &'static str {
