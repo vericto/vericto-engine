@@ -213,6 +213,25 @@ impl Default for StatementInfo {
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
     pub statements: Vec<StatementInfo>,
+    /// The syntax tree the statements were read from, kept for the
+    /// sensitive-column analysis (VERICTO-085), which needs the projections
+    /// themselves rather than the flattened `StatementInfo`. Moved in from
+    /// the parser, not copied, so keeping it costs nothing; it is only walked
+    /// when the policy carries tags.
+    pub(crate) ast: SourceAst,
+}
+
+/// The parser's own tree, behind an `Arc` so cloning a `ParsedQuery` stays cheap.
+#[derive(Debug, Clone)]
+pub(crate) enum SourceAst {
+    /// No tree kept (never produced by the built-in parsers).
+    #[allow(dead_code)]
+    None,
+    Pg(std::sync::Arc<pg_query::protobuf::ParseResult>),
+    Sql {
+        statements: std::sync::Arc<Vec<sqlparser::ast::Statement>>,
+        dialect: Dialect,
+    },
 }
 
 /// Common interface for dialect-specific parsers (Strategy Pattern).

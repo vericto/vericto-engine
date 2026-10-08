@@ -30,7 +30,7 @@ impl Default for MySqlParser {
 
 impl SqlParser for MySqlParser {
     fn parse(&self, sql: &str) -> Result<ParsedQuery> {
-        parse_with_dialect(&self.dialect, sql)
+        parse_with_dialect(&self.dialect, crate::parser::Dialect::Mysql, sql)
     }
 
     fn dialect_name(&self) -> &'static str {

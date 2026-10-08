@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.5.3" }
+//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.6.0" }
 //! ```
 //!
 //! ```rust
@@ -36,6 +36,7 @@
 pub mod error;
 pub mod parser;
 pub mod rules;
+pub mod sensitive;
 
 // Re-export the most commonly used types at the crate root for ergonomics.
 pub use error::{ProxyError, Result};
@@ -44,11 +45,16 @@ pub use rules::engine::{
     Decision, EnforcementAction, EnforcementPolicy, EvaluationOutcome, ParseErrorAction,
     ReportedViolation, Rule, RuleClass, RuleEngine, RuleType, Severity,
 };
+pub use sensitive::{
+    MaskStyle, SENSITIVE_RULE_CODE, SensitiveColumn, SensitivePolicy, TouchedColumn,
+};
 
 /// Convenience function: parse + evaluate in one call.
 ///
 /// On parse error, resolves the decision from `policy.parse_error`
-/// (R5.5/R5.6) instead of failing closed unconditionally.
+/// (R5.5/R5.6) instead of failing closed unconditionally — except that a
+/// `block`/`mask` sensitive column forces `Block`
+/// ([`EnforcementPolicy::effective_parse_error`]).
 pub fn evaluate(
     sql: &str,
     dialect: Dialect,
@@ -60,7 +66,7 @@ pub fn evaluate(
         Ok(parsed) => RuleEngine::evaluate(&parsed, rules, policy),
         Err(e) => EvaluationOutcome {
             decision: policy.parse_error_decision(),
-            action: Some(match policy.parse_error {
+            action: Some(match policy.effective_parse_error() {
                 ParseErrorAction::Block => EnforcementAction::Block,
                 ParseErrorAction::AllowReport => EnforcementAction::Flag,
             }),
@@ -76,6 +82,8 @@ pub fn evaluate(
             // telemetry, not a catalogue entry, and putting it here would make
             // `violations` disagree with "every rule this query broke".
             violations: Vec::new(),
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
         },
     }
 }

@@ -105,3 +105,37 @@ fn custom_rule_example_scopes_correctly() {
         Decision::Allow
     );
 }
+
+#[test]
+fn sensitive_columns_example() {
+    use vericto_engine::{
+        Decision, Dialect, EnforcementPolicy, MaskStyle, SensitiveColumn, SensitivePolicy, evaluate,
+    };
+
+    let policy = EnforcementPolicy {
+        sensitive_columns: vec![SensitiveColumn {
+            schema: None, // any schema
+            table: "customers".into(),
+            column: "email".into(),
+            policy: SensitivePolicy::Mask,
+            mask_style: MaskStyle::Email,
+        }],
+        ..EnforcementPolicy::default()
+    };
+
+    let outcome = evaluate(
+        "SELECT id, email FROM customers WHERE id = $1",
+        Dialect::Postgres,
+        &[],
+        &policy,
+    );
+    assert_eq!(outcome.decision, Decision::Flag);
+    assert_eq!(outcome.rule_code.as_deref(), Some("VERICTO-085"));
+    assert_eq!(
+        outcome.rewritten_query.as_deref(),
+        Some(
+            r"SELECT id, regexp_replace(email::text, '^(.)[^@]*(@.*)?$', E'\\1***\\2') AS email FROM customers WHERE id = $1"
+        )
+    );
+    assert_eq!(outcome.sensitive_columns[0].column, "email");
+}

@@ -80,6 +80,7 @@ fn policy_strategy() -> impl Strategy<Value = EnforcementPolicy> {
                     parse_error,
                     monitor_mode,
                     schema_migration_cap,
+                    sensitive_columns: Vec::new(),
                 }
             },
         )
@@ -220,7 +221,7 @@ proptest! {
         policy in policy_strategy(),
         s in severity_strategy(),
     ) {
-        let mut with_monitor = policy;
+        let mut with_monitor = policy.clone();
         with_monitor.monitor_mode = true;
         let mut without_monitor = policy;
         without_monitor.monitor_mode = false;
