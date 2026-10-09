@@ -402,6 +402,12 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         // code in the `rules` slice is therefore a no-op.
         "VERICTO-085" => None,
 
+        // VERICTO-086: MySQL text the engine cannot read the way MySQL does.
+        // Not a predicate either: `RuleEngine::evaluate` returns it from the
+        // MySQL parser's lexical normalization, whatever the `rules` slice
+        // holds (see `crate::parser::mysql_lex`). A no-op here.
+        "VERICTO-086" => None,
+
         // ── SQL injection ─────────────────────────────────────────────────
 
         // VERICTO-090: SQL injection tautology — OR branch in WHERE is always true

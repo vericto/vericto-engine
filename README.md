@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.6.1" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.7.0" }
 ```
 
 ### Quick example
@@ -149,6 +149,7 @@ Low/Informational → Monitor).
 | VERICTO-042 | UPDATE without WHERE | An `UPDATE` with no `WHERE` (or an always-true one) — rewrites every row. |
 | VERICTO-080 | COPY … TO/FROM PROGRAM | `COPY … PROGRAM '…'` runs a shell command on the database host — remote code execution / data-exfiltration channel. (PostgreSQL.) |
 | VERICTO-081 | DO anonymous code block | `DO $$ … $$` runs an arbitrary PL/pgSQL body that can hide any DML/DDL; opaque to the SQL parser. (PostgreSQL.) |
+| VERICTO-086 | SQL text MySQL and the engine would read differently | MySQL text the engine cannot resolve to one statement with certainty, because of differences between MySQL's and the engine's reading of comments and string escapes. Every rule is evaluated on the statement MySQL executes (comments read by MySQL's rules, string literals under both string-escape modes, the strictest outcome kept); this blocks what that cannot settle. Not enabled through the rules slice, not a parse error: always blocks (flags under `monitor_mode`). (MySQL.) |
 | VERICTO-090 | OR tautology in WHERE (SQL injection) | A `WHERE` with a trivially-true `OR` branch (`… OR 1=1`) — the canonical injection bypass. Covers SELECT/DELETE/UPDATE at any depth. |
 
 ### High
@@ -353,14 +354,15 @@ positive is a blocked query with a clear message; a false negative is a leak.
 | Strictest policy read | Decision | `rewritten_query` |
 |---|---|---|
 | `flag` | `Flag` | `None` |
-| `mask`, rewritten (Postgres) | `Flag` — forward the **rewritten** query, record it | `Some(sql)` |
+| `mask`, rewritten (Postgres, MySQL) | `Flag` — forward the **rewritten** query, record it | `Some(sql)` |
 | `mask` that cannot be applied | `Block` | `None` |
 | `block` | `Block` | `None` |
 
 Strictness is `block > mask > flag`. A mask cannot be applied to `*` / whole-row /
 `COPY table TO` (nothing to name — the message says to list the columns), to a
-copy (masking would change stored data), or on MySQL, Oracle and SQL Server in
-this release (no rewrite yet; blocking is the fail-safe direction). The column
+copy (masking would change stored data), on MySQL to a statement the engine
+cannot print back faithfully (see below), or on Oracle and SQL Server (no rewrite
+yet; blocking is the fail-safe direction). The column
 verdict is a **floor** over the rules: the final decision is the stricter of the
 two, and VERICTO-085 takes the flat fields only when it is the stricter one.
 `monitor_mode` turns a column block into a flag and never applies a mask (the
@@ -388,12 +390,57 @@ The tag's style applies only when the projected value **is** the column (a bare
 reference, possibly through CTEs and subqueries). Any computed value —
 `substring(card, 1, 4)`, `lower(email)`, `string_agg(…)` — is masked `full`:
 applying `last4` to a caller-chosen substring would hand out any four characters.
-A masked column becomes `text`. `ORDER BY` / `GROUP BY` items that referred to a
+A computed value masked `full` keeps the expression and discards its value,
+`concat('[redacted]'::text, left((expr)::text, 0))`, so its `$n` parameters stay
+in place and an aggregate still returns one row. A masked column becomes `text`. `ORDER BY` / `GROUP BY` items that referred to a
 masked output keep sorting and grouping by the original value.
 
 `tests/mask_equivalence.rs` runs every rewrite against a real Postgres and checks
 that unmasked columns are identical row for row and masked ones match their style
 (set `VERICTO_EQUIV_PSQL` to a `psql` command line).
+
+### Mask rewrite (MySQL)
+
+The same rewrite on MySQL — and on MariaDB and Aurora MySQL, which use the same
+dialect — printed back from the sqlparser tree. The masks use only functions that
+MySQL 5.7, 8.0, Aurora MySQL 2/3 and MariaDB all have, and return exactly what the
+Postgres masks return for the same text (NULL stays NULL except under `full`):
+
+| Style | Expression (`x` = `(CONVERT((col) USING utf8mb4) COLLATE utf8mb4_bin)`) |
+|---|---|
+| `full` | `'[redacted]'` (a computed value: `CONCAT('[redacted]', COALESCE(LEFT(x, 0), ''))`) |
+| `last4` | `CONCAT('****', RIGHT(x, 4))` |
+| `email` | `CASE WHEN CHAR_LENGTH(x) = 0 THEN x WHEN LOCATE('@', x, 2) > 0 THEN CONCAT(LEFT(x, 1), '***', SUBSTRING(x, LOCATE('@', x, 2))) ELSE CONCAT(LEFT(x, 1), '***') END` |
+| `hash` | `SHA2(x, 256)` |
+
+`x` gives the same characters and UTF-8 bytes whatever the column's or the
+connection's charset, and its explicit collation lets the masked value be
+`UNION`ed, compared or concatenated with a column of any collation
+(`CAST(col AS CHAR)` raises "Illegal mix of collations" there). A replaced
+projection keeps MySQL's output name: the column name as written, or an
+unaliased expression's own text.
+
+MySQL binds `?` by position. The engine numbers the client's `?` before parsing
+and only forwards a rewrite whose `?` are all there, once each, in the same order
+(`LIMIT ?, ?` keeps its comma form). It also checks that the unmodified statement
+prints back to the client's own tokens — string literals verbatim, so the result
+does not depend on the server's string-escape mode — and that the rewrite parses back to
+itself. When any check fails, the query is **blocked**. Statements that block
+instead of rewriting: optimizer hints, the SELECT modifiers sqlparser does not
+know, bit literals, a `GROUP BY` / `HAVING` / `ORDER BY` expression naming a masked
+alias, and everything sqlparser 0.52 does not parse (index hints, `LOCK IN SHARE
+MODE`, `WITH ROLLUP`, `INTO OUTFILE`, …).
+
+MySQL text that sqlparser would read differently from MySQL, because of how
+MySQL reads comments and string escapes, cannot be analysed for sensitive columns
+and resolves like a parse error (blocked under a `block` or `mask` tag). A quote
+inside a string literal should be doubled rather than backslash-escaped.
+
+`tests/mysql_mask_equivalence.rs` runs every rewrite against real MySQL servers,
+over the text and the binary protocol (prepared statements with bound `?`), on
+utf8mb4 tables with a non-default collation and a latin1 table, and compares the
+masked values with the Postgres ones (set `VERICTO_EQUIV_MYSQL` to a JSON
+connection object or array, with the `mysql2` Node driver on `NODE_PATH`).
 
 ## Custom rules (YAML)
 
@@ -445,7 +492,7 @@ vericto-engine/
 ├── src/
 │   ├── lib.rs          ← public API + evaluate() convenience fn
 │   ├── error.rs        ← ProxyError, Result
-│   ├── sensitive/      ← VERICTO-085: sensitive-column derivation + mask rewrite
+│   ├── sensitive/      ← VERICTO-085: sensitive-column derivation + mask rewrite (pg.rs, sql.rs, mysql.rs)
 │   │   ├── mod.rs      ← tags, scopes, lineage, verdict
 │   │   ├── pg.rs       ← pg_query walker + rewrite
 │   │   └── sql.rs      ← sqlparser walker (MySQL/Oracle/MSSQL)

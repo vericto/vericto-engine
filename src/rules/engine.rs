@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
-use crate::parser::ParsedQuery;
+use crate::parser::{MysqlReadings, ParsedQuery};
 use crate::rules::evaluator;
 use crate::sensitive::{
     self, SENSITIVE_RULE_CODE, SensitiveColumn, SensitivePolicy, TouchedColumn,
@@ -103,7 +103,7 @@ impl RuleClass {
             }
             // Security
             "VERICTO-070" | "VERICTO-080" | "VERICTO-081" | "VERICTO-082" | "VERICTO-085"
-            | "VERICTO-090" => RuleClass::Security,
+            | "VERICTO-086" | "VERICTO-090" => RuleClass::Security,
             // Performance / best-practice
             "VERICTO-050" | "VERICTO-051" | "VERICTO-060" | "VERICTO-061" => RuleClass::Performance,
             // Custom rules / unknown codes: conservative default.
@@ -391,6 +391,16 @@ impl EvaluationOutcome {
     }
 }
 
+/// VERICTO-086: SQL text that MySQL and the engine would read differently.
+///
+/// Returned (Critical, Security) when the MySQL text holds a construct the
+/// lexical normalization cannot resolve with certainty. The engine cannot know which
+/// statement the server would execute, so it blocks. Like VERICTO-085 it is
+/// not enabled through the `rules` slice and does not go through the severity
+/// mapping: it always blocks, except under `monitor_mode`, which never blocks.
+/// Deliberately not a `VERICTO-PARSE-ERROR`: a fail-open host forwards those.
+pub const TEXT_DIVERGENCE_RULE_CODE: &str = "VERICTO-086";
+
 /// The rule engine. Evaluates a parsed query against the active rules and
 /// returns the highest-severity violation (or ALLOW if none is violated).
 pub struct RuleEngine;
@@ -409,7 +419,62 @@ impl RuleEngine {
     /// lowest `code` wins. The order of `rules` never affects the outcome, so
     /// the same query and ruleset always report the same violation regardless of
     /// how the host assembled the slice.
+    ///
+    /// MySQL text that MySQL reads differently from sqlparser (see
+    /// `parser::mysql_lex`) carries every statement the server may execute:
+    /// each is evaluated and the strictest outcome wins (block, then flag or
+    /// mask, then monitor, then allow; on a tie the base reading's). Text that
+    /// cannot be read with certainty blocks with [`TEXT_DIVERGENCE_RULE_CODE`].
     pub fn evaluate(
+        parsed: &ParsedQuery,
+        rules: &[Rule],
+        policy: &EnforcementPolicy,
+    ) -> EvaluationOutcome {
+        let alternatives = match parsed.mysql.as_deref() {
+            None => return Self::evaluate_reading(parsed, rules, policy),
+            Some(MysqlReadings::Ambiguous(why)) => return divergence_outcome(why, policy),
+            Some(MysqlReadings::Alternatives(alts)) => alts,
+        };
+        let mut outcome = Self::evaluate_reading(parsed, rules, policy);
+        for alt in alternatives {
+            // VERICTO-085 already ran on the client's text, through a front
+            // end that refuses every one of these constructs; the other
+            // readings only need the rules.
+            let other = match alt {
+                Ok(p) => Self::evaluate_rules(p, rules, policy),
+                Err(e) => parse_error_outcome(e, policy),
+            };
+            if strictness(&other) > strictness(&outcome) {
+                // A stricter outcome never forwards a rewrite (a rewrite is a
+                // flag, so the stricter one is a block); the tagged columns the
+                // client's text reads stay in the audit trail.
+                let touched = std::mem::take(&mut outcome.sensitive_columns);
+                outcome = other;
+                outcome.sensitive_columns = touched;
+                outcome.rewritten_query = None;
+            }
+        }
+        outcome
+    }
+
+    /// One reading: the rules, then the sensitive columns.
+    fn evaluate_reading(
+        parsed: &ParsedQuery,
+        rules: &[Rule],
+        policy: &EnforcementPolicy,
+    ) -> EvaluationOutcome {
+        let outcome = Self::evaluate_rules(parsed, rules, policy);
+        // The only cost when no column is tagged: this check.
+        if policy.sensitive_columns.is_empty() {
+            return outcome;
+        }
+        match sensitive::evaluate(parsed, &policy.sensitive_columns) {
+            Some(verdict) => apply_sensitive(outcome, verdict, policy),
+            None => outcome,
+        }
+    }
+
+    fn evaluate_rules(
         parsed: &ParsedQuery,
         rules: &[Rule],
         policy: &EnforcementPolicy,
@@ -451,7 +516,7 @@ impl RuleEngine {
             other => other,
         });
 
-        let outcome = match violations.first() {
+        match violations.first() {
             None => EvaluationOutcome::allowed(),
             Some(winner) => {
                 // `decision` and `action` come from the winner alone, exactly as
@@ -472,16 +537,80 @@ impl RuleEngine {
                     sensitive_columns: Vec::new(),
                 }
             }
-        };
+        }
+    }
+}
 
-        // The only cost when no column is tagged: this check.
-        if policy.sensitive_columns.is_empty() {
-            return outcome;
-        }
-        match sensitive::evaluate(parsed, &policy.sensitive_columns) {
-            Some(verdict) => apply_sensitive(outcome, verdict, policy),
-            None => outcome,
-        }
+/// The outcome for text that does not parse (R5.5/R5.6): resolved from
+/// [`EnforcementPolicy::effective_parse_error`], reported as
+/// `VERICTO-PARSE-ERROR` at Medium.
+pub(crate) fn parse_error_outcome(
+    err: impl std::fmt::Display,
+    policy: &EnforcementPolicy,
+) -> EvaluationOutcome {
+    EvaluationOutcome {
+        decision: policy.parse_error_decision(),
+        action: Some(match policy.effective_parse_error() {
+            ParseErrorAction::Block => EnforcementAction::Block,
+            ParseErrorAction::AllowReport => EnforcementAction::Flag,
+        }),
+        // Parse-error telemetry severity is Medium by product decision (R8.6).
+        severity: Some(Severity::Medium),
+        rule_id: None,
+        rule_code: Some("VERICTO-PARSE-ERROR".to_string()),
+        ast_node_path: Some(format!("PARSE_ERROR: {err}")),
+        estimated_rows_affected: None,
+        suggested_safe_query: None,
+        // A parse error is not a rule violation: nothing was evaluated, so
+        // there is no set to report. The pseudo-code in `rule_code` is
+        // telemetry, not a catalogue entry, and putting it here would make
+        // `violations` disagree with "every rule this query broke".
+        violations: Vec::new(),
+        rewritten_query: None,
+        sensitive_columns: Vec::new(),
+    }
+}
+
+/// VERICTO-086: the text cannot be read the way MySQL reads it.
+fn divergence_outcome(why: &str, policy: &EnforcementPolicy) -> EvaluationOutcome {
+    // monitor_mode never blocks (dry-run), and still reports.
+    let action = if policy.monitor_mode {
+        EnforcementAction::Flag
+    } else {
+        EnforcementAction::Block
+    };
+    let v = ReportedViolation {
+        rule_id: TEXT_DIVERGENCE_RULE_CODE.to_string(),
+        rule_code: TEXT_DIVERGENCE_RULE_CODE.to_string(),
+        severity: Severity::Critical,
+        action,
+        ast_node_path: format!("LexicalDivergence > MySQL may read this text differently ({why})"),
+        estimated_rows_affected: None,
+        suggested_safe_query: None,
+    };
+    EvaluationOutcome {
+        decision: Decision::from_action(action),
+        action: Some(action),
+        severity: Some(v.severity),
+        rule_id: Some(v.rule_id.clone()),
+        rule_code: Some(v.rule_code.clone()),
+        ast_node_path: Some(v.ast_node_path.clone()),
+        estimated_rows_affected: None,
+        suggested_safe_query: None,
+        violations: vec![v],
+        rewritten_query: None,
+        sensitive_columns: Vec::new(),
+    }
+}
+
+/// Strictness of an outcome: block > flag (a mask is a flag) > monitor >
+/// allow.
+fn strictness(o: &EvaluationOutcome) -> u8 {
+    match (o.decision, o.action) {
+        (Decision::Block, _) => 3,
+        (Decision::Flag, _) => 2,
+        (Decision::Allow, Some(EnforcementAction::Monitor)) => 1,
+        (Decision::Allow, _) => 0,
     }
 }
 

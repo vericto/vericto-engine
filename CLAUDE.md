@@ -19,7 +19,7 @@ Bumping the version here means bumping the tag in both consumers (they are usual
 Requires `libclang` and `protobuf` on the system — `pg_query` builds vendored PostgreSQL sources via bindgen.
 
 ```bash
-cargo test --all                       # 220 tests: unit, proptest, integration
+cargo test --all                       # 269 tests: unit, proptest, integration
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 
@@ -67,9 +67,9 @@ The v3.2.4 fix is the reference case: equal-severity ties used `>` (strictly gre
 
 Never let anything caller-supplied-but-unordered (slice position, HashMap iteration) influence an outcome. `src/rules/properties.rs` holds 8 proptest properties covering totality, the total order, monitor_mode safety/monotonicity, the schema-cap invariant, and serde round-trips.
 
-### Rule catalogue: 29 codes
+### Rule catalogue: 30 codes
 
-10 Critical / 15 High / 3 Medium / 1 Low, documented in the README table. VERICTO-085 (sensitive columns, `src/sensitive/`) is the exception to "rules read `StatementInfo`": it walks the AST itself, is driven by `EnforcementPolicy::sensitive_columns` rather than the `rules` slice (its evaluator arm is a no-op), and is the only code that rewrites SQL (`EvaluationOutcome::rewritten_query`). It has its own two walkers (`pg.rs`, `sql.rs`) over shared scope/lineage logic in `sensitive/mod.rs`; the same both-walkers rule applies. Codes are grouped by number: `001-042` DML scope, `010-019` DDL, `050-061` performance, `070-090` security.
+11 Critical / 15 High / 3 Medium / 1 Low, documented in the README table. VERICTO-085 (sensitive columns, `src/sensitive/`) is the exception to "rules read `StatementInfo`": it walks the AST itself, is driven by `EnforcementPolicy::sensitive_columns` rather than the `rules` slice (its evaluator arm is a no-op), and is the only code that rewrites SQL (`EvaluationOutcome::rewritten_query`). It has its own two walkers (`pg.rs`, `sql.rs`) over shared scope/lineage logic in `sensitive/mod.rs`; the same both-walkers rule applies. VERICTO-086 (MySQL text the engine cannot read the way MySQL does) is the other engine-driven code: the MySQL parser normalizes the text with MySQL's lexical rules (`src/parser/mysql_lex.rs`: comments by MySQL's rules, both string-escape modes) and hands the rule engine every statement the server may execute, which evaluates each and keeps the strictest; text it cannot resolve comes back as an `Ok(ParsedQuery)` the engine blocks with 086, never as a parse error. Text without those constructs takes the old path unchanged, pinned by the golden corpus `tests/mysql_orm_corpus.rs`. Codes are grouped by number: `001-042` DML scope, `010-019` DDL, `050-061` performance, `070-090` security.
 
 Custom rules are YAML (`ast_condition_yaml`) with a required `node_type` and 8 optional `condition:` predicates. `condition` deserializes to a raw `serde_yaml::Value` specifically so `where_clause: null` (key present, value null) is distinguishable from the key being absent — a typed `Option<T>` would collapse both to `None`.
 

@@ -124,6 +124,12 @@ const CASES: &[Case] = &[
         None,
         &[("bin", MaskStyle::Full)],
     ),
+    (
+        // An aggregate masked `full` must still return ONE row.
+        "SELECT string_agg(email, ',' ORDER BY id) AS all_emails, count(*) AS n FROM customers",
+        None,
+        &[("all_emails", MaskStyle::Full)],
+    ),
 ];
 
 fn policy() -> EnforcementPolicy {

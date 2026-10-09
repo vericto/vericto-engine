@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.6.1" }
+//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.7.0" }
 //! ```
 //!
 //! ```rust
@@ -43,7 +43,7 @@ pub use error::{ProxyError, Result};
 pub use parser::Dialect;
 pub use rules::engine::{
     Decision, EnforcementAction, EnforcementPolicy, EvaluationOutcome, ParseErrorAction,
-    ReportedViolation, Rule, RuleClass, RuleEngine, RuleType, Severity,
+    ReportedViolation, Rule, RuleClass, RuleEngine, RuleType, Severity, TEXT_DIVERGENCE_RULE_CODE,
 };
 pub use sensitive::{
     MaskStyle, SENSITIVE_RULE_CODE, SensitiveColumn, SensitivePolicy, TouchedColumn,
@@ -64,26 +64,6 @@ pub fn evaluate(
     let parser = parser::parser_for(dialect);
     match parser.parse(sql) {
         Ok(parsed) => RuleEngine::evaluate(&parsed, rules, policy),
-        Err(e) => EvaluationOutcome {
-            decision: policy.parse_error_decision(),
-            action: Some(match policy.effective_parse_error() {
-                ParseErrorAction::Block => EnforcementAction::Block,
-                ParseErrorAction::AllowReport => EnforcementAction::Flag,
-            }),
-            // Parse-error telemetry severity is Medium by product decision (R8.6).
-            severity: Some(Severity::Medium),
-            rule_id: None,
-            rule_code: Some("VERICTO-PARSE-ERROR".to_string()),
-            ast_node_path: Some(format!("PARSE_ERROR: {e}")),
-            estimated_rows_affected: None,
-            suggested_safe_query: None,
-            // A parse error is not a rule violation: nothing was evaluated, so
-            // there is no set to report. The pseudo-code in `rule_code` is
-            // telemetry, not a catalogue entry, and putting it here would make
-            // `violations` disagree with "every rule this query broke".
-            violations: Vec::new(),
-            rewritten_query: None,
-            sensitive_columns: Vec::new(),
-        },
+        Err(e) => rules::engine::parse_error_outcome(e, policy),
     }
 }
