@@ -699,3 +699,55 @@ fn mysql_masks_equal_the_postgres_masks() {
         pg_rows.len()
     );
 }
+
+// ── Lexical normalization ──────────────────────────────────────────────────
+
+/// The MySQL lexical normalization (3.7.0) evaluates what the server runs:
+/// for each text, one of the engine's readings (the strings asserted in
+/// `parser::mysql_lex`'s unit tests) returns on a real server exactly what
+/// the client's text returns. SELECTs only, with no database: nothing is
+/// created, changed or dropped. The other string-escape mode would need a `SET`, so
+/// the escape modes are covered by the unit tests alone.
+#[test]
+fn mysql_executes_the_normalized_text() {
+    let configs = servers();
+    if configs.is_empty() {
+        eprintln!("VERICTO_EQUIV_MYSQL not set: skipping");
+        return;
+    }
+    // (client text, the reading a MySQL 8 server executes)
+    let cases = [
+        // executed comment: the base reading
+        ("SELECT 1 /*!50000 + 1 */ AS v", "SELECT 1   + 1   AS v"),
+        ("SELECT 1 /*! + 1 */ AS v", "SELECT 1   + 1   AS v"),
+        // a version above the server's: skipped, the other reading
+        ("SELECT 1 /*!99999 + 1 */ AS v", "SELECT 1   AS v"),
+        // MariaDB-only: skipped by MySQL, the other reading
+        ("SELECT 1 /*M! + 1 */ AS v", "SELECT 1   AS v"),
+        // comment start rule
+        ("SELECT 1 --1 AS v", "SELECT 1 - -1 AS v"),
+        ("SELECT 1 ---1 AS v", "SELECT 1 - - -1 AS v"),
+        // comments are whitespace
+        ("SELECT 2 -- 1\n AS v", "SELECT 2  \n AS v"),
+        ("SELECT 3 # 1\n AS v", "SELECT 3  \n AS v"),
+        ("SELECT 4/**/AS v", "SELECT 4 AS v"),
+        // a backslash escape under the server's default mode: the base
+        // reading is the client's text
+        (r"SELECT 'a\'b' AS v", r"SELECT 'a\'b' AS v"),
+    ];
+    for config in configs {
+        let requests: Vec<Value> = cases
+            .iter()
+            .flat_map(|(a, b)| [a, b])
+            .map(|sql| json!({ "sql": sql, "params": null }))
+            .collect();
+        let res = run_node(&config, Value::Array(requests));
+        for (i, (client, reading)) in cases.iter().enumerate() {
+            let (c, r) = (&res[2 * i], &res[2 * i + 1]);
+            assert_eq!(c["ok"], json!(true), "{client}: {}", c["error"]);
+            assert_eq!(r["ok"], json!(true), "{reading}: {}", r["error"]);
+            assert_eq!(c["rows"], r["rows"], "{client} vs {reading}");
+            eprintln!("ok: {client:?} = {reading:?} → {}", c["rows"]);
+        }
+    }
+}

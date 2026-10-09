@@ -6,6 +6,7 @@
 
 pub mod mssql;
 pub mod mysql;
+pub(crate) mod mysql_lex;
 pub mod oracle;
 pub mod pg_ast;
 pub mod postgres;
@@ -219,13 +220,29 @@ pub struct ParsedQuery {
     /// the parser, not copied, so keeping it costs nothing; it is only walked
     /// when the policy carries tags.
     pub(crate) ast: SourceAst,
+    /// MySQL only, and only when the text holds a construct MySQL reads
+    /// differently from sqlparser (see [`mysql_lex`]): `statements` and `ast`
+    /// are then the base reading, and this carries the rest. `None` for every
+    /// other text, which is evaluated exactly as before.
+    pub(crate) mysql: Option<std::sync::Arc<MysqlReadings>>,
+}
+
+/// The other statements MySQL may execute for the client's text.
+#[derive(Debug)]
+pub(crate) enum MysqlReadings {
+    /// The text cannot be read with certainty (VERICTO-086). `statements` is
+    /// empty.
+    Ambiguous(String),
+    /// Each other reading (another server version, or the other escape
+    /// mode): parsed, or the parse error.
+    Alternatives(Vec<std::result::Result<ParsedQuery, String>>),
 }
 
 /// The parser's own tree, behind an `Arc` so cloning a `ParsedQuery` stays cheap.
 #[derive(Debug, Clone)]
 pub(crate) enum SourceAst {
-    /// No tree kept (never produced by the built-in parsers).
-    #[allow(dead_code)]
+    /// No tree kept: MySQL text that cannot be read with certainty
+    /// ([`MysqlReadings::Ambiguous`]), which is never analysed.
     None,
     Pg(std::sync::Arc<pg_query::protobuf::ParseResult>),
     Sql {

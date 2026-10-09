@@ -11,9 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 VERICTO-085 `mask` now rewrites on MySQL (and MariaDB / Aurora MySQL through the
 same dialect) instead of blocking, and the MySQL analysis reads the text the way
-MySQL does, closing several ways to hide a read from it. No API change: the same
-types, fields, JSON and decision mapping as 3.6; `rewritten_query` is now `Some`
-for a successful MySQL mask too.
+MySQL does, closing several ways to hide a read from it. Every rule on MySQL now
+runs on the statement MySQL executes (see **Security**). No breaking API change:
+the same types, fields, JSON and decision mapping as 3.6; `rewritten_query` is
+now `Some` for a successful MySQL mask too, and there is one new rule code,
+VERICTO-086.
 
 ### Added
 
@@ -64,11 +66,9 @@ for a successful MySQL mask too.
   the SELECT modifiers are removed before the analysis so it sees what MySQL
   reads. Only hosts that send tags are affected; with no tags nothing changes.
 
-  **Scope:** this re-reading runs only inside the sensitive-column analysis. A
-  host that sends no tags gets exactly the 3.6.1 outcome for every one of these
-  forms of text (no new `PARSE_ERROR`, no new block, under either `parse_error`
-  setting); the rule engine's own parsing is unchanged. Pinned by
-  `mysql_text_handling_is_inert_without_tags`.
+  **Scope:** this re-reading runs inside the sensitive-column analysis, which
+  runs only when tags are sent. The rule engine reads MySQL text the way MySQL
+  does too, for every rule and every policy: see **Security** below.
 
 - **More copies are reads on MySQL (and the other sqlparser dialects).**
   `SET @v = (SELECT email …)` and `ON DUPLICATE KEY UPDATE x = (SELECT email …)` /
@@ -87,6 +87,31 @@ for a successful MySQL mask too.
   `CONCAT('[redacted]', COALESCE(LEFT(x, 0), ''))` on MySQL: the expression still
   runs and still decides the row count, and the output is still exactly
   `'[redacted]'`. A bare column masked `full` is still the plain constant.
+
+### Security
+
+- Fixed rule evasion on MySQL caused by differences between MySQL's and the
+  engine's reading of comments and string escapes. Affects all MySQL
+  evaluations; upgrading is recommended.
+
+  Every rule now runs on the statement MySQL executes. Before any rule runs, the
+  MySQL parser reads the text with MySQL's lexical rules: comments are read the
+  way MySQL reads them (for every server version, keeping the strictest
+  outcome), and a string literal containing a backslash is read under both
+  settings of the server's string-escape mode, again keeping the strictest outcome
+  (block, then flag or mask, then monitor, then allow). Text without these
+  constructs is evaluated exactly as before, byte for byte; a regression corpus
+  of ORM-generated MySQL queries (`tests/mysql_orm_corpus.rs`) has identical
+  outcomes before and after. Postgres, Oracle and SQL Server are unaffected.
+
+  Text the engine cannot resolve to one statement with certainty now blocks with
+  the new Security rule **VERICTO-086** (SQL text that MySQL and the engine would
+  read differently), Critical, whatever the `rules` slice holds and under either
+  `parse_error` setting; under `monitor_mode` it flags. It is not a
+  `VERICTO-PARSE-ERROR`, which a fail-open policy would forward. Hosts that call
+  `parser_for(Dialect::Mysql).parse()` and `RuleEngine::evaluate()` separately
+  receive it from `evaluate()`, not as a parse error. The code is exported as
+  `TEXT_DIVERGENCE_RULE_CODE`.
 
 ## [3.6.1] — 2026-10-08
 

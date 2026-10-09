@@ -26,6 +26,18 @@ pub fn parse_with_dialect<D: SqlDialect>(
     which: crate::parser::Dialect,
     sql: &str,
 ) -> Result<ParsedQuery> {
+    parse_text(dialect, which, sql, sql)
+}
+
+/// Parses `sql`, keeping `original` (the client's text) for the MySQL
+/// sensitive-column analysis. They differ only when the MySQL parser hands in
+/// its lexical normalization of `original` (see `parser::mysql_lex`).
+pub(crate) fn parse_text<D: SqlDialect>(
+    dialect: &D,
+    which: crate::parser::Dialect,
+    sql: &str,
+    original: &str,
+) -> Result<ParsedQuery> {
     // Before the parser recurses on this string. `parse_sql` descends recursively,
     // so deeply nested input overflows the stack inside sqlparser — which aborts the
     // process rather than returning an error we could map. See
@@ -45,8 +57,9 @@ pub fn parse_with_dialect<D: SqlDialect>(
         ast: crate::parser::SourceAst::Sql {
             statements: std::sync::Arc::new(statements),
             dialect: which,
-            sql: (which == crate::parser::Dialect::Mysql).then(|| std::sync::Arc::from(sql)),
+            sql: (which == crate::parser::Dialect::Mysql).then(|| std::sync::Arc::from(original)),
         },
+        mysql: None,
     })
 }
 

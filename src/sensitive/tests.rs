@@ -1087,8 +1087,6 @@ fn mysql_text_sqlparser_reads_differently_cannot_hide_a_read() {
         "SELECT id, /*! email, */ id FROM customers",
         "SELECT id /*!50000 , email */ FROM customers",
         "SELECT id /*M! , email */ FROM customers",
-        // MySQL and sqlparser disagree on where the comment ends.
-        "SELECT id /* /* */ , email FROM customers -- */",
         "SELECT 0 --card\n FROM customers",
         // The literal ends at a different place in each string-escape mode
         // (measured on 8.0).
@@ -1108,6 +1106,18 @@ fn mysql_text_sqlparser_reads_differently_cannot_hide_a_read() {
         let o = eval_on(sql, Dialect::Mysql, vec![]);
         assert_eq!(o.decision, Decision::Allow, "no tags: unchanged: {sql}");
     }
+    // MySQL and sqlparser disagree on where this comment ends, and MySQL's own
+    // reading depends on context: the engine does not guess, VERICTO-086
+    // blocks it whatever the tags (3.7.0).
+    for cols in [tags(), vec![tag("customers", "email", Flag)], vec![]] {
+        let o = eval_on(
+            "SELECT id /* /* */ , email FROM customers -- */",
+            Dialect::Mysql,
+            cols,
+        );
+        assert_eq!(o.decision, Decision::Block, "{o:?}");
+        assert_eq!(o.rule_code.as_deref(), Some("VERICTO-086"), "{o:?}");
+    }
     // A real comment, and `-- ` with a space, are fine.
     for sql in [
         "SELECT id /* email */ FROM customers",
@@ -1122,13 +1132,14 @@ fn mysql_text_sqlparser_reads_differently_cannot_hide_a_read() {
 
 #[test]
 fn mysql_text_handling_is_inert_without_tags() {
-    // 3.7.0 re-reads MySQL text only inside the sensitive-column analysis,
-    // which never runs without tags: untagged evaluation of these forms is
-    // exactly 3.6.1's (no new PARSE_ERROR, no new block).
+    // The sensitive-column analysis never runs without tags, and the rule
+    // engine's own reading of these forms (lexical normalization, 3.7.0)
+    // finds nothing to report with no rules: no PARSE_ERROR, no block. The
+    // one form the normalization cannot resolve blocks
+    // with VERICTO-086 (see mysql_text_sqlparser_reads_differently_…).
     for sql in [
         r"SELECT id, 'it\'s' FROM customers",
         "SELECT id, /*! name, */ id FROM customers",
-        "SELECT id /* /* */ , name FROM customers -- */",
         "SELECT 0 --x\n FROM customers",
         "SELECT HIGH_PRIORITY name FROM customers",
         "SELECT SQL_CALC_FOUND_ROWS id FROM customers LIMIT 10",
