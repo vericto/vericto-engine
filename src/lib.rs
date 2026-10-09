@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.7.0" }
+//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.8.0" }
 //! ```
 //!
 //! ```rust
@@ -33,12 +33,17 @@
 //! assert!(result.decision == Decision::Block);
 //! ```
 
+pub mod access;
 pub mod error;
 pub mod parser;
 pub mod rules;
 pub mod sensitive;
 
 // Re-export the most commonly used types at the crate root for ergonomics.
+pub use access::{
+    ACCESS_RULE_CODE, AccessColumns, AccessEntry, AccessLevel, AccessMode, AccessPolicy,
+    AccessPolicyMap, DdlPolicy, DeniedRef, Needed,
+};
 pub use error::{ProxyError, Result};
 pub use parser::Dialect;
 pub use rules::engine::{
@@ -53,8 +58,9 @@ pub use sensitive::{
 ///
 /// On parse error, resolves the decision from `policy.parse_error`
 /// (R5.5/R5.6) instead of failing closed unconditionally — except that a
-/// `block`/`mask` sensitive column forces `Block`
-/// ([`EnforcementPolicy::effective_parse_error`]).
+/// `block`/`mask` sensitive column, or an enforced agent allowlist (except for
+/// session boilerplate), forces `Block`
+/// ([`EnforcementPolicy::effective_parse_error_for`]).
 pub fn evaluate(
     sql: &str,
     dialect: Dialect,
@@ -64,6 +70,8 @@ pub fn evaluate(
     let parser = parser::parser_for(dialect);
     match parser.parse(sql) {
         Ok(parsed) => RuleEngine::evaluate(&parsed, rules, policy),
-        Err(e) => rules::engine::parse_error_outcome(e, policy),
+        Err(e) => {
+            rules::engine::parse_error_outcome_as(e, policy.effective_parse_error_for(sql, dialect))
+        }
     }
 }

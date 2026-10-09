@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
+use crate::access::{self, ACCESS_RULE_CODE, AccessMode, AccessPolicy, DeniedRef};
 use crate::parser::{MysqlReadings, ParsedQuery};
 use crate::rules::evaluator;
 use crate::sensitive::{
@@ -103,7 +104,7 @@ impl RuleClass {
             }
             // Security
             "VERICTO-070" | "VERICTO-080" | "VERICTO-081" | "VERICTO-082" | "VERICTO-085"
-            | "VERICTO-086" | "VERICTO-090" => RuleClass::Security,
+            | "VERICTO-086" | "VERICTO-087" | "VERICTO-090" => RuleClass::Security,
             // Performance / best-practice
             "VERICTO-050" | "VERICTO-051" | "VERICTO-060" | "VERICTO-061" => RuleClass::Performance,
             // Custom rules / unknown codes: conservative default.
@@ -173,6 +174,13 @@ pub struct EnforcementPolicy {
     /// tags alone drive it. See [`crate::sensitive`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sensitive_columns: Vec<SensitiveColumn>,
+    /// The allowlist of the identity making this call (VERICTO-087): the API
+    /// key, or the database user of a proxy session; the host picks it (see
+    /// [`crate::AccessPolicyMap`]). `None` = no allowlist for this identity:
+    /// the analysis does not run and the outcome is exactly what it was
+    /// before the field existed. See [`crate::access`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_policy: Option<AccessPolicy>,
 }
 
 impl Default for EnforcementPolicy {
@@ -189,6 +197,7 @@ impl Default for EnforcementPolicy {
             monitor_mode: false,
             schema_migration_cap: None,
             sensitive_columns: Vec::new(),
+            access_policy: None,
         }
     }
 }
@@ -248,13 +257,60 @@ impl EnforcementPolicy {
     /// database accepts. `flag`-only tags keep the host's choice — flagging is
     /// what a parse error already does.
     ///
+    /// The same holds for an agent allowlist in `enforce` mode (VERICTO-087):
+    /// a statement the engine cannot read cannot be shown to stay inside it.
+    /// In `observe` mode the host's choice stands.
+    ///
     /// Hosts that branch on the parse-error action themselves must use this,
     /// not the raw field.
+    /// [`effective_parse_error`](Self::effective_parse_error) for the text
+    /// `sql` that did not parse. Identical, except that the allowlist does not
+    /// force a block when `sql` is one of the session statements drivers and
+    /// ORMs send on every connection (`SET SESSION TRANSACTION ISOLATION LEVEL
+    /// …`, `SET NAMES …`, `BEGIN`, … — a closed list, see
+    /// `crate::access::session`): sqlparser rejects some of them, and blocking
+    /// them would break every connection of an agent identity. A
+    /// `block`/`mask` tag still forces a block.
+    ///
+    /// Hosts that parse themselves and branch on the parse-error action must
+    /// call this (with the client's text) instead of `effective_parse_error`.
+    pub fn effective_parse_error_for(
+        &self,
+        sql: &str,
+        dialect: crate::parser::Dialect,
+    ) -> ParseErrorAction {
+        let enforced = self
+            .access_policy
+            .as_ref()
+            .is_some_and(|p| p.mode == AccessMode::Enforce);
+        if enforced && access::session::is_session_boilerplate(sql, dialect) {
+            self.parse_error_ignoring_access()
+        } else {
+            self.effective_parse_error()
+        }
+    }
+
+    fn parse_error_ignoring_access(&self) -> ParseErrorAction {
+        if self
+            .sensitive_columns
+            .iter()
+            .any(|c| c.policy != SensitivePolicy::Flag)
+        {
+            ParseErrorAction::Block
+        } else {
+            self.parse_error
+        }
+    }
+
     pub fn effective_parse_error(&self) -> ParseErrorAction {
         let protective = self
             .sensitive_columns
             .iter()
-            .any(|c| c.policy != SensitivePolicy::Flag);
+            .any(|c| c.policy != SensitivePolicy::Flag)
+            || self
+                .access_policy
+                .as_ref()
+                .is_some_and(|p| p.mode == AccessMode::Enforce);
         if protective {
             ParseErrorAction::Block
         } else {
@@ -371,6 +427,10 @@ pub struct EvaluationOutcome {
     /// sorted, for the audit trail. Empty when none is read, and always empty
     /// when the policy carries no tags.
     pub sensitive_columns: Vec<TouchedColumn>,
+    /// Every reference the identity's allowlist denied (VERICTO-087),
+    /// deduplicated and sorted, for the audit trail. Filled in `observe` mode
+    /// too. Always empty when the policy carries no `access_policy`.
+    pub access_denied: Vec<DeniedRef>,
 }
 
 impl EvaluationOutcome {
@@ -387,6 +447,7 @@ impl EvaluationOutcome {
             violations: Vec::new(),
             rewritten_query: None,
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         }
     }
 }
@@ -439,9 +500,10 @@ impl RuleEngine {
         for alt in alternatives {
             // VERICTO-085 already ran on the client's text, through a front
             // end that refuses every one of these constructs; the other
-            // readings only need the rules.
-            let other = match alt {
-                Ok(p) => Self::evaluate_rules(p, rules, policy),
+            // readings need the rules and the identity's allowlist (each is a
+            // statement the server may execute).
+            let mut other = match alt {
+                Ok(p) => Self::with_access(Self::evaluate_rules(p, rules, policy), p, policy),
                 Err(e) => parse_error_outcome(e, policy),
             };
             if strictness(&other) > strictness(&outcome) {
@@ -449,27 +511,49 @@ impl RuleEngine {
                 // flag, so the stricter one is a block); the tagged columns the
                 // client's text reads stay in the audit trail.
                 let touched = std::mem::take(&mut outcome.sensitive_columns);
-                outcome = other;
+                let denied = std::mem::take(&mut outcome.access_denied);
+                std::mem::swap(&mut outcome, &mut other);
                 outcome.sensitive_columns = touched;
                 outcome.rewritten_query = None;
+                other.access_denied = denied;
             }
+            // Every reading's denials stay in the audit trail.
+            union_denied(&mut outcome.access_denied, other.access_denied);
         }
         outcome
     }
 
-    /// One reading: the rules, then the sensitive columns.
+    /// One reading: the rules, then the sensitive columns, then the
+    /// identity's allowlist (design §6.1 precedence: applied after 085, so a
+    /// `block` tag keeps the flat fields and an allowed `mask` keeps its
+    /// rewrite).
     fn evaluate_reading(
         parsed: &ParsedQuery,
         rules: &[Rule],
         policy: &EnforcementPolicy,
     ) -> EvaluationOutcome {
-        let outcome = Self::evaluate_rules(parsed, rules, policy);
+        let mut outcome = Self::evaluate_rules(parsed, rules, policy);
         // The only cost when no column is tagged: this check.
-        if policy.sensitive_columns.is_empty() {
-            return outcome;
+        if !policy.sensitive_columns.is_empty() {
+            if let Some(verdict) = sensitive::evaluate(parsed, &policy.sensitive_columns) {
+                outcome = apply_sensitive(outcome, verdict, policy);
+            }
         }
-        match sensitive::evaluate(parsed, &policy.sensitive_columns) {
-            Some(verdict) => apply_sensitive(outcome, verdict, policy),
+        Self::with_access(outcome, parsed, policy)
+    }
+
+    /// Folds the identity's allowlist (VERICTO-087) into `outcome`. The only
+    /// cost without a policy: this check.
+    fn with_access(
+        outcome: EvaluationOutcome,
+        parsed: &ParsedQuery,
+        policy: &EnforcementPolicy,
+    ) -> EvaluationOutcome {
+        let Some(access_policy) = policy.access_policy.as_ref() else {
+            return outcome;
+        };
+        match access::evaluate(parsed, access_policy) {
+            Some(verdict) => apply_access(outcome, verdict, policy),
             None => outcome,
         }
     }
@@ -535,6 +619,7 @@ impl RuleEngine {
                     violations,
                     rewritten_query: None,
                     sensitive_columns: Vec::new(),
+                    access_denied: Vec::new(),
                 }
             }
         }
@@ -548,9 +633,21 @@ pub(crate) fn parse_error_outcome(
     err: impl std::fmt::Display,
     policy: &EnforcementPolicy,
 ) -> EvaluationOutcome {
+    parse_error_outcome_as(err, policy.effective_parse_error())
+}
+
+/// [`parse_error_outcome`] with the action already resolved (see
+/// [`EnforcementPolicy::effective_parse_error_for`]).
+pub(crate) fn parse_error_outcome_as(
+    err: impl std::fmt::Display,
+    resolved: ParseErrorAction,
+) -> EvaluationOutcome {
     EvaluationOutcome {
-        decision: policy.parse_error_decision(),
-        action: Some(match policy.effective_parse_error() {
+        decision: match resolved {
+            ParseErrorAction::AllowReport => Decision::Flag,
+            ParseErrorAction::Block => Decision::Block,
+        },
+        action: Some(match resolved {
             ParseErrorAction::Block => EnforcementAction::Block,
             ParseErrorAction::AllowReport => EnforcementAction::Flag,
         }),
@@ -568,6 +665,7 @@ pub(crate) fn parse_error_outcome(
         violations: Vec::new(),
         rewritten_query: None,
         sensitive_columns: Vec::new(),
+        access_denied: Vec::new(),
     }
 }
 
@@ -600,6 +698,7 @@ fn divergence_outcome(why: &str, policy: &EnforcementPolicy) -> EvaluationOutcom
         violations: vec![v],
         rewritten_query: None,
         sensitive_columns: Vec::new(),
+        access_denied: Vec::new(),
     }
 }
 
@@ -695,6 +794,76 @@ fn apply_sensitive(
     };
     outcome.sensitive_columns = verdict.touched;
     outcome
+}
+
+/// Folds the allowlist verdict (VERICTO-087) into the outcome so far (rules,
+/// then VERICTO-085).
+///
+/// Like the column verdict, a floor: the final decision is the strictest.
+/// VERICTO-087 takes the flat fields only when it is **strictly** stricter, so
+/// a VERICTO-085 block keeps them (design §6.1 step 1: a `block` tag always
+/// wins) and otherwise joins `violations` at its (severity desc, code asc)
+/// position. A block clears any mask rewrite: a refused query is never
+/// forwarded, masked or not. Under `mode = observe` (and `monitor_mode`) it
+/// flags and never blocks, and an allowed mask keeps its rewrite (steps 3/4
+/// still apply).
+fn apply_access(
+    mut outcome: EvaluationOutcome,
+    verdict: access::AccessVerdict,
+    policy: &EnforcementPolicy,
+) -> EvaluationOutcome {
+    let action = if verdict.mode == AccessMode::Observe || policy.monitor_mode {
+        EnforcementAction::Flag
+    } else {
+        EnforcementAction::Block
+    };
+    let v = ReportedViolation {
+        rule_id: ACCESS_RULE_CODE.to_string(),
+        rule_code: ACCESS_RULE_CODE.to_string(),
+        severity: Severity::High,
+        action,
+        ast_node_path: verdict.ast_node_path,
+        estimated_rows_affected: None,
+        suggested_safe_query: verdict.suggested_safe_query,
+    };
+    let decision = Decision::from_action(action);
+    let stricter = decision_rank(decision) > decision_rank(outcome.decision);
+    if stricter || outcome.violations.is_empty() {
+        outcome.decision = decision;
+        outcome.action = Some(action);
+        outcome.severity = Some(v.severity);
+        outcome.rule_id = Some(v.rule_id.clone());
+        outcome.rule_code = Some(v.rule_code.clone());
+        outcome.ast_node_path = Some(v.ast_node_path.clone());
+        outcome.estimated_rows_affected = None;
+        outcome.suggested_safe_query = v.suggested_safe_query.clone();
+        outcome.violations.insert(0, v);
+    } else {
+        let pos = outcome.violations[1..]
+            .iter()
+            .position(|o| match v.severity.cmp(&o.severity) {
+                Ordering::Greater => true,
+                Ordering::Equal => v.rule_code < o.rule_code,
+                Ordering::Less => false,
+            })
+            .map_or(outcome.violations.len(), |p| p + 1);
+        outcome.violations.insert(pos, v);
+    }
+    if outcome.decision == Decision::Block {
+        outcome.rewritten_query = None;
+    }
+    union_denied(&mut outcome.access_denied, verdict.denied);
+    outcome
+}
+
+/// Adds `more` to `into`, keeping it sorted and free of duplicates.
+fn union_denied(into: &mut Vec<DeniedRef>, more: Vec<DeniedRef>) {
+    if more.is_empty() {
+        return;
+    }
+    into.extend(more);
+    into.sort();
+    into.dedup();
 }
 
 fn decision_rank(d: Decision) -> u8 {
@@ -899,6 +1068,9 @@ mod tests {
             "VERICTO-080",
             "VERICTO-081",
             "VERICTO-082",
+            "VERICTO-085",
+            "VERICTO-086",
+            "VERICTO-087",
             "VERICTO-090",
         ] {
             assert_eq!(RuleClass::for_code(c), Security, "{c}");

@@ -7,6 +7,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.8.0] — 2026-10-09
+
+Agent access allowlists: a new rule, **VERICTO-087 "Access outside the agent's
+allowlist"**, that confines the identity making a call — an API key, or the
+database user of a proxy session — to the tables, columns and writes it was
+granted, deny by default. It is driven by a new optional field,
+`EnforcementPolicy::access_policy`; with it absent (the default) the analysis does
+not run and every outcome is exactly what 3.7.0 returned. No breaking change to
+the decision of any existing caller; one new field on `EvaluationOutcome`
+(`access_denied`), so a host that builds the struct with a literal adds
+`access_denied: Vec::new()`.
+
+### Added
+
+- **`AccessPolicy`** (`mode: observe | enforce`, `entries`, `ddl: deny`) and
+  **`AccessEntry`** (`schema?`, `table`, `columns: "*" | [..]`,
+  `access: read | read_write`), serde-compatible with the dashboard's JSON. Absent
+  or unknown values fail safe: an unknown `mode` enforces, an unknown `access` is
+  `read`, and a `columns` value other than `"*"` never widens to every column.
+  **`AccessPolicyMap`** carries one policy per database user (with an optional
+  `"*"` default) and selects the session's with `for_user`, so the TCP proxy and
+  the sidecar share one selection rule. Exported at the crate root with
+  `DeniedRef`, `Needed` and `ACCESS_RULE_CODE`.
+- **VERICTO-087** (High, `Security`). Stricter than VERICTO-085 on purpose: 085
+  counts what a query projects, 087 counts **every reference**, because a
+  predicate lets an agent probe a value it may not read (`WHERE salary > 100000`
+  answers the question without returning the column). The select list, `WHERE`,
+  `JOIN … ON`/`USING`/`NATURAL`, `GROUP BY`, `HAVING`, `ORDER BY`, windows,
+  aggregate `FILTER`/`ORDER BY`, `LIMIT`, subqueries anywhere (including
+  `EXISTS`), CTEs (recursive and data-modifying), every arm of a set operation,
+  `RETURNING`, upserts, `MERGE`, and the arguments of `CALL`/`EXECUTE`. Every table
+  in `FROM` counts even when none of its columns is named. `*`, `t.*`, whole-row
+  references, `COPY t TO` and MySQL `DESCRIBE t` need every column granted. Writes
+  need `read_write`: each column an `INSERT` lists or an `UPDATE` assigns, every
+  column for an `INSERT` without a list, a `DELETE`, a `REPLACE` or a `COPY … FROM`
+  without a list. DDL is always denied, and so are the statements that change who
+  the session is or how unqualified names resolve (`SET ROLE`,
+  `SET SESSION AUTHORIZATION`, `SET search_path` and its `set_config` form,
+  `USE`); any statement kind not known to be harmless is denied as well.
+  Transaction control, settings, cursors, prepared statements and function calls
+  are allowed. The catalogue (`information_schema`, `pg_catalog`, `mysql`,
+  `performance_schema`, `sys`) is denied unless an entry names that schema; an
+  unqualified `pg_*` relation is `pg_catalog`'s, and MySQL `SHOW TABLES` and its
+  siblings read `information_schema`.
+- **The derivation is VERICTO-085's**, not a second one: the same two walkers
+  (`pg_query` for Postgres, `sqlparser` for MySQL, Oracle and SQL Server) run in an
+  access mode that records every resolution instead of matching tags and visits
+  the clauses 085 skips. Aliases, expressions, CTE and subquery pass-through, set
+  operations and correlated references resolve exactly as they do for sensitive
+  columns. On MySQL it runs on the statement MySQL executes (the 3.7.0 lexical
+  normalization, every reading), so a predicate inside `/*! … */` counts.
+- **Conservative name resolution.** An unqualified column resolves against every
+  relation in scope, the outer ones of a correlated subquery included, and must be
+  allowed in all of them; otherwise it is denied and the message says to qualify
+  it. An unqualified table matches an entry without a schema, or `public`
+  (Postgres) / `dbo` (SQL Server); a qualifier that names nothing in scope is
+  taken as a table. This refuses some legitimate queries
+  (`… WHERE id IN (SELECT customer_id FROM orders)` from `customers` when
+  `customers` has no `customer_id` grant) rather than guess which table a name
+  belongs to: the engine has no schema.
+- **`EvaluationOutcome::access_denied`**: every denied reference
+  (`{schema, table, column, needed: read | write | ddl}`), sorted, for the audit
+  trail, filled in `observe` mode too. `ast_node_path` names the first one —
+  `AccessPolicy > public.customers.email (read)`, `AccessPolicy > customers.* (read):
+  list the columns explicitly`, `AccessPolicy > DROP (ddl): denied for this
+  identity` — and counts the rest (`(+2 more)`).
+
+### Changed
+
+- **Precedence with VERICTO-085** (design §6.1), applied in that order: a `block`
+  tag always wins and keeps the flat fields; then a denial (block under `enforce`,
+  flag under `observe`); then an allowed `mask` keeps its rewrite; otherwise the
+  query is allowed. A denial clears `rewritten_query` — a refused query is never
+  forwarded, masked or not. `monitor_mode` turns a denial into a flag, as it does
+  every block. The rules slice is unaffected and stays a floor alongside both.
+- **`SET` is deny by default for an agent identity.** A closed list of the
+  session settings drivers and ORMs send (transaction characteristics, character
+  sets and collations, time zone, timeouts, `autocommit`, `sql_auto_is_null`,
+  `sql_select_limit`, `session_track_*`, `application_name`, date/interval
+  styles, `work_mem` and the other memory settings, `bytea_output`,
+  `standard_conforming_strings = on`) is allowed with literal values; any other
+  setting is denied, because a literal can still be dangerous
+  (`session_replication_role = replica` turns off triggers and foreign keys,
+  `foreign_key_checks = 0`, `sql_log_bin = 0`). `sql_mode` is allowed only when
+  built from literals, `@@sql_mode` and `CONCAT()` and no resulting mode switches
+  on `ANSI_QUOTES`, `NO_BACKSLASH_ESCAPES`, `PIPES_AS_CONCAT` or a combination
+  mode that implies them — they change how MySQL lexes every later statement;
+  Rails' connection setup passes. `SET GLOBAL`/`PERSIST`, a subquery or function
+  value, and a multi-assignment with any denied part are denied.
+- **`effective_parse_error()`** is `Block` under an enforced allowlist, as it
+  already is with a `block`/`mask` tag: a statement the engine cannot read cannot
+  be shown to stay inside the allowlist. The new
+  **`effective_parse_error_for(sql, dialect)`** is the same except for the session
+  statements above, matched on the normalized text, one statement only, with the
+  same value rules: they keep the host's parse-error choice, since sqlparser
+  0.52 rejects some of them (Django's MySQL `SET SESSION TRANSACTION ISOLATION
+  LEVEL READ COMMITTED`) and blocking them would break every connection. Hosts
+  that parse themselves (the proxy, the sidecar) must call it with the client's
+  text.
+
+### Unchanged, and how it is pinned
+
+- `access_policy: None` changes nothing: the 3.7.0 ORM golden corpus
+  (`tests/mysql_orm_corpus.rs`, unchanged fixture) produces the same outcomes, the
+  policy JSON is the 3.7.0 JSON, and a counter test shows the analysis is never
+  entered. An agent granted every table its ORM uses gets exactly the decision it
+  gets without an allowlist on every corpus query (except the parse error above).
+- VERICTO-085 outcomes are unchanged: the walkers' access mode is a separate
+  flag, and the whole sensitive-column suite passes as before.
+
 ## [3.7.0] — 2026-10-08
 
 VERICTO-085 `mask` now rewrites on MySQL (and MariaDB / Aurora MySQL through the
@@ -1000,7 +1110,9 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.6.1...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.8.0...HEAD
+[3.8.0]: https://github.com/vericto/vericto-engine/compare/v3.7.0...v3.8.0
+[3.7.0]: https://github.com/vericto/vericto-engine/compare/v3.6.1...v3.7.0
 [3.6.1]: https://github.com/vericto/vericto-engine/compare/v3.6.0...v3.6.1
 [3.6.0]: https://github.com/vericto/vericto-engine/compare/v3.5.3...v3.6.0
 [3.5.3]: https://github.com/vericto/vericto-engine/compare/v3.5.2...v3.5.3

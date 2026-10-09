@@ -41,6 +41,7 @@ pub(crate) fn analyze(
         touches: Touches::default(),
         rewrite: any_mask,
         rewrote: false,
+        all: false,
     };
     for raw in tree.stmts.iter_mut() {
         if let Some(node) = raw.stmt.as_deref_mut().and_then(|n| n.node.as_mut()) {
@@ -62,6 +63,23 @@ pub(crate) fn analyze(
     Ok((w.touches, rewrite))
 }
 
+/// The access analysis (VERICTO-087) of one statement: the same walk, with
+/// `tags` collecting every resolution and every clause visited (see
+/// [`crate::access`]). The statement is the caller's clone; nothing is
+/// rewritten.
+pub(crate) fn access_walk(node: &mut NodeEnum, tags: &Tags) -> Result<()> {
+    let mut w = Walker {
+        tags,
+        scopes: Scopes::default(),
+        ctes: Vec::new(),
+        touches: Touches::default(),
+        rewrite: false,
+        rewrote: false,
+        all: true,
+    };
+    w.stmt(node, 0)
+}
+
 #[cfg(test)]
 thread_local! {
     /// Lets a test prove that a deparse failure blocks (deparse of a tree
@@ -79,6 +97,9 @@ struct Walker<'a, 't> {
     /// Whether client-visible projections may be rewritten (some tag is a mask).
     rewrite: bool,
     rewrote: bool,
+    /// The access analysis: every clause counts (WHERE, JOIN, GROUP BY, …),
+    /// not only what is projected, and tables and write targets are recorded.
+    all: bool,
 }
 
 fn too_deep(depth: usize) -> Result<()> {
@@ -150,7 +171,35 @@ impl Walker<'_, '_> {
             NodeEnum::UpdateStmt(_) | NodeEnum::DeleteStmt(_) | NodeEnum::MergeStmt(_) => {
                 self.dml(node, Some(visible), depth + 1)?;
             }
+            NodeEnum::CopyStmt(c) if c.is_from => {
+                // Only reached by the access analysis (085 reads nothing here):
+                // `COPY t [(cols)] FROM` writes those columns, or every one.
+                if let Some(rel) = c.relation.as_ref() {
+                    let schema = non_empty(&rel.schemaname);
+                    self.tags.write(schema, &rel.relname, None);
+                    if c.attlist.is_empty() {
+                        self.tags.write(schema, &rel.relname, Some("*"));
+                    }
+                    for a in &c.attlist {
+                        if let Some(col) = str_of(a) {
+                            self.tags.write(schema, &rel.relname, Some(col));
+                        }
+                    }
+                    if self.all {
+                        if let Some(w) = c.where_clause.as_deref_mut() {
+                            self.scopes.push();
+                            self.scopes.add(base_item(rel));
+                            let r = self.expr(w, depth + 1);
+                            self.scopes.pop();
+                            r?;
+                        }
+                    }
+                }
+            }
             NodeEnum::CopyStmt(c) if !c.is_from => {
+                if let Some(rel) = c.relation.as_ref() {
+                    self.tags.relation(non_empty(&rel.schemaname), &rel.relname);
+                }
                 if let Some(q) = c.query.as_deref_mut() {
                     self.query(q, Some(visible), depth + 1)?;
                 } else if let Some(rel) = c.relation.as_ref() {
@@ -305,7 +354,13 @@ impl Walker<'_, '_> {
                 Some(r) => self.select(r, sink, depth + 1)?,
                 None => Vec::new(),
             };
-            self.combine(l, r)
+            let out = self.combine(l, r);
+            if self.all {
+                // ORDER BY / LIMIT of the whole set operation: output names
+                // or positions, or expressions over the enclosing scopes.
+                self.order_and_limit(s, &out, depth + 1)?;
+            }
+            out
         } else {
             self.scopes.push();
             let res = self.simple_select(s, sink, depth + 1);
@@ -353,14 +408,61 @@ impl Walker<'_, '_> {
         }
 
         if !s.values_lists.is_empty() {
-            return self.values(&mut s.values_lists, sink, depth + 1);
+            let outs = self.values(&mut s.values_lists, sink, depth + 1)?;
+            if self.all {
+                // `VALUES … ORDER BY (SELECT …) LIMIT …`
+                self.order_and_limit(s, &outs, depth + 1)?;
+            }
+            return Ok(outs);
         }
 
         let (outs, rewritten, has_star) = self.targets(&mut s.target_list, sink, depth + 1)?;
         if !rewritten.is_empty() && s.distinct_clause.is_empty() {
             fix_order_and_group(s, &rewritten, has_star);
         }
+        if self.all {
+            self.select_clauses(s, &outs, depth + 1)?;
+        }
         Ok(outs)
+    }
+
+    /// Access analysis: every clause of a simple `SELECT` besides its target
+    /// list and `FROM`. A predicate lets the caller probe a value it cannot
+    /// read, so it counts as much as a projection.
+    fn select_clauses(&mut self, s: &mut SelectStmt, outs: &[OutCol], depth: usize) -> Result<()> {
+        self.opt(s.where_clause.as_deref_mut(), depth)?;
+        // GROUP BY prefers the input column over an output alias of the same
+        // name: resolved as an input column (conservative).
+        self.exprs(&mut s.group_clause, depth)?;
+        self.opt(s.having_clause.as_deref_mut(), depth)?;
+        self.exprs(&mut s.window_clause, depth)?;
+        self.exprs(&mut s.distinct_clause, depth)?;
+        self.order_and_limit(s, outs, depth)
+    }
+
+    /// Access analysis: `ORDER BY` (a bare name equal to an output column IS
+    /// that output, already counted), `LIMIT`, `OFFSET`.
+    fn order_and_limit(&mut self, s: &mut SelectStmt, outs: &[OutCol], depth: usize) -> Result<()> {
+        for item in s.sort_clause.iter_mut() {
+            let Some(NodeEnum::SortBy(sb)) = item.node.as_mut() else {
+                self.expr(item, depth)?;
+                continue;
+            };
+            let output = match sb.node.as_deref().and_then(|n| n.node.as_ref()) {
+                Some(NodeEnum::ColumnRef(c)) if c.fields.len() == 1 => str_of(&c.fields[0])
+                    .is_some_and(|name| {
+                        outs.iter()
+                            .any(|o| matches!(o, OutCol::Named { name: n, .. } if n == name))
+                    }),
+                _ => false,
+            };
+            if !output {
+                self.opt(sb.node.as_deref_mut(), depth)?;
+            }
+        }
+        self.opt(s.limit_count.as_deref_mut(), depth)?;
+        self.opt(s.limit_offset.as_deref_mut(), depth)?;
+        Ok(())
     }
 
     /// `VALUES (…), (…)`: column j derives from item j of every row.
@@ -471,13 +573,30 @@ impl Walker<'_, '_> {
         too_deep(depth)?;
         let pushed = self.push_ctes(s.with_clause.as_mut(), depth + 1)?;
         let target = s.relation.as_ref().map(base_item);
+        if let Some(rv) = s.relation.as_ref() {
+            // Access analysis: the target and each column written (no column
+            // list = every column). No-op for tags.
+            let schema = non_empty(&rv.schemaname);
+            self.tags.write(schema, &rv.relname, None);
+            if s.cols.is_empty() {
+                self.tags.write(schema, &rv.relname, Some("*"));
+            }
+            for c in &s.cols {
+                if let Some(NodeEnum::ResTarget(r)) = c.node.as_ref() {
+                    self.tags.write(schema, &rv.relname, Some(&r.name));
+                }
+            }
+        }
+        let all = self.all;
         let res = (|| -> Result<Vec<OutCol>> {
             if let Some(src) = s.select_stmt.as_deref_mut() {
                 let outs = self.query(src, None, depth + 1)?;
                 for (j, c) in outs.iter().enumerate() {
                     let mut lin = outcol_all(self.tags, c);
                     // Writing a tagged column into itself is not a copy out.
-                    if let (Some(dest), Some(t)) = (
+                    // (The access analysis records the write itself instead.)
+                    if let (false, Some(dest), Some(t)) = (
+                        all,
                         s.cols.get(j).and_then(|n| match n.node.as_ref() {
                             Some(NodeEnum::ResTarget(r)) => Some(r.name.as_str()),
                             _ => None,
@@ -497,6 +616,29 @@ impl Walker<'_, '_> {
             }
             let r = (|| -> Result<Vec<OutCol>> {
                 if let Some(oc) = s.on_conflict_clause.as_deref_mut() {
+                    if all {
+                        // `EXCLUDED` is the row proposed for insertion: the
+                        // target's columns.
+                        if let Some(Item::Base { schema, table, .. }) = target.clone() {
+                            self.scopes.add(Item::Base {
+                                refname: "excluded".to_string(),
+                                schema,
+                                table,
+                            });
+                        }
+                        if let Some(inf) = oc.infer.as_deref_mut() {
+                            for e in inf.index_elems.iter_mut() {
+                                if let Some(NodeEnum::IndexElem(ie)) = e.node.as_mut() {
+                                    if !ie.name.is_empty() {
+                                        self.scopes.column(self.tags, &[], &ie.name);
+                                    }
+                                    self.opt(ie.expr.as_deref_mut(), depth + 1)?;
+                                }
+                            }
+                            self.opt(inf.where_clause.as_deref_mut(), depth + 1)?;
+                        }
+                        self.opt(oc.where_clause.as_deref_mut(), depth + 1)?;
+                    }
                     self.set_list(&mut oc.target_list, target.as_ref(), depth + 1)?;
                 }
                 let (outs, _, _) = self.targets(&mut s.returning_list, sink, depth + 1)?;
@@ -543,6 +685,10 @@ impl Walker<'_, '_> {
         match node {
             NodeEnum::UpdateStmt(s) => {
                 let target = s.relation.as_ref().map(base_item);
+                if let Some(rv) = s.relation.as_ref() {
+                    self.tags
+                        .write(non_empty(&rv.schemaname), &rv.relname, None);
+                }
                 if let Some(t) = target.clone() {
                     self.scopes.add(t);
                 }
@@ -552,9 +698,18 @@ impl Walker<'_, '_> {
                     }
                 }
                 self.set_list(&mut s.target_list, target.as_ref(), depth + 1)?;
+                if self.all {
+                    self.opt(s.where_clause.as_deref_mut(), depth + 1)?;
+                }
                 Ok(self.targets(&mut s.returning_list, sink, depth + 1)?.0)
             }
             NodeEnum::DeleteStmt(s) => {
+                if let Some(rv) = s.relation.as_ref() {
+                    // Removing a row removes every column's value.
+                    let schema = non_empty(&rv.schemaname);
+                    self.tags.write(schema, &rv.relname, None);
+                    self.tags.write(schema, &rv.relname, Some("*"));
+                }
                 if let Some(t) = s.relation.as_ref().map(base_item) {
                     self.scopes.add(t);
                 }
@@ -563,10 +718,22 @@ impl Walker<'_, '_> {
                         self.scopes.add(it);
                     }
                 }
+                if self.all {
+                    self.opt(s.where_clause.as_deref_mut(), depth + 1)?;
+                }
                 Ok(self.targets(&mut s.returning_list, sink, depth + 1)?.0)
             }
             NodeEnum::MergeStmt(s) => {
                 let target = s.relation.as_ref().map(base_item);
+                let tgt = s.relation.as_ref().map(|rv| {
+                    (
+                        non_empty(&rv.schemaname).map(str::to_string),
+                        rv.relname.clone(),
+                    )
+                });
+                if let Some((schema, table)) = &tgt {
+                    self.tags.write(schema.as_deref(), table, None);
+                }
                 if let Some(t) = target.clone() {
                     self.scopes.add(t);
                 }
@@ -575,10 +742,32 @@ impl Walker<'_, '_> {
                         self.scopes.add(it);
                     }
                 }
+                if self.all {
+                    self.opt(s.join_condition.as_deref_mut(), depth + 1)?;
+                }
                 for clause in s.merge_when_clauses.iter_mut() {
                     let Some(NodeEnum::MergeWhenClause(c)) = clause.node.as_mut() else {
                         continue;
                     };
+                    if self.all {
+                        self.opt(c.condition.as_deref_mut(), depth + 1)?;
+                        if let Some((schema, table)) = &tgt {
+                            let schema = schema.as_deref();
+                            let insert = c.command_type == protobuf::CmdType::CmdInsert as i32;
+                            let delete = c.command_type == protobuf::CmdType::CmdDelete as i32;
+                            // DELETE removes whole rows; INSERT without a
+                            // column list writes every column.
+                            if delete || (insert && c.target_list.is_empty()) {
+                                self.tags.write(schema, table, Some("*"));
+                            } else if insert {
+                                for n in &c.target_list {
+                                    if let Some(NodeEnum::ResTarget(r)) = n.node.as_ref() {
+                                        self.tags.write(schema, table, Some(&r.name));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if c.values.is_empty() {
                         // WHEN MATCHED THEN UPDATE SET …
                         self.set_list(&mut c.target_list, target.as_ref(), depth + 1)?;
@@ -594,7 +783,9 @@ impl Walker<'_, '_> {
                             .collect();
                         for (j, v) in c.values.iter_mut().enumerate() {
                             let mut lin = self.expr(v, depth + 1)?;
-                            if let (Some(dest), Some(t)) = (dests.get(j), target.as_ref()) {
+                            if let (false, Some(dest), Some(t)) =
+                                (self.all, dests.get(j), target.as_ref())
+                            {
                                 for k in t.column(self.tags, dest).keys() {
                                     lin.remove(k);
                                 }
@@ -620,7 +811,18 @@ impl Walker<'_, '_> {
                 Some(v) => self.expr(v, depth + 1)?,
                 None => Lineage::new(),
             };
-            if let Some(t) = target {
+            if self.all {
+                // Access analysis: the column written.
+                if let Some(Item::Base { schema, table, .. }) = target {
+                    self.tags.write(schema.as_deref(), table, Some(&rt.name));
+                }
+                for ind in rt.indirection.iter_mut() {
+                    if let Some(NodeEnum::AIndices(ix)) = ind.node.as_mut() {
+                        self.opt(ix.lidx.as_deref_mut(), depth + 1)?;
+                        self.opt(ix.uidx.as_deref_mut(), depth + 1)?;
+                    }
+                }
+            } else if let Some(t) = target {
                 for k in t.column(self.tags, &rt.name).keys() {
                     lin.remove(k);
                 }
@@ -691,6 +893,34 @@ impl Walker<'_, '_> {
                     level.truncate(mark);
                 }
                 items.extend(right?);
+                if self.all {
+                    // Access analysis: `ON`, `USING` and `NATURAL` read the
+                    // join columns of both sides.
+                    for it in &items {
+                        self.scopes.add(it.clone());
+                    }
+                    let r = (|| -> Result<()> {
+                        self.opt(j.quals.as_deref_mut(), depth + 1)?;
+                        for u in &j.using_clause {
+                            if let Some(name) = str_of(u) {
+                                for it in &items {
+                                    it.column(self.tags, name);
+                                }
+                            }
+                        }
+                        if j.is_natural {
+                            // The common columns are unknown: every column.
+                            for it in &items {
+                                it.star_all(self.tags);
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Some(level) = self.scopes.levels.last_mut() {
+                        level.truncate(mark);
+                    }
+                    r?;
+                }
                 vec![Item::Join {
                     refname: alias_name(j.alias.as_ref()),
                     items,
@@ -737,6 +967,8 @@ impl Walker<'_, '_> {
             }
         }
         let schema = non_empty(&rv.schemaname).map(str::to_string);
+        // Access analysis: a relation read. No-op for tags.
+        self.tags.relation(schema.as_deref(), &rv.relname);
         if rv.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()) {
             // `customers AS c(a, b)` renames columns by position, which the
             // engine cannot map without the schema: every column may be any tag.
@@ -783,7 +1015,34 @@ impl Walker<'_, '_> {
             }
             // Only the arguments are values. FILTER, ORDER BY and OVER decide
             // which rows or in what order — like WHERE, not projected.
-            NodeEnum::FuncCall(f) => self.exprs(&mut f.args, d)?,
+            NodeEnum::FuncCall(f) => {
+                if self.all {
+                    if let Some(what) = set_config_target(f) {
+                        // `set_config('search_path', …)` is `SET search_path`.
+                        self.tags.statement(&what);
+                    }
+                    // Access analysis: these choose rows and order, which
+                    // still reads the columns.
+                    self.opt(f.agg_filter.as_deref_mut(), d)?;
+                    self.exprs(&mut f.agg_order, d)?;
+                    if let Some(w) = f.over.as_deref_mut() {
+                        self.exprs(&mut w.partition_clause, d)?;
+                        self.exprs(&mut w.order_clause, d)?;
+                        self.opt(w.start_offset.as_deref_mut(), d)?;
+                        self.opt(w.end_offset.as_deref_mut(), d)?;
+                    }
+                }
+                self.exprs(&mut f.args, d)?
+            }
+            NodeEnum::SortBy(sb) if self.all => self.opt(sb.node.as_deref_mut(), d)?,
+            NodeEnum::WindowDef(w) if self.all => {
+                let mut l = self.exprs(&mut w.partition_clause, d)?;
+                merge(&mut l, self.exprs(&mut w.order_clause, d)?);
+                merge(&mut l, self.opt(w.start_offset.as_deref_mut(), d)?);
+                merge(&mut l, self.opt(w.end_offset.as_deref_mut(), d)?);
+                l
+            }
+            NodeEnum::GroupingSet(g) if self.all => self.exprs(&mut g.content, d)?,
             NodeEnum::AExpr(a) => {
                 let mut l = self.opt(a.lexpr.as_deref_mut(), d)?;
                 merge(&mut l, self.opt(a.rexpr.as_deref_mut(), d)?);
@@ -828,6 +1087,12 @@ impl Walker<'_, '_> {
                 let kind = sl.sub_link_type;
                 if kind == SubLinkType::ExistsSublink as i32 {
                     // EXISTS projects a boolean about rows, not their values.
+                    // The access analysis still reads what is inside.
+                    if self.all {
+                        if let Some(q) = sl.subselect.as_deref_mut() {
+                            self.query(q, None, d)?;
+                        }
+                    }
                     return Ok(Lineage::new());
                 }
                 let cols = match sl.subselect.as_deref_mut() {
@@ -881,6 +1146,12 @@ impl Walker<'_, '_> {
         let mut refs: Vec<(Vec<String>, bool)> = Vec::new();
         let mut rels: Vec<(Option<String>, String)> = Vec::new();
         collect_json(&json, depth, &mut refs, &mut rels)?;
+        // Access analysis: every relation mentioned inside is read.
+        for (s, t) in &rels {
+            if s.is_some() || self.find_cte(t).is_none() {
+                self.tags.relation(s.as_deref(), t);
+            }
+        }
         let mut out = Lineage::new();
         for (names, star) in &refs {
             let v: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -897,6 +1168,14 @@ impl Walker<'_, '_> {
                     merge(&mut out, self.scopes.column(self.tags, &[], one));
                     merge(&mut out, self.scopes.whole_row(self.tags, one));
                     merge(&mut out, self.tags.any_with_column(one));
+                    if self.all {
+                        // Access analysis: the name may belong to a relation
+                        // read inside the unmodelled node (a subquery passed
+                        // to XMLTABLE, …), whose scope is not modelled.
+                        for (s, t) in &rels {
+                            merge(&mut out, self.tags.of_column(s.as_deref(), t, one));
+                        }
+                    }
                     for (s, t) in &rels {
                         if crate::sensitive::ieq(t, one) {
                             merge(&mut out, starred(self.tags.of_table(s.as_deref(), t)));
@@ -910,6 +1189,31 @@ impl Walker<'_, '_> {
             }
         }
         Ok(indirect(out))
+    }
+}
+
+/// Access analysis: `set_config(name, …)` changes a setting like `SET` does.
+/// The settings an allowlist depends on (who the session is, where
+/// unqualified names resolve) are denied as their `SET` form; a name that is
+/// not a literal could be any of them.
+fn set_config_target(f: &protobuf::FuncCall) -> Option<String> {
+    let name = f.funcname.iter().rev().find_map(str_of)?;
+    if !name.eq_ignore_ascii_case("set_config") {
+        return None;
+    }
+    let setting = f.args.first().and_then(|a| match a.node.as_ref() {
+        Some(NodeEnum::AConst(c)) => match c.val.as_ref() {
+            Some(protobuf::a_const::Val::Sval(s)) => Some(s.sval.to_ascii_lowercase()),
+            _ => None,
+        },
+        _ => None,
+    });
+    match setting.as_deref() {
+        Some("search_path") => Some("SET search_path".to_string()),
+        Some("role") => Some("SET ROLE".to_string()),
+        Some("session_authorization") => Some("SET SESSION AUTHORIZATION".to_string()),
+        Some(_) => None,
+        None => Some("set_config".to_string()),
     }
 }
 

@@ -81,6 +81,7 @@ fn policy_strategy() -> impl Strategy<Value = EnforcementPolicy> {
                     monitor_mode,
                     schema_migration_cap,
                     sensitive_columns: Vec::new(),
+                    access_policy: None,
                 }
             },
         )

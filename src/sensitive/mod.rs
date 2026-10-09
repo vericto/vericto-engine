@@ -195,13 +195,99 @@ pub(crate) fn ieq(a: &str, b: &str) -> bool {
 }
 
 /// The configured tags, with the matching rules of design §5.3.
+///
+/// The same walkers also serve the agent-access analysis (VERICTO-087,
+/// [`crate::access`]): built with [`Tags::collecting`], every column, table and
+/// star the walk resolves is recorded in a [`Collector`] instead of being
+/// matched against tags, so the scope and derivation rules are the same ones.
 pub(crate) struct Tags<'a> {
     pub(crate) cols: &'a [SensitiveColumn],
+    pub(crate) collect: Option<&'a Collector>,
+}
+
+/// Something a statement references, as the access analysis records it. The
+/// names are the query's spelling; the qualifier is resolved through aliases.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Ref {
+    /// A relation in `FROM` (or a table the walk could only name).
+    Relation {
+        schema: Option<String>,
+        table: String,
+    },
+    /// One column of a relation.
+    Column {
+        schema: Option<String>,
+        table: String,
+        column: String,
+    },
+    /// Every column: `*`, `t.*`, a whole-row reference, positional renaming.
+    AllColumns {
+        schema: Option<String>,
+        table: String,
+    },
+    /// A write. `column`: `None` = the table as a target, `Some("*")` = every
+    /// column (INSERT without a column list, DELETE), else that column.
+    Write {
+        schema: Option<String>,
+        table: String,
+        column: Option<String>,
+    },
+    /// A statement kind that is denied outright (DDL, `SET ROLE`, …).
+    Statement(String),
+}
+
+/// What the access walk found. Interior mutability because the walkers hold
+/// `Tags` by shared reference and resolve through `&self` helpers.
+#[derive(Debug, Default)]
+pub(crate) struct Collector {
+    refs: std::cell::RefCell<BTreeMap<Ref, usize>>,
+    by_id: std::cell::RefCell<Vec<Ref>>,
+    /// Unqualified column names that resolved to more than one table.
+    ambiguous: std::cell::RefCell<std::collections::BTreeSet<String>>,
+}
+
+impl Collector {
+    fn intern(&self, r: Ref) -> usize {
+        if let Some(&i) = self.refs.borrow().get(&r) {
+            return i;
+        }
+        let mut by_id = self.by_id.borrow_mut();
+        let i = by_id.len();
+        by_id.push(r.clone());
+        self.refs.borrow_mut().insert(r, i);
+        i
+    }
+
+    /// Every reference recorded, sorted, and the ambiguous column names
+    /// (ASCII-lowercased).
+    pub(crate) fn finish(self) -> (Vec<Ref>, std::collections::BTreeSet<String>) {
+        (
+            self.refs.into_inner().into_keys().collect(),
+            self.ambiguous.into_inner(),
+        )
+    }
+}
+
+fn single(i: usize) -> Lineage {
+    let mut l = Lineage::new();
+    l.insert(i, Flow::DIRECT);
+    l
 }
 
 impl<'a> Tags<'a> {
     pub(crate) fn new(cols: &'a [SensitiveColumn]) -> Self {
-        Self { cols }
+        Self {
+            cols,
+            collect: None,
+        }
+    }
+
+    /// For the access analysis: no tags, every resolution is recorded.
+    pub(crate) fn collecting(c: &'a Collector) -> Self {
+        Self {
+            cols: &[],
+            collect: Some(c),
+        }
     }
 
     /// Whether tag `i` can be the relation `schema.table` as written in the
@@ -220,6 +306,12 @@ impl<'a> Tags<'a> {
 
     /// Tags on `schema.table`.
     pub(crate) fn of_table(&self, schema: Option<&str>, table: &str) -> Lineage {
+        if let Some(c) = self.collect {
+            return single(c.intern(Ref::AllColumns {
+                schema: schema.map(str::to_string),
+                table: table.to_string(),
+            }));
+        }
         let mut out = Lineage::new();
         for i in 0..self.cols.len() {
             if self.table_matches(i, schema, table) {
@@ -231,6 +323,13 @@ impl<'a> Tags<'a> {
 
     /// Tags on `schema.table.column`.
     pub(crate) fn of_column(&self, schema: Option<&str>, table: &str, column: &str) -> Lineage {
+        if let Some(c) = self.collect {
+            return single(c.intern(Ref::Column {
+                schema: schema.map(str::to_string),
+                table: table.to_string(),
+                column: column.to_string(),
+            }));
+        }
         let mut out = Lineage::new();
         for i in 0..self.cols.len() {
             if self.table_matches(i, schema, table) && ieq(&self.cols[i].column, column) {
@@ -241,15 +340,75 @@ impl<'a> Tags<'a> {
     }
 
     /// Every tag on a column named `column`, whatever its table. Used by the
-    /// conservative fallback for expressions the walkers do not model.
+    /// conservative fallback for expressions the walkers do not model. The
+    /// access analysis resolves those names in scope instead (the fallback
+    /// does both), so it records nothing here.
     pub(crate) fn any_with_column(&self, column: &str) -> Lineage {
         let mut out = Lineage::new();
+        if self.collect.is_some() {
+            return out;
+        }
         for (i, tag) in self.cols.iter().enumerate() {
             if ieq(&tag.column, column) {
                 out.insert(i, Flow::INDIRECT);
             }
         }
         out
+    }
+
+    /// Access analysis: a relation the statement reads from. No-op for tags.
+    pub(crate) fn relation(&self, schema: Option<&str>, table: &str) {
+        if let Some(c) = self.collect {
+            c.intern(Ref::Relation {
+                schema: schema.map(str::to_string),
+                table: table.to_string(),
+            });
+        }
+    }
+
+    /// Access analysis: a write target (see [`Ref::Write`]). No-op for tags.
+    pub(crate) fn write(&self, schema: Option<&str>, table: &str, column: Option<&str>) {
+        if let Some(c) = self.collect {
+            c.intern(Ref::Write {
+                schema: schema.map(str::to_string),
+                table: table.to_string(),
+                column: column.map(str::to_string),
+            });
+        }
+    }
+
+    /// Access analysis: a statement kind denied outright. No-op for tags.
+    pub(crate) fn statement(&self, what: &str) {
+        if let Some(c) = self.collect {
+            c.intern(Ref::Statement(what.to_string()));
+        }
+    }
+
+    /// Access analysis: `col`, unqualified, resolved to `lin`. Remembers it
+    /// when it could be a column of more than one table, so the message can
+    /// tell the caller to qualify it.
+    fn note_unqualified(&self, col: &str, lin: &Lineage) {
+        let Some(c) = self.collect else { return };
+        let by_id = c.by_id.borrow();
+        let mut tables = std::collections::BTreeSet::new();
+        for &i in lin.keys() {
+            if let Some(Ref::Column {
+                schema,
+                table,
+                column,
+            }) = by_id.get(i)
+            {
+                if ieq(column, col) {
+                    tables.insert((
+                        schema.as_deref().map(str::to_ascii_lowercase),
+                        table.to_ascii_lowercase(),
+                    ));
+                }
+            }
+        }
+        if tables.len() > 1 {
+            c.ambiguous.borrow_mut().insert(col.to_ascii_lowercase());
+        }
     }
 }
 
@@ -516,6 +675,7 @@ impl Scopes {
                     merge(&mut out, item.column(tags, col));
                 }
             }
+            tags.note_unqualified(col, &out);
             return out;
         }
         let q = &qualifier[qualifier.len().saturating_sub(2)..];
@@ -569,6 +729,24 @@ impl Scopes {
             cols.extend(item.star_cols());
         }
         (lin, cols)
+    }
+
+    /// The base tables `qualifier` names in scope (through aliases and
+    /// aliased joins), for the access analysis's write targets.
+    pub(crate) fn base_tables(&self, qualifier: &[&str]) -> Vec<(Option<String>, String)> {
+        fn bases(item: &Item, out: &mut Vec<(Option<String>, String)>) {
+            match item {
+                Item::Base { schema, table, .. } => out.push((schema.clone(), table.clone())),
+                Item::Join { items, .. } => items.iter().for_each(|i| bases(i, out)),
+                Item::Derived { .. } | Item::Opaque { .. } => {}
+            }
+        }
+        let q = &qualifier[qualifier.len().saturating_sub(2)..];
+        let mut out = Vec::new();
+        for item in self.named(q) {
+            bases(item, &mut out);
+        }
+        out
     }
 
     /// A single-name reference that may be a whole-row reference

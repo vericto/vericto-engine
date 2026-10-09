@@ -408,6 +408,12 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         // holds (see `crate::parser::mysql_lex`). A no-op here.
         "VERICTO-086" => None,
 
+        // VERICTO-087: access outside the agent's allowlist. Driven by
+        // `EnforcementPolicy::access_policy` (see `crate::access`), not by a
+        // predicate over `StatementInfo`: listing it in the rules slice is a
+        // no-op.
+        "VERICTO-087" => None,
+
         // ── SQL injection ─────────────────────────────────────────────────
 
         // VERICTO-090: SQL injection tautology — OR branch in WHERE is always true
