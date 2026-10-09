@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.7.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.8.0" }
 ```
 
 ### Quick example
@@ -171,6 +171,7 @@ Low/Informational → Monitor).
 | VERICTO-083 | MERGE | `MERGE INTO …` — can mass-mutate the target like an UPDATE/DELETE with no effective WHERE. |
 | VERICTO-084 | CREATE TABLE AS SELECT | `CREATE TABLE … AS SELECT …` / `SELECT … INTO` — bulk data copy that can duplicate a whole table. |
 | VERICTO-085 | Read of a sensitive column | A query projects (or copies elsewhere) a column the host tagged as sensitive. Driven by `EnforcementPolicy::sensitive_columns`, not by the rules slice; High for `block`/`mask`, Medium for `flag`. See [Sensitive columns](#sensitive-columns-vericto-085). |
+| VERICTO-087 | Access outside the agent's allowlist | The identity making the call (an API key, or the database user of a proxy session) references a table, column or write target its allowlist does not grant, or runs DDL. Every reference counts, predicates included. Driven by `EnforcementPolicy::access_policy`, not by the rules slice; blocks under `mode = enforce`, flags under `observe`. See [Agent access allowlists](#agent-access-allowlists-vericto-087). |
 
 ### Medium
 
@@ -252,7 +253,7 @@ Every built-in code carries a static [`RuleClass`](src/rules/engine.rs) — the
 |---|---|---|
 | `SchemaMigration` | 010–019 | DROP TABLE/DATABASE/SCHEMA, TRUNCATE, ALTER TABLE, DROP INDEX. Destructive against a live database, but normal in a versioned migration. |
 | `DataMutation` | 001, 002, 003, 030, 031, 033, 040, 042, 083, 084 | Data mutation without adequate scope. Dangerous on *any* channel — a WHERE-less DELETE is never intended, even in a migration. |
-| `Security` | 070, 080, 081, 082, 085, 090 | Injection tautologies, `COPY … PROGRAM`, `DO` blocks, GRANT/REVOKE, sleep-based probing, reads of sensitive columns. |
+| `Security` | 070, 080, 081, 082, 085, 086, 087, 090 | Injection tautologies, `COPY … PROGRAM`, `DO` blocks, GRANT/REVOKE, sleep-based probing, reads of sensitive columns, MySQL text read differently, access outside an agent's allowlist. |
 | `Performance` | 050, 051, 060, 061 | Best-practice / performance hints. Advisory. |
 
 Custom rules and any unrecognized code classify as `DataMutation` — the
@@ -442,6 +443,135 @@ utf8mb4 tables with a non-default collation and a latin1 table, and compares the
 masked values with the Postgres ones (set `VERICTO_EQUIV_MYSQL` to a JSON
 connection object or array, with the `mysql2` Node driver on `NODE_PATH`).
 
+## Agent access allowlists (VERICTO-087)
+
+Sensitive-column tags are a denylist that applies to every caller. An agent
+needs the opposite: an **allowlist** for its own identity, deny by default, so a
+prompt-injected agent cannot reach a table, a column or a write it was not given.
+The host selects the policy of the identity making the call — the API key on the
+Runtime API, MCP and CLI; the database user of the session on the TCP proxy — and
+passes it in `EnforcementPolicy::access_policy`.
+
+```rust
+use vericto_engine::{evaluate, AccessPolicy, Decision, Dialect, EnforcementPolicy};
+
+let agent: AccessPolicy = serde_json::from_str(r#"{
+    "mode": "enforce",
+    "entries": [
+        { "table": "orders",    "columns": "*",            "access": "read" },
+        { "table": "customers", "columns": ["id", "name"], "access": "read" }
+    ]
+}"#).unwrap();
+let policy = EnforcementPolicy { access_policy: Some(agent), ..EnforcementPolicy::default() };
+
+let ok = evaluate("SELECT c.name, o.total FROM customers c JOIN orders o ON o.customer_id = c.id",
+                  Dialect::Postgres, &[], &policy);
+assert_eq!(ok.decision, Decision::Allow);
+
+// A predicate on a column that is not granted lets the agent probe it: denied.
+let probe = evaluate("SELECT id FROM customers WHERE email LIKE 'a%'", Dialect::Postgres, &[], &policy);
+assert_eq!(probe.decision, Decision::Block);
+assert_eq!(probe.rule_code.as_deref(), Some("VERICTO-087"));
+assert_eq!(probe.ast_node_path.as_deref(), Some("AccessPolicy > customers.email (read)"));
+assert_eq!(probe.access_denied[0].column.as_deref(), Some("email")); // for the audit trail
+```
+
+An entry is `{"schema": null, "table": "orders", "columns": "*" | ["id", …], "access": "read" | "read_write"}`
+(`schema` optional = any schema). The policy is `{"mode": "observe" | "enforce", "ddl": "deny", "entries": [ … ]}`.
+Absent or unknown values fail safe: `mode` → `enforce`, `access` → `read`,
+`columns` other than `"*"` never widen to every column. The TCP proxy receives one
+policy per database user ([`AccessPolicyMap`](src/access/mod.rs), with an optional
+`"*"` default) and picks the session's with `for_user`. With `access_policy: None`
+the analysis does not run at all and every outcome is exactly what it was before.
+
+### What counts as access
+
+Stricter than VERICTO-085, which counts projections: **every reference counts** —
+the select list, `WHERE`, `JOIN … ON`/`USING`, `GROUP BY`, `HAVING`, `ORDER BY`,
+windows, aggregate `FILTER`/`ORDER BY`, `LIMIT`, subqueries anywhere (including
+`EXISTS`), CTEs, every arm of a set operation, `RETURNING`, upserts and `MERGE` —
+because a predicate lets an agent probe a value it may not read. Every table in
+`FROM` counts even when no column of it is named (`SELECT count(*) FROM t`).
+
+- `*`, `t.*`, whole-row references, `COPY t TO`, `TABLE t` and MySQL `DESCRIBE t`
+  need the table's entry to have `"columns": "*"`.
+- **Writes need `read_write`**: `INSERT` (each listed column; no column list means
+  every column), `UPDATE … SET` (each assigned column), `DELETE` and `REPLACE` (every
+  column: a removed row loses all of them), `MERGE`, `COPY … FROM`, `LOCK`.
+- **DDL is always denied**, and so are the statements that change who the session
+  is or where unqualified names resolve (`SET ROLE`, `SET SESSION AUTHORIZATION`,
+  `SET search_path`, `USE`). A statement kind not known to be harmless is denied;
+  transaction control, settings, cursors, `PREPARE`/`EXECUTE` and `CALL` are allowed
+  (functions are out of scope).
+- **The catalogue** (`information_schema`, `pg_catalog`, `mysql`,
+  `performance_schema`, `sys`) is denied unless an entry names that schema
+  explicitly; an unqualified `pg_*` relation is `pg_catalog`'s, and MySQL `SHOW
+  TABLES`/`COLUMNS`/`DATABASES`/`CREATE …` read `information_schema`.
+- **Names resolve conservatively.** An unqualified column resolves against every
+  relation in scope (subqueries see the outer ones) and must be allowed in all of
+  them — otherwise it is denied and the message says to qualify it. An unqualified
+  table matches an entry without a schema, or `public` (Postgres) / `dbo` (SQL
+  Server). A qualifier that names nothing in scope is taken as a table.
+- **`SET` is deny by default** under a policy: an unlisted setting can be
+  dangerous even with a literal value (`session_replication_role`,
+  `foreign_key_checks`, `unique_checks`, `sql_log_bin`,
+  `default_transaction_read_only`, `check_function_bodies`). Allowed, with
+  literal values only (no subquery, no function call): transaction control and
+  characteristics (`BEGIN`, `START TRANSACTION`, `COMMIT`, `ROLLBACK`, savepoints,
+  `SET [SESSION|LOCAL] TRANSACTION …`, `transaction_isolation`/`tx_isolation`),
+  `SET NAMES`, `SET CHARACTER SET`, `character_set_results/client/connection`,
+  `collation_connection`, `client_encoding`, `autocommit`, the time zone,
+  `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`,
+  `idle_session_timeout`, `wait_timeout`, `interactive_timeout`,
+  `net_read_timeout`, `net_write_timeout`, `max_execution_time`,
+  `sql_select_limit`, `sql_auto_is_null`, `session_track_*`, `application_name`,
+  `DateStyle`, `IntervalStyle`, `extra_float_digits`, `work_mem`,
+  `maintenance_work_mem`, `temp_buffers`, `bytea_output`,
+  `standard_conforming_strings = on` (not `off`: it changes how escapes are read),
+  `RESET ALL`, and user variables (`@v`) set to a literal. A multi-assignment `SET`
+  is allowed only if every assignment is. **`sql_mode`** is allowed only as a
+  value built from string literals, `@@sql_mode` and `CONCAT(…)` (Rails'
+  `CONCAT(CONCAT(@@sql_mode, ',STRICT_ALL_TABLES'), ',NO_AUTO_VALUE_ON_ZERO')`),
+  where no comma-separated mode is `ANSI_QUOTES`, `NO_BACKSLASH_ESCAPES`,
+  `ANSI`, `PIPES_AS_CONCAT` or a combination mode implying them (`ORACLE`,
+  `MSSQL`, `DB2`, `POSTGRESQL`, `MAXDB`); those change how MySQL lexes the next
+  statements. `SET GLOBAL`/`PERSIST`, `SET ROLE`, `SET SESSION AUTHORIZATION`,
+  `SET search_path`, `set_config` and `USE` are denied.
+- With an enforced policy, a parse error blocks
+  ([`effective_parse_error_for`](src/rules/engine.rs)), except for the session
+  statements above, which sqlparser 0.52 sometimes rejects (Django's `SET SESSION
+  TRANSACTION ISOLATION LEVEL …`, `SET CHARACTER SET …`): they are matched on the
+  normalized text, one statement only, with the same value rules, and keep the
+  host's parse-error choice. Hosts that parse themselves call
+  `policy.effective_parse_error_for(sql, dialect)` instead of
+  `effective_parse_error()`. On MySQL the analysis runs on the statement MySQL
+  executes (the 3.7.0 lexical normalization), every reading.
+
+**Expected behaviour: an unqualified column inside a subquery counts against the
+outer tables too.** SQL resolves `customer_id` in
+`SELECT count(*) FROM customers WHERE id IN (SELECT customer_id FROM orders)` to
+`orders` only if `orders` has that column, and the engine has no schema to know
+it: if it does not, the name is the outer `customers.customer_id`, which the
+agent could use to probe a column it was not granted. So the column must be
+allowed in `customers` as well, and the query is denied with
+`… (read): \`customer_id\` is unqualified and may belong to several tables;
+qualify the column`. **Fix: qualify the column** —
+`SELECT count(*) FROM customers c WHERE c.id IN (SELECT o.customer_id FROM orders o)`
+is allowed.
+
+### Precedence with sensitive columns
+
+1. A `block` tag always wins (VERICTO-085 keeps the flat fields).
+2. Not allowed → VERICTO-087: `Block` under `enforce`, `Flag` under `observe`.
+3. Allowed and tagged `mask` → the VERICTO-085 rewrite.
+4. Otherwise allowed (a `flag` tag still flags).
+
+A denial clears any rewrite (a refused query is never forwarded, masked or not);
+under `observe` an allowed mask keeps its rewrite. `monitor_mode` turns a denial
+into a flag. `EvaluationOutcome::access_denied` lists every denied reference
+(`{"schema", "table", "column", "needed": "read" | "write" | "ddl"}`), also in
+`observe` mode.
+
 ## Custom rules (YAML)
 
 You can define domain-specific rules using YAML AST conditions. A rule has a
@@ -492,6 +622,7 @@ vericto-engine/
 ├── src/
 │   ├── lib.rs          ← public API + evaluate() convenience fn
 │   ├── error.rs        ← ProxyError, Result
+│   ├── access/         ← VERICTO-087: agent allowlists — policy types, statement classes, verdict (runs the sensitive/ walkers in access mode)
 │   ├── sensitive/      ← VERICTO-085: sensitive-column derivation + mask rewrite (pg.rs, sql.rs, mysql.rs)
 │   │   ├── mod.rs      ← tags, scopes, lineage, verdict
 │   │   ├── pg.rs       ← pg_query walker + rewrite

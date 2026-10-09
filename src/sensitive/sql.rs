@@ -76,6 +76,40 @@ pub(crate) fn analyze_mysql(
     Ok((touches, Some(rewrite)))
 }
 
+/// The access analysis (VERICTO-087) of one statement: the same walk, with
+/// `tags` collecting every resolution and every clause visited (see
+/// [`crate::access`]). `mysql`: `"x"` may be a column (`ANSI_QUOTES`). The
+/// statement is the caller's clone; nothing is rewritten.
+pub(crate) fn access_walk(
+    stmt: &mut Statement,
+    tags: &Tags,
+    dialect: crate::parser::Dialect,
+) -> Result<()> {
+    let mut w = Walker::new(tags, false, None);
+    w.all = true;
+    w.ansi_quotes = dialect == crate::parser::Dialect::Mysql;
+    w.oracle = dialect == crate::parser::Dialect::Oracle;
+    w.stmt(stmt, 0)
+}
+
+/// Oracle pseudo-columns: values the server supplies, not table columns.
+fn is_oracle_pseudo_column(name: &str) -> bool {
+    [
+        "rownum",
+        "rowid",
+        "level",
+        "sysdate",
+        "systimestamp",
+        "user",
+        "uid",
+        "ora_rowscn",
+        "connect_by_isleaf",
+        "connect_by_iscycle",
+    ]
+    .iter()
+    .any(|p| p.eq_ignore_ascii_case(name))
+}
+
 #[cfg(test)]
 thread_local! {
     /// Lets a test prove that a render failure blocks.
@@ -98,6 +132,19 @@ struct Walker<'a, 't, 'p, 's> {
     refused: Option<String>,
     /// MySQL only: the client's text (output names, `"…"` handling).
     mysql: Option<&'p Prepared<'s>>,
+    /// `"x"` may be the column `x` (MySQL, whose `ANSI_QUOTES` the engine
+    /// cannot see).
+    ansi_quotes: bool,
+    /// Oracle: `ROWNUM`, `LEVEL`, … are pseudo-columns (access analysis).
+    oracle: bool,
+    /// The access analysis: every clause counts (WHERE, JOIN, GROUP BY, …),
+    /// not only what is projected, and tables and write targets are recorded.
+    all: bool,
+}
+
+/// `[db.]schema.table` of a write target, for [`Tags::write`].
+fn target_of(name: &ObjectName) -> (Option<String>, String) {
+    split_name(name)
 }
 
 fn too_deep(depth: usize) -> Result<()> {
@@ -169,6 +216,40 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             rewrote: false,
             refused: None,
             mysql,
+            ansi_quotes: mysql.is_some(),
+            oracle: false,
+            all: false,
+        }
+    }
+
+    /// Access analysis: the tables an assignment target `[q.]col` writes to.
+    /// Qualified: what the qualifier names in scope (or the qualifier itself
+    /// as a table); unqualified: the statement's target.
+    fn write_targets(
+        &self,
+        n: &ObjectName,
+        target: Option<&Item>,
+    ) -> Vec<(Option<String>, String)> {
+        let parts: Vec<&str> = n.0.iter().map(|i| i.value.as_str()).collect();
+        match parts.as_slice() {
+            [] => Vec::new(),
+            [_] => match target {
+                Some(Item::Base { schema, table, .. }) => vec![(schema.clone(), table.clone())],
+                _ => Vec::new(),
+            },
+            [q @ .., _] => {
+                let found = self.scopes.base_tables(q);
+                if found.is_empty() {
+                    let q = &q[q.len().saturating_sub(2)..];
+                    match q {
+                        [t] => vec![(None, t.to_string())],
+                        [s, t] => vec![(Some(s.to_string()), t.to_string())],
+                        _ => Vec::new(),
+                    }
+                } else {
+                    found
+                }
+            }
         }
     }
 
@@ -194,6 +275,15 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             }
             Statement::Insert(ins) => {
                 let (schema, table) = split_name(&ins.table_name);
+                // Access analysis: the target and each column written (no
+                // column list, or REPLACE, which deletes rows: every column).
+                self.tags.write(schema.as_deref(), &table, None);
+                if ins.columns.is_empty() || ins.replace_into {
+                    self.tags.write(schema.as_deref(), &table, Some("*"));
+                }
+                for c in &ins.columns {
+                    self.tags.write(schema.as_deref(), &table, Some(&c.value));
+                }
                 let target = Item::Base {
                     refname: ins
                         .table_alias
@@ -207,7 +297,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                     let outs = self.query(src, None, d)?;
                     for (j, c) in outs.iter().enumerate() {
                         let mut lin = outcol_all(self.tags, c);
-                        if let Some(dest) = ins.columns.get(j) {
+                        if let (false, Some(dest)) = (self.all, ins.columns.get(j)) {
                             for k in target.column(self.tags, &dest.value).keys() {
                                 lin.remove(k);
                             }
@@ -217,18 +307,50 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 }
                 // `ON DUPLICATE KEY UPDATE x = <expr>` / `ON CONFLICT DO
                 // UPDATE SET x = <expr>` store a value like `UPDATE … SET`.
+                let mut conflict_cols: Vec<String> = Vec::new();
+                let mut upsert_where: Option<&mut Expr> = None;
                 let upsert = match ins.on.as_mut() {
                     Some(OnInsert::DuplicateKeyUpdate(a)) => Some(a),
-                    Some(OnInsert::OnConflict(oc)) => match &mut oc.action {
-                        OnConflictAction::DoUpdate(u) => Some(&mut u.assignments),
-                        OnConflictAction::DoNothing => None,
-                    },
+                    Some(OnInsert::OnConflict(oc)) => {
+                        if let Some(sqlparser::ast::ConflictTarget::Columns(cols)) =
+                            &oc.conflict_target
+                        {
+                            conflict_cols = cols.iter().map(|c| c.value.clone()).collect();
+                        }
+                        match &mut oc.action {
+                            OnConflictAction::DoUpdate(u) => {
+                                upsert_where = u.selection.as_mut();
+                                Some(&mut u.assignments)
+                            }
+                            OnConflictAction::DoNothing => None,
+                        }
+                    }
                     _ => None,
                 };
+                if self.all && !conflict_cols.is_empty() {
+                    for c in &conflict_cols {
+                        target.column(self.tags, c);
+                    }
+                }
                 if let Some(assignments) = upsert {
                     self.scopes.push();
                     self.scopes.add(target.clone());
-                    let r = self.assignments(assignments, Some(&target), d);
+                    if self.all {
+                        // `EXCLUDED` is the proposed row: the target's columns.
+                        if let Item::Base { schema, table, .. } = &target {
+                            self.scopes.add(Item::Base {
+                                refname: "excluded".to_string(),
+                                schema: schema.clone(),
+                                table: table.clone(),
+                            });
+                        }
+                    }
+                    let r = self
+                        .assignments(assignments, Some(&target), d)
+                        .and_then(|()| match (self.all, upsert_where) {
+                            (true, Some(w)) => self.expr(w, d).map(|_| ()),
+                            _ => Ok(()),
+                        });
                     self.scopes.pop();
                     r?;
                 }
@@ -244,6 +366,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 table,
                 assignments,
                 from,
+                selection,
                 returning,
                 ..
             } => {
@@ -260,6 +383,11 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                         }
                     }
                     self.assignments(assignments, target.as_ref(), d)?;
+                    if self.all {
+                        if let Some(w) = selection {
+                            self.expr(w, d)?;
+                        }
+                    }
                     if let Some(ret) = returning {
                         self.projection(ret, Some(visible), d)?;
                     }
@@ -269,15 +397,51 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 r?;
             }
             Statement::Delete(del) => {
-                if del.returning.is_some() {
+                if del.returning.is_some() || self.all {
                     self.scopes.push();
                     let r = (|| -> Result<()> {
                         let from = match &mut del.from {
                             FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
                         };
+                        // Access analysis: the targets lose whole rows. With
+                        // a table list (`DELETE t FROM t JOIN …`) those are
+                        // the targets; otherwise each FROM relation.
+                        let mut targets: Vec<(Option<String>, String)> = Vec::new();
+                        if self.all && del.tables.is_empty() {
+                            for twj in from.iter() {
+                                if let TableFactor::Table { name, .. } = &twj.relation {
+                                    targets.push(target_of(name));
+                                }
+                            }
+                        }
                         for twj in from.iter_mut().chain(del.using.iter_mut().flatten()) {
                             for it in self.table_with_joins(twj, d)? {
                                 self.scopes.add(it);
+                            }
+                        }
+                        if self.all {
+                            for n in &del.tables {
+                                let parts: Vec<&str> =
+                                    n.0.iter().map(|i| i.value.as_str()).collect();
+                                let found = self.scopes.base_tables(&parts);
+                                if found.is_empty() {
+                                    targets.push(target_of(n));
+                                } else {
+                                    targets.extend(found);
+                                }
+                            }
+                            for (schema, table) in &targets {
+                                self.tags.write(schema.as_deref(), table, None);
+                                self.tags.write(schema.as_deref(), table, Some("*"));
+                            }
+                            if let Some(w) = del.selection.as_mut() {
+                                self.expr(w, d)?;
+                            }
+                            for o in del.order_by.iter_mut() {
+                                self.expr(&mut o.expr, d)?;
+                            }
+                            if let Some(l) = del.limit.as_mut() {
+                                self.expr(l, d)?;
                             }
                         }
                         if let Some(ret) = del.returning.as_mut() {
@@ -309,6 +473,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                     columns,
                 } => {
                     let (schema, table) = split_name(table_name);
+                    self.tags.relation(schema.as_deref(), &table);
                     let lin = if columns.is_empty() {
                         starred(self.tags.of_table(schema.as_deref(), &table))
                     } else {
@@ -324,6 +489,25 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                     self.touches.record_fixed(&lin);
                 }
             },
+            Statement::Copy {
+                source:
+                    sqlparser::ast::CopySource::Table {
+                        table_name,
+                        columns,
+                    },
+                to: false,
+                ..
+            } => {
+                // Access analysis: `COPY t [(cols)] FROM` writes them.
+                let (schema, table) = split_name(table_name);
+                self.tags.write(schema.as_deref(), &table, None);
+                if columns.is_empty() {
+                    self.tags.write(schema.as_deref(), &table, Some("*"));
+                }
+                for c in columns.iter() {
+                    self.tags.write(schema.as_deref(), &table, Some(&c.value));
+                }
+            }
             Statement::Declare { stmts } => {
                 for decl in stmts {
                     if let Some(q) = decl.for_query.as_deref_mut() {
@@ -351,19 +535,54 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             Statement::Merge {
                 table,
                 source,
+                on,
                 clauses,
                 ..
             } => {
                 self.scopes.push();
                 let r = (|| -> Result<()> {
                     let target = self.table_factor(table, d)?.into_iter().next();
+                    let tgt = match &target {
+                        Some(Item::Base { schema, table, .. }) => {
+                            Some((schema.clone(), table.clone()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((schema, table)) = &tgt {
+                        self.tags.write(schema.as_deref(), table, None);
+                    }
                     if let Some(t) = target.clone() {
                         self.scopes.add(t);
                     }
                     for it in self.table_factor(source, d)? {
                         self.scopes.add(it);
                     }
+                    if self.all {
+                        self.expr(on, d)?;
+                    }
                     for c in clauses.iter_mut() {
+                        if self.all {
+                            if let Some(p) = c.predicate.as_mut() {
+                                self.expr(p, d)?;
+                            }
+                            if let Some((schema, table)) = &tgt {
+                                let schema = schema.as_deref();
+                                match &c.action {
+                                    MergeAction::Delete => {
+                                        self.tags.write(schema, table, Some("*"))
+                                    }
+                                    MergeAction::Insert(ins) if ins.columns.is_empty() => {
+                                        self.tags.write(schema, table, Some("*"))
+                                    }
+                                    MergeAction::Insert(ins) => {
+                                        for col in &ins.columns {
+                                            self.tags.write(schema, table, Some(&col.value));
+                                        }
+                                    }
+                                    MergeAction::Update { .. } => {}
+                                }
+                            }
+                        }
                         match &mut c.action {
                             MergeAction::Update { assignments } => {
                                 self.assignments(assignments, target.as_ref(), d)?
@@ -373,8 +592,8 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                                     for row in v.rows.iter_mut() {
                                         for (j, e) in row.iter_mut().enumerate() {
                                             let mut lin = self.expr(e, d)?;
-                                            if let (Some(dest), Some(t)) =
-                                                (ins.columns.get(j), target.as_ref())
+                                            if let (false, Some(dest), Some(t)) =
+                                                (self.all, ins.columns.get(j), target.as_ref())
                                             {
                                                 for k in t.column(self.tags, &dest.value).keys() {
                                                     lin.remove(k);
@@ -406,6 +625,22 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
     ) -> Result<()> {
         for a in list.iter_mut() {
             let mut lin = self.expr(&mut a.value, depth + 1)?;
+            if self.all {
+                // Access analysis: the column (and its table) written.
+                let names: Vec<&ObjectName> = match &a.target {
+                    AssignmentTarget::ColumnName(n) => vec![n],
+                    AssignmentTarget::Tuple(ns) => ns.iter().collect(),
+                };
+                for n in names {
+                    let col = n.0.last().map(|i| i.value.clone()).unwrap_or_default();
+                    for (schema, table) in self.write_targets(n, target) {
+                        self.tags.write(schema.as_deref(), &table, None);
+                        self.tags.write(schema.as_deref(), &table, Some(&col));
+                    }
+                }
+                self.touches.record(&lin, Sink::Copy);
+                continue;
+            }
             if let (AssignmentTarget::ColumnName(n), Some(t)) = (&a.target, target) {
                 if let Some(col) = n.0.last() {
                     for k in t.column(self.tags, &col.value).keys() {
@@ -439,9 +674,13 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         } else {
             false
         };
+        let all = self.all;
         let out = if let SetExpr::Select(sel) = q.body.as_mut() {
-            // A simple SELECT: its ORDER BY lives on the query.
-            self.select(sel, sink, depth + 1)
+            // A simple SELECT: its ORDER BY lives on the query. The access
+            // analysis walks it inside the SELECT's scope (it may name FROM
+            // columns that are not projected).
+            let order = if all { q.order_by.as_mut() } else { None };
+            self.select(sel, sink, order, depth + 1)
                 .map(|(outs, rw, star, distinct)| {
                     if !rw.is_empty() && !distinct {
                         if let Some(ob) = q.order_by.as_mut() {
@@ -453,12 +692,61 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                     outs
                 })
         } else {
-            self.set_expr(&mut q.body, sink, depth + 1)
+            let out = self.set_expr(&mut q.body, sink, depth + 1);
+            if let (true, Ok(outs), Some(ob)) = (all, out.as_ref(), q.order_by.as_mut()) {
+                // ORDER BY of a set operation: output names, positions, or
+                // expressions over the enclosing scopes.
+                let outs = outs.clone();
+                if let Err(e) = self.order_by(ob, &outs, depth + 1) {
+                    if pushed {
+                        self.ctes.pop();
+                    }
+                    return Err(e);
+                }
+            }
+            out
+        };
+        let out = match (all, out) {
+            (true, Ok(o)) => {
+                let r = (|| -> Result<()> {
+                    if let Some(l) = q.limit.as_mut() {
+                        self.expr(l, depth + 1)?;
+                    }
+                    self.exprs(&mut q.limit_by, depth + 1)?;
+                    if let Some(o) = q.offset.as_mut() {
+                        self.expr(&mut o.value, depth + 1)?;
+                    }
+                    if let Some(f) = q.fetch.as_mut().and_then(|f| f.quantity.as_mut()) {
+                        self.expr(f, depth + 1)?;
+                    }
+                    Ok(())
+                })();
+                r.map(|()| o)
+            }
+            (_, other) => other,
         };
         if pushed {
             self.ctes.pop();
         }
         out
+    }
+
+    /// Access analysis: `ORDER BY` items. A bare name equal to an output
+    /// column IS that output (MySQL and the others resolve ORDER BY names to
+    /// the select list first), already counted.
+    fn order_by(&mut self, ob: &mut OrderBy, outs: &[OutCol], depth: usize) -> Result<()> {
+        for item in ob.exprs.iter_mut() {
+            let output = match &item.expr {
+                Expr::Identifier(id) => outs
+                    .iter()
+                    .any(|o| matches!(o, OutCol::Named { name, .. } if ieq(name, &id.value))),
+                _ => false,
+            };
+            if !output {
+                self.expr(&mut item.expr, depth)?;
+            }
+        }
+        Ok(())
     }
 
     fn cte_cols(&mut self, cte: &mut Cte, depth: usize) -> Result<Vec<OutCol>> {
@@ -512,7 +800,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         too_deep(depth)?;
         let d = depth + 1;
         match body {
-            SetExpr::Select(sel) => Ok(self.select(sel, sink, d)?.0),
+            SetExpr::Select(sel) => Ok(self.select(sel, sink, None, d)?.0),
             SetExpr::Query(q) => self.query(q, sink, d),
             SetExpr::SetOperation { left, right, .. } => {
                 let l = self.set_expr(left, sink, d)?;
@@ -574,8 +862,23 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         &mut self,
         sel: &mut Select,
         sink: Option<Sink>,
+        order: Option<&mut OrderBy>,
         depth: usize,
     ) -> Result<(Vec<OutCol>, Vec<Rewritten>, bool, bool)> {
+        if self.all {
+            // `SELECT … INTO t` creates a table (SQL Server, Postgres via
+            // sqlparser); `INTO @v` (MySQL) only sets a session variable.
+            if let Some(into) = &sel.into {
+                if !into
+                    .name
+                    .0
+                    .first()
+                    .is_some_and(|i| i.value.starts_with('@'))
+                {
+                    self.tags.statement("SELECT INTO");
+                }
+            }
+        }
         // `SELECT … INTO t` / `INTO OUTFILE` / `INTO @v`: a copy, not a read.
         let sink = if sel.into.is_some() {
             Some(Sink::Copy)
@@ -589,7 +892,11 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                     self.scopes.add(it);
                 }
             }
-            self.projection(&mut sel.projection, sink, depth)
+            let p = self.projection(&mut sel.projection, sink, depth)?;
+            if self.all {
+                self.select_clauses(sel, &p.0, order, depth)?;
+            }
+            Ok(p)
         })();
         self.scopes.pop();
         let (outs, rw, star) = r?;
@@ -597,6 +904,70 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             self.fix_group_and_having(sel, &rw, star);
         }
         Ok((outs, rw, star, sel.distinct.is_some()))
+    }
+
+    /// Access analysis: every clause of a `SELECT` besides its projection and
+    /// `FROM`. A predicate lets the caller probe a value it cannot read, so it
+    /// counts as much as a projection.
+    fn select_clauses(
+        &mut self,
+        sel: &mut Select,
+        outs: &[OutCol],
+        order: Option<&mut OrderBy>,
+        depth: usize,
+    ) -> Result<()> {
+        let d = depth + 1;
+        for e in [
+            &mut sel.prewhere,
+            &mut sel.selection,
+            &mut sel.having,
+            &mut sel.qualify,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.expr(e, d)?;
+        }
+        // GROUP BY prefers the input column over an alias of the same name:
+        // resolved as an input column (conservative).
+        if let GroupByExpr::Expressions(exprs, _) = &mut sel.group_by {
+            self.exprs(exprs, d)?;
+        }
+        self.exprs(&mut sel.cluster_by, d)?;
+        self.exprs(&mut sel.distribute_by, d)?;
+        self.exprs(&mut sel.sort_by, d)?;
+        if let Some(sqlparser::ast::Distinct::On(exprs)) = &mut sel.distinct {
+            self.exprs(exprs, d)?;
+        }
+        for w in sel.named_window.iter_mut() {
+            if let sqlparser::ast::NamedWindowExpr::WindowSpec(spec) = &mut w.1 {
+                self.window_spec(spec, d)?;
+            }
+        }
+        for lv in sel.lateral_views.iter_mut() {
+            self.expr(&mut lv.lateral_view, d)?;
+        }
+        if let Some(cb) = sel.connect_by.as_mut() {
+            self.expr(&mut cb.condition, d)?;
+            self.exprs(&mut cb.relationships, d)?;
+        }
+        if let Some(sqlparser::ast::TopQuantity::Expr(e)) =
+            sel.top.as_mut().and_then(|t| t.quantity.as_mut())
+        {
+            self.expr(e, d)?;
+        }
+        if let Some(ob) = order {
+            self.order_by(ob, outs, d)?;
+        }
+        Ok(())
+    }
+
+    fn window_spec(&mut self, spec: &mut sqlparser::ast::WindowSpec, depth: usize) -> Result<()> {
+        self.exprs(&mut spec.partition_by, depth)?;
+        for o in spec.order_by.iter_mut() {
+            self.expr(&mut o.expr, depth)?;
+        }
+        Ok(())
     }
 
     /// After masking, `GROUP BY` / `HAVING` items naming a masked output could
@@ -770,6 +1141,61 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             }
             items.extend(right?);
         }
+        if self.all && !twj.joins.is_empty() {
+            // Access analysis: `ON`, `USING` and `NATURAL` read the join
+            // columns, with every relation of the join visible.
+            let mark = self.scopes.levels.last().map_or(0, Vec::len);
+            for it in &items {
+                self.scopes.add(it.clone());
+            }
+            let r = (|| -> Result<()> {
+                for j in twj.joins.iter_mut() {
+                    use sqlparser::ast::{JoinConstraint, JoinOperator as J};
+                    let (constraint, matching) = match &mut j.join_operator {
+                        J::Inner(c)
+                        | J::LeftOuter(c)
+                        | J::RightOuter(c)
+                        | J::FullOuter(c)
+                        | J::LeftSemi(c)
+                        | J::RightSemi(c)
+                        | J::LeftAnti(c)
+                        | J::RightAnti(c) => (Some(c), None),
+                        J::AsOf {
+                            match_condition,
+                            constraint,
+                        } => (Some(constraint), Some(match_condition)),
+                        J::CrossJoin | J::CrossApply | J::OuterApply => (None, None),
+                    };
+                    if let Some(m) = matching {
+                        self.expr(m, depth + 1)?;
+                    }
+                    match constraint {
+                        Some(JoinConstraint::On(e)) => {
+                            self.expr(e, depth + 1)?;
+                        }
+                        Some(JoinConstraint::Using(cols)) => {
+                            for c in cols.iter() {
+                                for it in &items {
+                                    it.column(self.tags, &c.value);
+                                }
+                            }
+                        }
+                        Some(JoinConstraint::Natural) => {
+                            // The common columns are unknown: every column.
+                            for it in &items {
+                                it.star_all(self.tags);
+                            }
+                        }
+                        Some(JoinConstraint::None) | None => {}
+                    }
+                }
+                Ok(())
+            })();
+            if let Some(level) = self.scopes.levels.last_mut() {
+                level.truncate(mark);
+            }
+            r?;
+        }
         Ok(items)
     }
 
@@ -801,6 +1227,10 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 };
                 if schema.is_none() {
                     if let Some((exact, cols)) = self.find_cte(&table) {
+                        if !exact {
+                            // Maybe the table: the access analysis reads it.
+                            self.tags.relation(None, &table);
+                        }
                         let cte = Item::Derived {
                             refname: Some(refname.clone()),
                             cols: rename(cols, alias.as_ref()),
@@ -815,6 +1245,8 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                         }]);
                     }
                 }
+                // Access analysis: a relation read. No-op for tags.
+                self.tags.relation(schema.as_deref(), &table);
                 if alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
                     return Ok(vec![Item::Opaque {
                         refname: Some(refname),
@@ -926,16 +1358,35 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         too_deep(depth)?;
         let d = depth + 1;
         let lin = match e {
+            // Access analysis: `@v` / `@@version` are variables, and Oracle's
+            // pseudo-columns are not columns of any table.
+            Expr::Identifier(id)
+                if self.all
+                    && id.quote_style.is_none()
+                    && (id.value.starts_with('@')
+                        || (self.oracle && is_oracle_pseudo_column(&id.value))) =>
+            {
+                Lineage::new()
+            }
             Expr::Identifier(id) => {
                 let mut l = self.scopes.column(self.tags, &[], &id.value);
                 merge(&mut l, self.scopes.whole_row(self.tags, &id.value));
                 return Ok(l);
             }
+            // Access analysis: `@@SESSION.sql_mode` is a system variable.
+            Expr::CompoundIdentifier(ids)
+                if self.all
+                    && ids
+                        .first()
+                        .is_some_and(|i| i.quote_style.is_none() && i.value.starts_with('@')) =>
+            {
+                Lineage::new()
+            }
             Expr::CompoundIdentifier(ids) => return Ok(self.compound(ids)),
             // With `ANSI_QUOTES` (server-wide, or per statement through a
             // `SET_VAR` hint) MySQL reads `"email"` as the column. The engine
             // cannot see the SQL mode: treat it as a possible column.
-            Expr::Value(Value::DoubleQuotedString(s)) if self.mysql.is_some() => {
+            Expr::Value(Value::DoubleQuotedString(s)) if self.ansi_quotes => {
                 self.scopes.column(self.tags, &[], s)
             }
             Expr::Value(_) | Expr::TypedString { .. } | Expr::IntroducedString { .. } => {
@@ -944,17 +1395,47 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             Expr::Nested(x) => return self.expr(x, d),
             // Only the arguments are values; FILTER / OVER / WITHIN GROUP decide
             // which rows and in what order, like WHERE.
-            Expr::Function(f) => match &mut f.args {
-                FunctionArguments::None => Lineage::new(),
-                FunctionArguments::Subquery(q) => self.query_value(q, d)?,
-                FunctionArguments::List(list) => {
-                    let mut l = Lineage::new();
-                    for a in list.args.iter_mut() {
-                        merge(&mut l, self.function_arg(a, d)?);
+            Expr::Function(f) => {
+                if self.all {
+                    // Access analysis: these choose rows and order, which
+                    // still reads the columns.
+                    if let Some(x) = f.filter.as_deref_mut() {
+                        self.expr(x, d)?;
                     }
-                    l
+                    if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = f.over.as_mut() {
+                        self.window_spec(spec, d)?;
+                    }
+                    for o in f.within_group.iter_mut() {
+                        self.expr(&mut o.expr, d)?;
+                    }
+                    if let FunctionArguments::List(list) = &mut f.args {
+                        for c in list.clauses.iter_mut() {
+                            match c {
+                                sqlparser::ast::FunctionArgumentClause::OrderBy(obs) => {
+                                    for o in obs.iter_mut() {
+                                        self.expr(&mut o.expr, d)?;
+                                    }
+                                }
+                                sqlparser::ast::FunctionArgumentClause::Limit(e) => {
+                                    self.expr(e, d)?;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
-            },
+                match &mut f.args {
+                    FunctionArguments::None => Lineage::new(),
+                    FunctionArguments::Subquery(q) => self.query_value(q, d)?,
+                    FunctionArguments::List(list) => {
+                        let mut l = Lineage::new();
+                        for a in list.args.iter_mut() {
+                            merge(&mut l, self.function_arg(a, d)?);
+                        }
+                        l
+                    }
+                }
+            }
             Expr::Subquery(q) => {
                 // `(SELECT email …)` IS the value: keep directness.
                 let cols = self.query(q, None, d)?;
@@ -963,7 +1444,14 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                     .map(|c| outcol_all(self.tags, c))
                     .unwrap_or_default());
             }
-            Expr::Exists { .. } => Lineage::new(),
+            Expr::Exists { subquery, .. } => {
+                // A boolean about rows, not their values; the access analysis
+                // still reads what is inside.
+                if self.all {
+                    self.query(subquery, None, d)?;
+                }
+                Lineage::new()
+            }
             Expr::InSubquery { expr, subquery, .. } => {
                 let mut l = self.expr(expr, d)?;
                 merge(&mut l, self.query_value(subquery, d)?);

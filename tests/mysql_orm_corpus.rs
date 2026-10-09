@@ -13,8 +13,8 @@
 //! `VERICTO_CORPUS_BLESS=1 cargo test --test mysql_orm_corpus`.
 
 use vericto_engine::{
-    Dialect, EnforcementAction, EnforcementPolicy, MaskStyle, ParseErrorAction, Rule, RuleType,
-    SensitiveColumn, SensitivePolicy, Severity, evaluate,
+    AccessPolicy, Decision, Dialect, EnforcementAction, EnforcementPolicy, MaskStyle,
+    ParseErrorAction, Rule, RuleType, SensitiveColumn, SensitivePolicy, Severity, evaluate,
 };
 
 const GOLDEN: &str = "tests/fixtures/mysql_orm_corpus.golden";
@@ -195,7 +195,12 @@ fn render() -> String {
     for (dialect, sql) in cases {
         for (name, policy) in policies() {
             let o = evaluate(sql, dialect, &rules, &policy);
-            out.push_str(&format!("{dialect:?}\t{name}\t{sql:?}\t{o:?}\n"));
+            // 3.8.0 added `access_denied`, always empty without an
+            // `access_policy` (asserted here). The golden file is the 3.7.0
+            // one, byte for byte: everything else must be unchanged.
+            assert!(o.access_denied.is_empty(), "{sql}");
+            let line = format!("{o:?}").replace(", access_denied: []", "");
+            out.push_str(&format!("{dialect:?}\t{name}\t{sql:?}\t{line}\n"));
         }
     }
     out
@@ -225,4 +230,76 @@ fn orm_corpus_outcomes_are_unchanged() {
         diffs.len(),
         diffs.join("\n")
     );
+}
+
+/// Every table the corpus touches, granted read/write on every column.
+fn permissive() -> AccessPolicy {
+    let tables = [
+        "users",
+        "notes",
+        "posts",
+        "orders",
+        "hibernate_sequence",
+        "auth_user",
+        "app_item",
+        "django_session",
+        "app_doc",
+        "User",
+        "Post",
+        "Users",
+        "Posts",
+        "accounts",
+    ];
+    let entries: Vec<serde_json::Value> = tables
+        .iter()
+        .map(|t| serde_json::json!({"table": t, "columns": "*", "access": "read_write"}))
+        .collect();
+    serde_json::from_value(serde_json::json!({ "mode": "enforce", "entries": entries })).unwrap()
+}
+
+/// An agent granted every table its ORM uses gets exactly the decision it
+/// gets with no allowlist: the allowlist adds no false positive on ORM
+/// traffic (transaction control, session settings — including the ones the
+/// parser rejects, such as Django's `SET SESSION TRANSACTION ISOLATION LEVEL`
+/// —, upserts, joins, aliases, `SELECT … FOR UPDATE`, counts over derived
+/// tables).
+#[test]
+fn a_permissive_allowlist_changes_no_orm_decision() {
+    let rules = ruleset();
+    let mut diffs = Vec::new();
+    for (dialect, sql) in ORM
+        .iter()
+        .map(|q| (Dialect::Mysql, *q))
+        .chain(ORM.iter().map(|q| (Dialect::Postgres, *q)))
+    {
+        let base = evaluate(sql, dialect, &rules, &EnforcementPolicy::default());
+        let policy = EnforcementPolicy {
+            access_policy: Some(permissive()),
+            ..EnforcementPolicy::default()
+        };
+        let o = evaluate(sql, dialect, &rules, &policy);
+        // The MySQL corpus replayed on Postgres: MySQL syntax does not parse
+        // there, and a parse error blocks under an enforced allowlist —
+        // except session boilerplate (here Rails' `SET @@SESSION.sql_mode`),
+        // which keeps the host's parse-error choice.
+        if dialect == Dialect::Postgres && base.rule_code.as_deref() == Some("VERICTO-PARSE-ERROR")
+        {
+            let boilerplate =
+                policy.effective_parse_error_for(sql, dialect) == ParseErrorAction::AllowReport;
+            let want = if boilerplate {
+                base.decision
+            } else {
+                Decision::Block
+            };
+            assert_eq!(o.decision, want, "{sql}");
+            continue;
+        }
+        if o.decision != base.decision || !o.access_denied.is_empty() {
+            diffs.push(format!(
+                "{dialect:?} {sql}: {:?} -> {:?} {:?} {:?}",
+                base.decision, o.decision, o.ast_node_path, o.access_denied
+            ));
+        }
+    }
+    assert!(diffs.is_empty(), "{}", diffs.join("\n"));
 }

@@ -139,3 +139,45 @@ fn sensitive_columns_example() {
     );
     assert_eq!(outcome.sensitive_columns[0].column, "email");
 }
+
+#[test]
+fn agent_access_example() {
+    use vericto_engine::{AccessPolicy, Decision, Dialect, EnforcementPolicy, evaluate};
+
+    let agent: AccessPolicy = serde_json::from_str(
+        r#"{
+        "mode": "enforce",
+        "entries": [
+            { "table": "orders",    "columns": "*",            "access": "read" },
+            { "table": "customers", "columns": ["id", "name"], "access": "read" }
+        ]
+    }"#,
+    )
+    .unwrap();
+    let policy = EnforcementPolicy {
+        access_policy: Some(agent),
+        ..EnforcementPolicy::default()
+    };
+
+    let ok = evaluate(
+        "SELECT c.name, o.total FROM customers c JOIN orders o ON o.customer_id = c.id",
+        Dialect::Postgres,
+        &[],
+        &policy,
+    );
+    assert_eq!(ok.decision, Decision::Allow);
+
+    let probe = evaluate(
+        "SELECT id FROM customers WHERE email LIKE 'a%'",
+        Dialect::Postgres,
+        &[],
+        &policy,
+    );
+    assert_eq!(probe.decision, Decision::Block);
+    assert_eq!(probe.rule_code.as_deref(), Some("VERICTO-087"));
+    assert_eq!(
+        probe.ast_node_path.as_deref(),
+        Some("AccessPolicy > customers.email (read)")
+    );
+    assert_eq!(probe.access_denied[0].column.as_deref(), Some("email"));
+}
