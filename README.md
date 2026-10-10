@@ -368,9 +368,12 @@ verdict is a **floor** over the rules: the final decision is the stricter of the
 two, and VERICTO-085 takes the flat fields only when it is the stricter one.
 `monitor_mode` turns a column block into a flag and never applies a mask (the
 would-be rewrite is in `suggested_safe_query`). With a `block` or `mask` tag
-configured, a parse error always blocks
-([`EnforcementPolicy::effective_parse_error`](src/rules/engine.rs)): a query the
-engine cannot read cannot be shown not to read a tagged column.
+configured, a parse error blocks
+([`EnforcementPolicy::effective_parse_error_for`](src/rules/engine.rs)): a query the
+engine cannot read cannot be shown not to read a tagged column. The exception
+is the closed list of session statements drivers send on connect (see the
+`SET` list under agent access allowlists): they read no column and keep the
+host's parse-error choice.
 
 ### Mask rewrite (Postgres)
 
@@ -496,8 +499,11 @@ because a predicate lets an agent probe a value it may not read. Every table in
 - `*`, `t.*`, whole-row references, `COPY t TO`, `TABLE t` and MySQL `DESCRIBE t`
   need the table's entry to have `"columns": "*"`.
 - **Writes need `read_write`**: `INSERT` (each listed column; no column list means
-  every column), `UPDATE … SET` (each assigned column), `DELETE` and `REPLACE` (every
-  column: a removed row loses all of them), `MERGE`, `COPY … FROM`, `LOCK`.
+  every column), `UPDATE … SET` (each assigned column), `DELETE` (the table, any
+  column list; its `WHERE` still needs read), `REPLACE` (every column), `MERGE`,
+  `COPY … FROM`, `LOCK`, and row locks: `SELECT … FOR UPDATE / NO KEY UPDATE /
+  SHARE / KEY SHARE` needs `read_write` on each locked table (the `OF` tables, or
+  every table of the `FROM`).
 - **DDL is always denied**, and so are the statements that change who the session
   is or where unqualified names resolve (`SET ROLE`, `SET SESSION AUTHORIZATION`,
   `SET search_path`, `USE`). A statement kind not known to be harmless is denied;
@@ -567,7 +573,7 @@ because a predicate lets an agent probe a value it may not read. Every table in
   `MSSQL`, `DB2`, `POSTGRESQL`, `MAXDB`); those change how MySQL lexes the next
   statements. `SET GLOBAL`/`PERSIST`, `SET ROLE`, `SET SESSION AUTHORIZATION`,
   `SET search_path`, `set_config` and `USE` are denied.
-- With an enforced policy, a parse error blocks
+- With an enforced policy (or a `block`/`mask` tag), a parse error blocks
   ([`effective_parse_error_for`](src/rules/engine.rs)), except for the session
   statements above, which sqlparser 0.52 sometimes rejects (Django's `SET SESSION
   TRANSACTION ISOLATION LEVEL …`, `SET CHARACTER SET …`): they are matched on the

@@ -249,6 +249,35 @@ impl EnforcementPolicy {
         }
     }
 
+    /// [`effective_parse_error`](Self::effective_parse_error) for the text
+    /// `sql` that did not parse. Identical, except when `sql` is one of the
+    /// session statements drivers and ORMs send on every connection (`SET
+    /// SESSION TRANSACTION ISOLATION LEVEL …`, `SET NAMES …`, `BEGIN`, … — a
+    /// closed list, see `crate::access::session`): then nothing forces a
+    /// block, neither an enforced allowlist nor a `block`/`mask` tag, and the
+    /// host's `parse_error` stands. Those statements read no table and no
+    /// column, so there is nothing for either protection to guard; sqlparser
+    /// rejects some of them (Django's MySQL isolation level), and blocking
+    /// them would break every connection of a tagged workspace or an agent
+    /// identity.
+    ///
+    /// Hosts that parse themselves and branch on the parse-error action must
+    /// call this (with the client's text) instead of `effective_parse_error`.
+    pub fn effective_parse_error_for(
+        &self,
+        sql: &str,
+        dialect: crate::parser::Dialect,
+    ) -> ParseErrorAction {
+        let forced = self.effective_parse_error();
+        // The session list is only consulted when a protection would force
+        // the block: with neither, this is exactly `effective_parse_error`.
+        if forced != self.parse_error && access::session::is_session_boilerplate(sql, dialect) {
+            self.parse_error
+        } else {
+            forced
+        }
+    }
+
     /// The parse-error action actually in force. Equal to `parse_error`,
     /// except that it is `Block` whenever a `block` or `mask` sensitive column
     /// is configured: a query the engine cannot read cannot be shown not to
@@ -261,47 +290,9 @@ impl EnforcementPolicy {
     /// a statement the engine cannot read cannot be shown to stay inside it.
     /// In `observe` mode the host's choice stands.
     ///
-    /// Hosts that branch on the parse-error action themselves must use this,
-    /// not the raw field.
-    /// [`effective_parse_error`](Self::effective_parse_error) for the text
-    /// `sql` that did not parse. Identical, except that the allowlist does not
-    /// force a block when `sql` is one of the session statements drivers and
-    /// ORMs send on every connection (`SET SESSION TRANSACTION ISOLATION LEVEL
-    /// …`, `SET NAMES …`, `BEGIN`, … — a closed list, see
-    /// `crate::access::session`): sqlparser rejects some of them, and blocking
-    /// them would break every connection of an agent identity. A
-    /// `block`/`mask` tag still forces a block.
-    ///
-    /// Hosts that parse themselves and branch on the parse-error action must
-    /// call this (with the client's text) instead of `effective_parse_error`.
-    pub fn effective_parse_error_for(
-        &self,
-        sql: &str,
-        dialect: crate::parser::Dialect,
-    ) -> ParseErrorAction {
-        let enforced = self
-            .access_policy
-            .as_ref()
-            .is_some_and(|p| p.mode == AccessMode::Enforce);
-        if enforced && access::session::is_session_boilerplate(sql, dialect) {
-            self.parse_error_ignoring_access()
-        } else {
-            self.effective_parse_error()
-        }
-    }
-
-    fn parse_error_ignoring_access(&self) -> ParseErrorAction {
-        if self
-            .sensitive_columns
-            .iter()
-            .any(|c| c.policy != SensitivePolicy::Flag)
-        {
-            ParseErrorAction::Block
-        } else {
-            self.parse_error
-        }
-    }
-
+    /// Hosts that branch on the parse-error action themselves must use
+    /// [`effective_parse_error_for`](Self::effective_parse_error_for) (which
+    /// exempts session boilerplate), not the raw field.
     pub fn effective_parse_error(&self) -> ParseErrorAction {
         let protective = self
             .sensitive_columns
