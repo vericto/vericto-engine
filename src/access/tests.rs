@@ -372,6 +372,10 @@ fn writes_need_read_write_on_every_target() {
         "UPDATE tickets t SET status = 'x' FROM orders o WHERE o.id = t.id",
         "SELECT id FROM tickets FOR UPDATE",
         "LOCK TABLE jobs",
+        // 3.8.1 (contract v3.3): DELETE is a table-level write, whatever the
+        // entry's column list.
+        "DELETE FROM tickets WHERE id = 1",
+        "MERGE INTO tickets t USING orders o ON t.id = o.id WHEN MATCHED THEN DELETE",
     ] {
         assert_allowed(sql);
     }
@@ -412,13 +416,20 @@ fn writes_need_read_write_on_every_target() {
             "MERGE INTO tickets t USING jobs j ON t.id = j.id WHEN NOT MATCHED THEN INSERT (id, priority) VALUES (j.id, 1)",
             "tickets.priority:write",
         ),
-        // every column: no column list, or a whole row removed
+        // every column: no column list
         (
             "INSERT INTO tickets VALUES (1, 'a', 'b')",
             "tickets.*:write",
         ),
-        ("DELETE FROM tickets WHERE id = 1", "tickets.*:write"),
         ("COPY tickets FROM STDIN", "tickets.*:write"),
+        // DELETE reads its WHERE
+        (
+            "DELETE FROM tickets WHERE priority = 1",
+            "tickets.priority:read",
+        ),
+        // a row lock is a write
+        ("SELECT id FROM orders FOR UPDATE", "orders:write"),
+        ("SELECT id FROM orders FOR SHARE", "orders:write"),
         // a table that is not granted at all
         ("INSERT INTO secrets (value) VALUES ('x')", "secrets:write"),
         ("DELETE FROM secrets", "secrets:write"),
@@ -723,6 +734,9 @@ fn mysql_applies_the_same_derivation() {
         "UPDATE tickets SET status = 'closed' WHERE id = 1",
         "INSERT INTO tickets (id, status) VALUES (1, 'a') ON DUPLICATE KEY UPDATE status = VALUES(status)",
         "DELETE FROM jobs WHERE id = 1 LIMIT 1",
+        // DELETE: a table-level write, whatever the column list (v3.3).
+        "DELETE FROM tickets WHERE id = 1",
+        "DELETE t FROM tickets t JOIN orders o ON o.id = t.id",
         "SELECT LOWER(name) AS n FROM customers ORDER BY n",
         "BEGIN",
         "SET NAMES utf8mb4",
@@ -789,11 +803,8 @@ fn mysql_applies_the_same_derivation() {
             "UPDATE tickets t JOIN orders o ON o.id = t.id SET o.total = 0",
             "orders:write",
         ),
-        ("DELETE FROM tickets WHERE id = 1", "tickets.*:write"),
-        (
-            "DELETE t FROM tickets t JOIN orders o ON o.id = t.id",
-            "tickets.*:write",
-        ),
+        ("DELETE FROM orders WHERE id = 1", "orders:write"),
+        ("SELECT id FROM orders FOR UPDATE", "orders:write"),
         (
             "INSERT INTO tickets VALUES (1, 'a', 'b')",
             "tickets.*:write",
@@ -1942,4 +1953,102 @@ fn the_host_can_name_the_default_schema() {
             .unwrap()
             .contains("default_schema")
     );
+}
+
+// ── 3.8.1 (contract v3.3): session boilerplate is never forced to block ─────
+
+/// A `block` and a `mask` tag on `customers` (they force parse errors to
+/// block, VERICTO-085).
+fn protective_tags() -> Vec<SensitiveColumn> {
+    vec![
+        SensitiveColumn {
+            schema: None,
+            table: "customers".into(),
+            column: "ssn".into(),
+            policy: SensitivePolicy::Block,
+            mask_style: MaskStyle::Full,
+        },
+        SensitiveColumn {
+            schema: None,
+            table: "customers".into(),
+            column: "email".into(),
+            policy: SensitivePolicy::Mask,
+            mask_style: MaskStyle::Full,
+        },
+    ]
+}
+
+#[test]
+fn session_boilerplate_is_not_blocked_by_tags_an_allowlist_or_both() {
+    let tags_only = EnforcementPolicy {
+        sensitive_columns: protective_tags(),
+        ..EnforcementPolicy::default()
+    };
+    let policy_only = with(allow(Vec::new()));
+    let both = EnforcementPolicy {
+        sensitive_columns: protective_tags(),
+        ..with(allow(Vec::new()))
+    };
+    for (name, p) in [
+        ("tags only", &tags_only),
+        ("policy only", &policy_only),
+        ("both", &both),
+    ] {
+        for &(d, sql) in SESSION_SETUP {
+            let o = crate::evaluate(sql, d, &[], p);
+            assert_ne!(o.decision, Decision::Block, "{name}: {d:?} {sql}: {o:?}");
+            assert!(o.access_denied.is_empty(), "{name}: {d:?} {sql}");
+            // The host-side resolution agrees (proxy and sidecar parse
+            // themselves): the host's choice, not a forced block.
+            assert_eq!(
+                p.effective_parse_error_for(sql, d),
+                p.parse_error,
+                "{name}: {d:?} {sql}"
+            );
+        }
+        // A host that chose to block parse errors still blocks them.
+        let strict = EnforcementPolicy {
+            parse_error: ParseErrorAction::Block,
+            ..p.clone()
+        };
+        assert_eq!(
+            strict.effective_parse_error_for(
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                Mysql
+            ),
+            ParseErrorAction::Block,
+            "{name}"
+        );
+    }
+    // Django's isolation level on a tagged MySQL workspace: sqlparser rejects
+    // it; the host's parse_error (allow and report) stands.
+    let o = crate::evaluate(
+        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        Mysql,
+        &[],
+        &tags_only,
+    );
+    assert_eq!(o.decision, Decision::Flag, "{o:?}");
+}
+
+#[test]
+fn unparseable_statements_off_the_session_list_still_block_with_tags() {
+    let tags_only = EnforcementPolicy {
+        sensitive_columns: protective_tags(),
+        ..EnforcementPolicy::default()
+    };
+    for (d, sql) in [
+        (Postgres, "SELEC ssn FROM customers"),
+        (Mysql, "SELECT ssn FROM customers LOCK IN SHARE MODE"),
+        (Mysql, "SET GLOBAL max_connections = 1"),
+        (Mysql, "SET NAMES utf8mb4; SELEC ssn FROM customers"),
+    ] {
+        let o = crate::evaluate(sql, d, &[], &tags_only);
+        assert_eq!(o.decision, Decision::Block, "{d:?} {sql}: {o:?}");
+        assert_eq!(
+            tags_only.effective_parse_error_for(sql, d),
+            ParseErrorAction::Block,
+            "{d:?} {sql}"
+        );
+    }
 }

@@ -225,8 +225,9 @@ pub(crate) enum Ref {
         schema: Option<String>,
         table: String,
     },
-    /// A write. `column`: `None` = the table as a target, `Some("*")` = every
-    /// column (INSERT without a column list, DELETE), else that column.
+    /// A write. `column`: `None` = the table as a target (also DELETE, a row
+    /// lock), `Some("*")` = every column (INSERT without a column list), else
+    /// that column.
     Write {
         schema: Option<String>,
         table: String,
@@ -244,6 +245,9 @@ pub(crate) struct Collector {
     by_id: std::cell::RefCell<Vec<Ref>>,
     /// Unqualified column names that resolved to more than one table.
     ambiguous: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// Inside the `FROM` of a `SELECT … FOR UPDATE/SHARE` with no `OF`: every
+    /// relation read there is also locked, a table-level write.
+    locking: std::cell::Cell<usize>,
 }
 
 impl Collector {
@@ -357,13 +361,33 @@ impl<'a> Tags<'a> {
     }
 
     /// Access analysis: a relation the statement reads from. No-op for tags.
+    /// Inside a locking `FROM` ([`Tags::locking`]) it is also a write.
     pub(crate) fn relation(&self, schema: Option<&str>, table: &str) {
         if let Some(c) = self.collect {
             c.intern(Ref::Relation {
                 schema: schema.map(str::to_string),
                 table: table.to_string(),
             });
+            if c.locking.get() > 0 {
+                self.write(schema, table, None);
+            }
         }
+    }
+
+    /// Access analysis: runs `f` (the walk of a `SELECT … FOR UPDATE/SHARE`'s
+    /// `FROM`, no `OF`) with every relation it reads recorded as locked too: a
+    /// row lock stalls every other writer, so it needs write, like `LOCK
+    /// TABLE`. No-op for tags.
+    pub(crate) fn locking<T>(&self, on: bool, f: impl FnOnce() -> T) -> T {
+        let c = self.collect.filter(|_| on);
+        if let Some(c) = c {
+            c.locking.set(c.locking.get() + 1);
+        }
+        let out = f();
+        if let Some(c) = c {
+            c.locking.set(c.locking.get() - 1);
+        }
+        out
     }
 
     /// Access analysis: a write target (see [`Ref::Write`]). No-op for tags.

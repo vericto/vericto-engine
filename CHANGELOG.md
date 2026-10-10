@@ -10,9 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [3.8.1] — 2026-10-09
 
 Name semantics of the agent access allowlists (VERICTO-087). Three gaps let an
-allowlist grant more than the table it named; each is closed. Nothing changes
-without an `access_policy`: the 3.7.0/3.8.0 golden ORM corpus is identical byte
-for byte. One optional field is added (`AccessPolicy::default_schema`); no rule
+allowlist grant more than the table it named; each is closed. Two write rules
+are settled (`DELETE` is a table-level write; row locks need write), and the
+session statements drivers send on connect are no longer blocked as parse errors
+on a workspace with `block`/`mask` tags. With no policy at all (no tags, no
+allowlist) nothing changes: the 3.7.0/3.8.0 golden ORM corpus is identical byte
+for byte there; under its tags-only policy exactly two session statements change
+from block to the host's parse-error choice (below). One optional field is added (`AccessPolicy::default_schema`); no rule
 code, JSON shape of existing fields or precedence changes. A host that builds
 `AccessPolicy` with a struct literal adds `default_schema: None` (or
 `..Default::default()`). Every fix below narrows what an allowlist allows; the
@@ -70,6 +74,44 @@ before) and a host-named default schema.
   error under an enforced policy. Protocol-level prepared statements (Postgres
   Parse/Bind, MySQL `COM_STMT_PREPARE`) are unaffected: the host evaluates their
   text when it is prepared.
+- **Session statements were blocked on every workspace with a `block` or `mask`
+  tag.** A tag makes a parse error block (a query the engine cannot read cannot
+  be shown not to read a tagged column), and sqlparser rejects some of the
+  statements drivers and ORMs send on every connection: Django's MySQL `SET
+  SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED`, for one, so every Django
+  connection to a tagged MySQL database failed, with or without an allowlist.
+  The closed list of session statements that already exempted these from an
+  enforced allowlist (`effective_parse_error_for`) now exempts them from the
+  tags too: they read no table and no column, so there is nothing for either
+  protection to guard. They keep the host's `parse_error` (a host that chose to
+  block parse errors still blocks them); anything off the list, or more than
+  one statement, still blocks. Hosts already call `effective_parse_error_for`
+  (`vericto_engine::evaluate` does); no API change. In the golden ORM corpus
+  this changes exactly two tags-only outcomes from block to flag (Django's
+  isolation level on MySQL, Rails' `sql_mode` setup sent to Postgres).
+- **`SELECT … FOR UPDATE` was allowed to a read-only identity.** A row lock
+  stalls every other writer of those rows, exactly as `LOCK TABLE` (which
+  already needed write) stalls the table. `FOR UPDATE`, `FOR NO KEY UPDATE`,
+  `FOR SHARE` and `FOR KEY SHARE` now need a `read_write` entry on each locked
+  table, reported as the table (`AccessPolicy > orders (write)`, column null):
+  with `OF`, the tables it names (through aliases); without, every table of the
+  `FROM`, sub-selects included (subqueries in `WHERE` are not locked and only
+  need read). On a set operation every table is taken as locked
+  (conservative). MySQL's `LOCK IN SHARE MODE` does not parse in sqlparser 0.52
+  and blocks as a parse error under an enforced policy.
+
+### Changed
+
+- **`DELETE` is a table-level write.** It needed `"columns": "*"` in a
+  `read_write` entry (a removed row loses every column's value) and was reported
+  as `orders.* (write)`; it now needs a `read_write` entry for the table,
+  whatever its column list, and is reported as the table, `AccessPolicy > orders
+  (write)` with column null, as the path documentation already said. Its
+  `WHERE`/`USING` still need read. The same holds for the `DELETE` action of
+  `MERGE`. This widens what an allowlist allows only for `read_write` entries
+  with a column list, which were written to let the agent change that table.
+  `REPLACE INTO` and an `INSERT` without a column list still need every column;
+  `TRUNCATE` stays denied as DDL.
 
 ## [3.8.0] — 2026-10-09
 

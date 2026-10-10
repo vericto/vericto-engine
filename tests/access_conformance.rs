@@ -8,10 +8,9 @@
 //! the contract does not pin the granularity of the list). An `Allow` row
 //! always requires `access_denied` to be empty.
 //!
-//! Rows the contract does not decide are `#[ignore = "NEEDS DECISION: …"]`;
-//! rows where the engine disagrees with the contract are
-//! `#[ignore = "DEFECT: …"]`. Run them with `cargo test --test
-//! access_conformance -- --ignored`.
+//! A row the contract does not decide is `#[ignore = "NEEDS DECISION: …"]`;
+//! a row where the engine disagrees with the contract is
+//! `#[ignore = "DEFECT: …"]` (contract v3.3: none of either).
 //!
 //! The fixture world (no rules in the `rules` slice, so every decision comes
 //! from VERICTO-085 and VERICTO-087):
@@ -143,8 +142,6 @@ enum Want {
     /// `None`, a non-Allow row must not come from a parse error (a parse error
     /// under `enforce` blocks with no refs, which would hide what is tested).
     Decided(Decision, Refs, Option<&'static str>),
-    /// The contract is silent; the row only prints what the engine does.
-    Undecided,
 }
 
 fn exact(r: &'static [&'static str]) -> Refs {
@@ -166,12 +163,13 @@ fn block(r: Refs) -> Want {
 fn parse_error() -> Want {
     Want::Decided(Decision::Block, Refs::Exact(&[]), Some(PARSE_ERROR))
 }
+/// A parse error left to the host's `parse_error` (default: allow and report).
+fn host_parse_error() -> Want {
+    Want::Decided(Decision::Flag, Refs::Exact(&[]), Some(PARSE_ERROR))
+}
 /// Allowed by the allowlist, blocked by a VERICTO-085 tag (contract §4).
 fn tag_block() -> Want {
     Want::Decided(Decision::Block, Refs::Exact(&[]), Some("VERICTO-085"))
-}
-fn undecided() -> Want {
-    Want::Undecided
 }
 
 fn refs(o: &EvaluationOutcome) -> Vec<String> {
@@ -204,7 +202,6 @@ fn check(dialect: Dialect, p: Pol, sql: &str, want: Want) {
         o.decision, o.rule_code, o.ast_node_path
     );
     match want {
-        Want::Undecided => panic!("{dialect:?} {p:?} `{sql}`: undecided; engine says {actual}"),
         Want::Decided(decision, r, rule) => {
             assert_eq!(
                 o.decision, decision,
@@ -459,9 +456,14 @@ rows! {
         "UPDATE orders SET status = 'x' WHERE id = 1 RETURNING id" => allow();
     pg_update_returning_disallowed: Postgres, Rw,
         "UPDATE orders SET status = 'x' WHERE id = 1 RETURNING note" => block(exact(&["orders.note:read"]));
-    #[ignore = "NEEDS DECISION: §3.1 gives DELETE the table-level path `orders (write)` but §5 says DELETE needs `\"*\"`; the engine reports `orders.*:write` with the `list the columns explicitly` hint. Which ref (and message) is the contract?"]
-    pg_delete_needs_all_columns: Postgres, Rw,
-        "DELETE FROM orders WHERE id = 1" => block(has(&["orders:write"]));
+    // v3.3: DELETE is a table-level write; any column list, the WHERE still reads.
+    pg_delete_read_write_any_columns: Postgres, Rw, "DELETE FROM orders WHERE id = 1" => allow();
+    pg_delete_read_only_table: Postgres, Fixture,
+        "DELETE FROM orders WHERE id = 1" => block(exact(&["orders:write"]));
+    pg_delete_where_disallowed: Postgres, Rw,
+        "DELETE FROM orders WHERE note = 'x'" => block(exact(&["orders.note:read"]));
+    pg_delete_using_other: Postgres, Rw,
+        "DELETE FROM orders o USING other x WHERE x.id = o.id" => block(has(&["other:read"]));
     pg_delete_star_rw: Postgres, StarRw, "DELETE FROM orders WHERE id = 1" => allow();
     pg_truncate: Postgres, StarRw, "TRUNCATE orders" => block(exact(&["TRUNCATE:ddl"]));
     pg_merge_using_other: Postgres, Rw,
@@ -476,8 +478,26 @@ rows! {
     pg_copy_from_read_only: Postgres, Fixture, "COPY orders (id, status) FROM STDIN" => block(has(&["orders:write"]));
     pg_copy_from: Postgres, Rw, "COPY orders (id, status) FROM STDIN" => allow();
     pg_copy_from_no_columns: Postgres, Rw, "COPY orders FROM STDIN" => block(has(&["orders.*:write"]));
-    #[ignore = "NEEDS DECISION: does SELECT ... FOR UPDATE (a row lock) need read_write like LOCK TABLE, or only read?"]
-    pg_select_for_update: Postgres, Fixture, "SELECT id FROM orders WHERE id = 1 FOR UPDATE" => undecided();
+    pg_merge_delete_read_write: Postgres, Rw,
+        "MERGE INTO orders o USING orders i ON o.id = i.id WHEN MATCHED THEN DELETE" => allow();
+    pg_merge_delete_read_only: Postgres, Fixture,
+        "MERGE INTO orders o USING orders i ON o.id = i.id WHEN MATCHED THEN DELETE" => block(exact(&["orders:write"]));
+    // v3.3: a row lock needs read_write on the locked tables, ref the table.
+    pg_select_for_update: Postgres, Fixture,
+        "SELECT id FROM orders WHERE id = 1 FOR UPDATE" => block(exact(&["orders:write"]));
+    pg_select_for_share: Postgres, Fixture, "SELECT id FROM orders FOR SHARE" => block(exact(&["orders:write"]));
+    pg_select_for_no_key_update: Postgres, Fixture,
+        "SELECT id FROM orders FOR NO KEY UPDATE SKIP LOCKED" => block(exact(&["orders:write"]));
+    pg_select_for_key_share: Postgres, Fixture, "SELECT id FROM orders FOR KEY SHARE" => block(exact(&["orders:write"]));
+    pg_select_for_update_read_write: Postgres, Rw, "SELECT id FROM orders WHERE id = 1 FOR UPDATE" => allow();
+    pg_select_for_update_of_alias: Postgres, Fixture,
+        "SELECT o.id FROM orders o JOIN orders p ON p.id = o.id FOR UPDATE OF o" => block(exact(&["orders:write"]));
+    pg_select_for_update_derived: Postgres, Fixture,
+        "SELECT s.id FROM (SELECT id FROM orders) s FOR UPDATE" => block(exact(&["orders:write"]));
+    pg_select_for_update_where_subquery_not_locked: Postgres, Rw,
+        "SELECT id FROM orders WHERE id IN (SELECT i.id FROM orders i) FOR UPDATE" => allow();
+    pg_select_for_update_cte_named_like_table: Postgres, Fixture,
+        "WITH orders AS (SELECT 1 AS id) SELECT id FROM orders FOR UPDATE" => allow();
 
     my_insert_read_only_table: Mysql, Fixture,
         "INSERT INTO orders (id, status) VALUES (1, 'x')" => block(has(&["orders:write"]));
@@ -490,22 +510,34 @@ rows! {
     my_update: Mysql, Rw, "UPDATE orders SET status = 'x' WHERE id = 1" => allow();
     my_update_reads_disallowed: Mysql, Rw,
         "UPDATE orders SET status = note WHERE id = 1" => block(exact(&["orders.note:read"]));
-    #[ignore = "NEEDS DECISION: §3.1 gives DELETE the table-level path `orders (write)` but §5 says DELETE needs `\"*\"`; the engine reports `orders.*:write` with the `list the columns explicitly` hint. Which ref (and message) is the contract?"]
-    my_delete_needs_all_columns: Mysql, Rw, "DELETE FROM orders WHERE id = 1" => block(has(&["orders:write"]));
+    my_delete_read_write_any_columns: Mysql, Rw, "DELETE FROM orders WHERE id = 1" => allow();
+    my_delete_read_only_table: Mysql, Fixture,
+        "DELETE FROM orders WHERE id = 1" => block(exact(&["orders:write"]));
+    my_delete_where_disallowed: Mysql, Rw,
+        "DELETE FROM orders WHERE note = 'x'" => block(exact(&["orders.note:read"]));
     my_delete_star_rw: Mysql, StarRw, "DELETE FROM orders WHERE id = 1" => allow();
     my_truncate: Mysql, StarRw, "TRUNCATE TABLE orders" => block(exact(&["TRUNCATE:ddl"]));
     my_replace_needs_all_columns: Mysql, Rw,
         "REPLACE INTO orders (id, status) VALUES (1, 'x')" => block(has(&["orders.*:write"]));
-    #[ignore = "NEEDS DECISION: does SELECT ... FOR UPDATE (a row lock) need read_write like LOCK TABLES, or only read?"]
-    my_select_for_update: Mysql, Fixture, "SELECT id FROM orders WHERE id = 1 FOR UPDATE" => undecided();
+    my_select_for_update: Mysql, Fixture,
+        "SELECT id FROM orders WHERE id = 1 FOR UPDATE" => block(exact(&["orders:write"]));
+    my_select_for_share: Mysql, Fixture, "SELECT id FROM orders FOR SHARE" => block(exact(&["orders:write"]));
+    my_select_for_update_read_write: Mysql, Rw, "SELECT id FROM orders WHERE id = 1 FOR UPDATE" => allow();
+    my_select_for_update_join: Mysql, Rw,
+        "SELECT o.id FROM orders o JOIN orders p ON p.id = o.id FOR UPDATE" => allow();
+    // Does not parse in sqlparser 0.52: blocks (not session boilerplate).
+    my_lock_in_share_mode: Mysql, Fixture, "SELECT id FROM orders LOCK IN SHARE MODE" => parse_error();
 
     ms_insert_values: MsSql, Rw, "INSERT INTO orders (id, status) VALUES (1, 'x')" => allow();
     ms_insert_read_only_table: MsSql, Fixture,
         "INSERT INTO orders (id, status) VALUES (1, 'x')" => block(has(&["orders:write"]));
     ms_update_reads_disallowed: MsSql, Rw,
         "UPDATE orders SET status = note WHERE id = 1" => block(exact(&["orders.note:read"]));
-    #[ignore = "NEEDS DECISION: §3.1 gives DELETE the table-level path `orders (write)` but §5 says DELETE needs `\"*\"`; the engine reports `orders.*:write` with the `list the columns explicitly` hint. Which ref (and message) is the contract?"]
-    ms_delete_needs_all_columns: MsSql, Rw, "DELETE FROM orders WHERE id = 1" => block(has(&["orders:write"]));
+    ms_delete_read_write_any_columns: MsSql, Rw, "DELETE FROM orders WHERE id = 1" => allow();
+    ms_delete_read_only_table: MsSql, Fixture,
+        "DELETE FROM orders WHERE id = 1" => block(exact(&["orders:write"]));
+    ms_merge_delete_read_write: MsSql, Rw,
+        "MERGE INTO orders AS o USING orders AS i ON o.id = i.id WHEN MATCHED THEN DELETE;" => allow();
     ms_truncate: MsSql, StarRw, "TRUNCATE TABLE orders" => block(exact(&["TRUNCATE:ddl"]));
     ms_merge_using_other: MsSql, Rw,
         "MERGE INTO orders AS o USING other AS x ON o.id = x.id WHEN MATCHED THEN UPDATE SET status = 'x';" => block(has(&["other:read"]));
@@ -631,11 +663,11 @@ rows! {
     my_set_max_execution_time: Mysql, Fixture, "SET max_execution_time = 1000" => allow();
     my_set_session_track: Mysql, Fixture, "SET session_track_schema = 1" => allow();
     my_set_transaction_isolation_var: Mysql, Fixture, "SET transaction_isolation = 'READ-COMMITTED'" => allow();
-    // Does not parse in sqlparser; on the session-boilerplate list (§8), so the
-    // allowlist alone would not force a block, but the fixture's block/mask tags
-    // do ("block/mask tags still do").
-    my_set_session_transaction_parse_error_tags_block: Mysql, Fixture,
-        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED" => parse_error();
+    // Does not parse in sqlparser; on the session-boilerplate list, so neither
+    // the allowlist nor the block/mask tags force a block (v3.3): the host's
+    // parse_error (default allow-and-report) stands.
+    my_set_session_transaction: Mysql, Fixture,
+        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED" => host_parse_error();
     my_set_user_variable: Mysql, Fixture, "SET @v = 1" => allow();
     my_set_sql_mode_literal: Mysql, Fixture, "SET sql_mode = 'STRICT_ALL_TABLES'" => allow();
     my_set_rails_setup: Mysql, Fixture,

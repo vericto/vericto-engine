@@ -140,6 +140,10 @@ struct Walker<'a, 't, 'p, 's> {
     /// The access analysis: every clause counts (WHERE, JOIN, GROUP BY, …),
     /// not only what is projected, and tables and write targets are recorded.
     all: bool,
+    /// Access analysis: the locking clauses (`FOR UPDATE/SHARE`) of the query
+    /// whose simple `SELECT` is walked next — `(no OF, the OF names)`. Taken by
+    /// that `SELECT`, so nested queries never inherit it.
+    lock: Option<(bool, Vec<ObjectName>)>,
 }
 
 /// `[db.]schema.table` of a write target, for [`Tags::write`].
@@ -219,6 +223,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             ansi_quotes: mysql.is_some(),
             oracle: false,
             all: false,
+            lock: None,
         }
     }
 
@@ -430,9 +435,10 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                                     targets.extend(found);
                                 }
                             }
+                            // Removing a row is a write to the table, whatever
+                            // its columns: a `read_write` entry, any column list.
                             for (schema, table) in &targets {
                                 self.tags.write(schema.as_deref(), table, None);
-                                self.tags.write(schema.as_deref(), table, Some("*"));
                             }
                             if let Some(w) = del.selection.as_mut() {
                                 self.expr(w, d)?;
@@ -568,9 +574,9 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                             if let Some((schema, table)) = &tgt {
                                 let schema = schema.as_deref();
                                 match &c.action {
-                                    MergeAction::Delete => {
-                                        self.tags.write(schema, table, Some("*"))
-                                    }
+                                    // A table-level write: the target's
+                                    // `None` write above.
+                                    MergeAction::Delete => {}
                                     MergeAction::Insert(ins) if ins.columns.is_empty() => {
                                         self.tags.write(schema, table, Some("*"))
                                     }
@@ -675,7 +681,19 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             false
         };
         let all = self.all;
+        // Access analysis: `FOR UPDATE/SHARE` locks rows, a write (see
+        // `select`).
+        let lock = (all && !q.locks.is_empty()).then(|| {
+            (
+                q.locks.iter().any(|l| l.of.is_none()),
+                q.locks
+                    .iter()
+                    .filter_map(|l| l.of.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
         let out = if let SetExpr::Select(sel) = q.body.as_mut() {
+            self.lock = lock;
             // A simple SELECT: its ORDER BY lives on the query. The access
             // analysis walks it inside the SELECT's scope (it may name FROM
             // columns that are not projected).
@@ -692,7 +710,12 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                     outs
                 })
         } else {
-            let out = self.set_expr(&mut q.body, sink, depth + 1);
+            // A locking set operation: every relation inside is taken as
+            // locked (conservative).
+            let tags = self.tags;
+            let out = tags.locking(lock.is_some(), || {
+                self.set_expr(&mut q.body, sink, depth + 1)
+            });
             if let (true, Ok(outs), Some(ob)) = (all, out.as_ref(), q.order_by.as_mut()) {
                 // ORDER BY of a set operation: output names, positions, or
                 // expressions over the enclosing scopes.
@@ -885,11 +908,32 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         } else {
             sink
         };
+        let (lock_all, lock_of) = self.lock.take().unwrap_or_default();
+        let tags = self.tags;
         self.scopes.push();
         let r = (|| -> Result<(Vec<OutCol>, Vec<Rewritten>, bool)> {
-            for twj in sel.from.iter_mut() {
-                for it in self.table_with_joins(twj, depth)? {
-                    self.scopes.add(it);
+            // A row lock needs write on the locked tables: every relation of
+            // the `FROM` (derived tables included) without `OF`, else the
+            // ones `OF` names.
+            tags.locking(lock_all, || -> Result<()> {
+                for twj in sel.from.iter_mut() {
+                    for it in self.table_with_joins(twj, depth)? {
+                        self.scopes.add(it);
+                    }
+                }
+                Ok(())
+            })?;
+            for n in &lock_of {
+                let parts: Vec<&str> = n.0.iter().map(|i| i.value.as_str()).collect();
+                let bases = self.scopes.base_tables(&parts);
+                if bases.is_empty() {
+                    // Not a base table in scope: taken as a table name,
+                    // denied unless granted for writing (conservative).
+                    let (schema, table) = target_of(n);
+                    tags.write(schema.as_deref(), &table, None);
+                }
+                for (schema, table) in &bases {
+                    tags.write(schema.as_deref(), table, None);
                 }
             }
             let p = self.projection(&mut sel.projection, sink, depth)?;

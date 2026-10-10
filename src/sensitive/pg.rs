@@ -401,9 +401,53 @@ impl Walker<'_, '_> {
         sink: Option<Sink>,
         depth: usize,
     ) -> Result<Vec<OutCol>> {
-        for item in s.from_clause.iter_mut() {
-            for it in self.range_item(item, depth + 1)? {
-                self.scopes.add(it);
+        // Access analysis: `FOR UPDATE/NO KEY UPDATE/SHARE/KEY SHARE` locks
+        // rows, which needs write on the locked tables: every relation of the
+        // `FROM` (sub-SELECTs included) when a clause has no `OF`, else the
+        // ones `OF` names.
+        let mut lock_all = false;
+        let mut lock_of: Vec<(Option<String>, String)> = Vec::new();
+        if self.all {
+            for n in &s.locking_clause {
+                if let Some(NodeEnum::LockingClause(l)) = n.node.as_ref() {
+                    if l.locked_rels.is_empty() {
+                        lock_all = true;
+                    }
+                    for r in &l.locked_rels {
+                        if let Some(NodeEnum::RangeVar(rv)) = r.node.as_ref() {
+                            lock_of.push((
+                                non_empty(&rv.schemaname).map(str::to_string),
+                                rv.relname.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let tags = self.tags;
+        tags.locking(lock_all, || -> Result<()> {
+            for item in s.from_clause.iter_mut() {
+                for it in self.range_item(item, depth + 1)? {
+                    self.scopes.add(it);
+                }
+            }
+            Ok(())
+        })?;
+        for (schema, table) in &lock_of {
+            let q: Vec<&str> = schema
+                .iter()
+                .map(String::as_str)
+                .chain([table.as_str()])
+                .collect();
+            let bases = self.scopes.base_tables(&q);
+            if bases.is_empty() {
+                // Not a base table in scope (a sub-SELECT alias, or a name
+                // the walk cannot place): taken as a table name, denied
+                // unless granted for writing (conservative).
+                tags.write(schema.as_deref(), table, None);
+            }
+            for (bs, bt) in &bases {
+                tags.write(bs.as_deref(), bt, None);
             }
         }
 
@@ -705,10 +749,10 @@ impl Walker<'_, '_> {
             }
             NodeEnum::DeleteStmt(s) => {
                 if let Some(rv) = s.relation.as_ref() {
-                    // Removing a row removes every column's value.
-                    let schema = non_empty(&rv.schemaname);
-                    self.tags.write(schema, &rv.relname, None);
-                    self.tags.write(schema, &rv.relname, Some("*"));
+                    // Removing a row is a write to the table, whatever its
+                    // columns: it needs a `read_write` entry (any column list).
+                    self.tags
+                        .write(non_empty(&rv.schemaname), &rv.relname, None);
                 }
                 if let Some(t) = s.relation.as_ref().map(base_item) {
                     self.scopes.add(t);
@@ -754,10 +798,10 @@ impl Walker<'_, '_> {
                         if let Some((schema, table)) = &tgt {
                             let schema = schema.as_deref();
                             let insert = c.command_type == protobuf::CmdType::CmdInsert as i32;
-                            let delete = c.command_type == protobuf::CmdType::CmdDelete as i32;
-                            // DELETE removes whole rows; INSERT without a
-                            // column list writes every column.
-                            if delete || (insert && c.target_list.is_empty()) {
+                            // DELETE is a table-level write (the target's
+                            // `None` write above); INSERT without a column
+                            // list writes every column.
+                            if insert && c.target_list.is_empty() {
                                 self.tags.write(schema, table, Some("*"));
                             } else if insert {
                                 for n in &c.target_list {

@@ -4,7 +4,9 @@
 //! them add. The full outcome of every query (every field, under several
 //! policies, with and without tags) must stay exactly what it was before the
 //! MySQL lexical normalization: `tests/fixtures/mysql_orm_corpus.golden` was
-//! written by this test on the commit before it.
+//! written by this test on the commit before it. Reviewed changes since: 3.8.1
+//! (two session statements under the tags-only policy, no longer blocked as
+//! parse errors; see the CHANGELOG).
 //!
 //! The same queries also run on Postgres, together with the MySQL-only
 //! constructs, to show the Postgres path is untouched.
