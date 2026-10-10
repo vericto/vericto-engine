@@ -41,6 +41,7 @@ fn allow(entries: Vec<AccessEntry>) -> AccessPolicy {
         mode: AccessMode::Enforce,
         entries,
         ddl: DdlPolicy::Deny,
+        default_schema: None,
     }
 }
 
@@ -523,9 +524,6 @@ fn session_and_transaction_statements_are_allowed() {
         "RESET ALL",
         "SHOW search_path",
         "SHOW transaction_isolation",
-        "PREPARE p AS SELECT id FROM customers WHERE id = $1",
-        "EXECUTE p(1)",
-        "DEALLOCATE p",
         "DECLARE c CURSOR FOR SELECT id FROM orders",
         "FETCH 10 FROM c",
         "CLOSE c",
@@ -537,12 +535,14 @@ fn session_and_transaction_statements_are_allowed() {
     ] {
         assert_allowed(sql);
     }
-    // The arguments of CALL / EXECUTE are read.
+    // The arguments of CALL are read.
     assert_denied(
         "CALL refresh_stats((SELECT email FROM customers LIMIT 1))",
         "customers.email:read",
     );
-    assert_denied("EXECUTE p((SELECT value FROM secrets))", "secrets:read");
+    // SQL-level EXECUTE is denied outright (3.8.1, see
+    // `sql_level_prepared_statements_are_denied`).
+    assert_denied("EXECUTE p((SELECT value FROM secrets))", "EXECUTE:ddl");
     assert_denied_on(
         Mysql,
         "CALL p((SELECT email FROM customers LIMIT 1))",
@@ -557,11 +557,8 @@ fn session_and_transaction_statements_are_allowed() {
     );
     assert_denied("SELECT set_config($1, $2, false)", "set_config:ddl");
     assert_allowed("SELECT set_config('application_name', 'agent', false)");
-    // The analysed statement of PREPARE / DECLARE still counts.
-    assert_denied(
-        "PREPARE p AS SELECT email FROM customers",
-        "customers.email:read",
-    );
+    // The analysed statement of DECLARE still counts; PREPARE is denied.
+    assert_denied("PREPARE p AS SELECT email FROM customers", "PREPARE:ddl");
     assert_denied("DECLARE c CURSOR FOR SELECT * FROM secrets", "secrets:read");
 }
 
@@ -692,12 +689,25 @@ fn schemas_resolve_conservatively() {
     let db_orders = allow(vec![in_schema("shop", entry("orders", &["*"], Read))]);
     assert_allowed_on(Mysql, "SELECT id FROM shop.orders", &db_orders);
     assert_denied_on(Mysql, "SELECT id FROM orders", &db_orders, "orders:read");
-    // A schema-less entry matches any (non-catalogue) schema.
-    assert_allowed_on(Postgres, "SELECT id FROM other.orders", &agent());
-    assert_allowed_on(Mysql, "SELECT id FROM shop.orders", &agent());
-    // Identifiers compare ASCII case-insensitively.
-    assert_allowed_on(Postgres, "SELECT \"Name\" FROM \"Customers\"", &agent());
-    assert_allowed_on(Mysql, "SELECT `ID`, Name FROM `Customers`", &agent());
+    // A schema-less entry is the default schema's table only (3.8.1, see
+    // `an_entry_without_a_schema_matches_only_the_default_schema`).
+    assert_denied_on(
+        Postgres,
+        "SELECT id FROM other.orders",
+        &agent(),
+        "other.orders:read",
+    );
+    assert_denied_on(
+        Mysql,
+        "SELECT id FROM shop.orders",
+        &agent(),
+        "shop.orders:read",
+    );
+    // Identifiers compare the way each dialect compares them (3.8.1, see
+    // `postgres_identifiers_fold_unless_quoted` and
+    // `mysql_table_names_compare_exactly_and_column_names_do_not`).
+    assert_allowed_on(Postgres, "SELECT Name FROM Customers", &agent());
+    assert_allowed_on(Mysql, "SELECT `ID`, Name FROM `customers`", &agent());
 }
 
 // ── the other dialects ──────────────────────────────────────────────────────
@@ -1546,4 +1556,390 @@ fn session_statements_change_nothing_without_a_policy() {
         assert!(o.access_denied.is_empty());
         assert_ne!(o.rule_code.as_deref(), Some(ACCESS_RULE_CODE));
     }
+}
+
+// ── 3.8.1: default schema, identifier case, SQL-level prepared statements ───
+
+fn quoted(e: AccessEntry) -> AccessEntry {
+    AccessEntry {
+        table: format!("\"{}\"", e.table),
+        ..e
+    }
+}
+
+#[test]
+fn an_entry_without_a_schema_matches_only_the_default_schema() {
+    // Postgres: a schema-less entry is `public`'s table.
+    let p = agent();
+    for sql in [
+        "SELECT id FROM orders",
+        "SELECT id FROM public.orders",
+        "SELECT id FROM PUBLIC.orders",
+        "UPDATE public.tickets SET status = 'x' WHERE id = 1",
+    ] {
+        assert_allowed_on(Postgres, sql, &p);
+    }
+    for (sql, want) in [
+        ("SELECT id FROM other.orders", "other.orders:read"),
+        ("SELECT count(*) FROM archive.orders", "archive.orders:read"),
+        (
+            "UPDATE archive.tickets SET status = 'x' WHERE id = 1",
+            "archive.tickets:write",
+        ),
+        // The same table name in two schemas: only `public`'s is granted.
+        (
+            "SELECT a.id FROM public.orders a JOIN archive.orders b ON b.id = a.id",
+            "archive.orders:read",
+        ),
+        (
+            "SELECT id FROM orders WHERE id IN (SELECT o.id FROM archive.orders o)",
+            "archive.orders:read",
+        ),
+    ] {
+        assert_denied_on(Postgres, sql, &p, want);
+    }
+    // An entry naming a schema keeps working as in 3.8.0, and grants only it.
+    let sales = allow(vec![in_schema("sales", entry("orders", &["*"], Read))]);
+    assert_allowed_on(Postgres, "SELECT id FROM sales.orders", &sales);
+    assert_denied_on(Postgres, "SELECT id FROM orders", &sales, "orders:read");
+    assert_denied_on(
+        Postgres,
+        "SELECT id FROM archive.orders",
+        &sales,
+        "archive.orders:read",
+    );
+    // Both schemas granted: both readable, the join too.
+    let both = allow(vec![
+        entry("orders", &["*"], Read),
+        in_schema("archive", entry("orders", &["id"], Read)),
+    ]);
+    assert_allowed_on(
+        Postgres,
+        "SELECT a.id, a.total FROM public.orders a JOIN archive.orders b ON b.id = a.id",
+        &both,
+    );
+    assert_denied_on(
+        Postgres,
+        "SELECT b.total FROM archive.orders b",
+        &both,
+        "archive.orders.total:read",
+    );
+
+    // SQL Server: `dbo`.
+    assert_allowed_on(MsSql, "SELECT id FROM dbo.orders", &p);
+    assert_allowed_on(MsSql, "SELECT id FROM orders", &p);
+    assert_denied_on(
+        MsSql,
+        "SELECT id FROM sales.orders",
+        &p,
+        "sales.orders:read",
+    );
+
+    // MySQL: the session's database, i.e. unqualified names only (the engine
+    // cannot see which database is current).
+    assert_allowed_on(Mysql, "SELECT id FROM orders", &p);
+    assert_denied_on(Mysql, "SELECT id FROM shop.orders", &p, "shop.orders:read");
+    assert_denied_on(
+        Mysql,
+        "SELECT o.id FROM orders o JOIN other_db.orders x ON x.id = o.id",
+        &p,
+        "other_db.orders:read",
+    );
+    let shop = allow(vec![
+        entry("orders", &["*"], Read),
+        in_schema("shop", entry("orders", &["*"], Read)),
+    ]);
+    assert_allowed_on(Mysql, "SELECT id FROM shop.orders", &shop);
+    assert_allowed_on(Mysql, "SELECT id FROM orders", &shop);
+    assert_denied_on(
+        Mysql,
+        "SELECT id FROM other_db.orders",
+        &shop,
+        "other_db.orders:read",
+    );
+
+    // Oracle: the user's schema, which the engine cannot see either.
+    assert_allowed_on(Oracle, "SELECT id FROM orders", &p);
+    assert_denied_on(Oracle, "SELECT id FROM hr.orders", &p, "hr.orders:read");
+}
+
+#[test]
+fn postgres_identifiers_fold_unless_quoted() {
+    let p = agent(); // `customers` (id, name), unquoted
+    // Unquoted in the query: folded to lower case, the entry's table.
+    for sql in [
+        "SELECT id, name FROM Customers",
+        "SELECT ID, NAME FROM CUSTOMERS",
+        "SELECT c.Id FROM Public.Customers c",
+    ] {
+        assert_allowed_on(Postgres, sql, &p);
+    }
+    // Quoted mixed case: a different table (and column) from the lower-case
+    // entry.
+    assert_denied_on(
+        Postgres,
+        "SELECT id FROM \"Customers\"",
+        &p,
+        "Customers:read",
+    );
+    assert_denied_on(
+        Postgres,
+        "SELECT \"Name\" FROM customers",
+        &p,
+        "customers.Name:read",
+    );
+    assert_denied_on(
+        Postgres,
+        "SELECT id FROM \"Public\".customers",
+        &p,
+        "Public.customers:read",
+    );
+    // An entry written unquoted folds too: `Customers` is `customers`.
+    let folded = allow(vec![entry("Customers", &["ID"], Read)]);
+    assert_allowed_on(Postgres, "SELECT id FROM customers", &folded);
+    assert_denied_on(
+        Postgres,
+        "SELECT id FROM \"Customers\"",
+        &folded,
+        "Customers:read",
+    );
+    // A quoted entry compares exactly: that is how the dashboard sends a
+    // case-sensitive name.
+    let exact = allow(vec![
+        quoted(entry("Customers", &["id", "\"Name\""], Read)),
+        in_schema("\"Sales\"", entry("orders", &["*"], Read)),
+    ]);
+    assert_allowed_on(Postgres, "SELECT id, \"Name\" FROM \"Customers\"", &exact);
+    assert_allowed_on(Postgres, "SELECT * FROM \"Sales\".orders", &exact);
+    assert_denied_on(
+        Postgres,
+        "SELECT id FROM customers",
+        &exact,
+        "customers:read",
+    );
+    assert_denied_on(
+        Postgres,
+        "SELECT name FROM \"Customers\"",
+        &exact,
+        "Customers.name:read",
+    );
+    assert_denied_on(
+        Postgres,
+        "SELECT * FROM sales.orders",
+        &exact,
+        "sales.orders:read",
+    );
+    // Prisma on Postgres quotes every name: its mixed-case model tables need
+    // a quoted entry; its lower-case ones match either way.
+    let prisma = "SELECT \"public\".\"User\".\"id\", \"public\".\"User\".\"email\" FROM \"public\".\"User\" WHERE \"public\".\"User\".\"id\" = $1 LIMIT $2 OFFSET $3";
+    let user = |t: &str| allow(vec![entry(t, &["id", "email"], Read)]);
+    assert_allowed_on(Postgres, prisma, &user("\"User\""));
+    assert_denied_on(Postgres, prisma, &user("User"), "public.User:read");
+    assert_allowed_on(
+        Postgres,
+        "SELECT \"public\".\"orders\".\"id\" FROM \"public\".\"orders\"",
+        &agent(),
+    );
+    // An embedded quote is doubled, as in SQL.
+    let odd = allow(vec![entry("\"we\"\"ird\"", &["*"], Read)]);
+    assert_allowed_on(Postgres, "SELECT * FROM \"we\"\"ird\"", &odd);
+}
+
+#[test]
+fn mysql_table_names_compare_exactly_and_column_names_do_not() {
+    let p = agent();
+    // Columns: case-insensitive, as MySQL compares them.
+    assert_allowed_on(Mysql, "SELECT ID, `Name` FROM customers", &p);
+    // Tables: exact (`lower_case_table_names=0` keeps `Customers` and
+    // `customers` apart), backticks or not.
+    for (sql, want) in [
+        ("SELECT id FROM Customers", "Customers:read"),
+        ("SELECT id FROM `CUSTOMERS`", "CUSTOMERS:read"),
+        (
+            "UPDATE Tickets SET status = 'x' WHERE id = 1",
+            "Tickets:write",
+        ),
+    ] {
+        assert_denied_on(Mysql, sql, &p, want);
+    }
+    // An entry spelled as the table is stored matches it, and only it.
+    let seq = allow(vec![entry("Users", &["id", "email"], Read)]);
+    assert_allowed_on(Mysql, "SELECT `id`, `EMAIL` FROM `Users` AS `User`", &seq);
+    assert_denied_on(Mysql, "SELECT id FROM users", &seq, "users:read");
+    // `information_schema` compares case-insensitively, as MySQL does.
+    let mut cat = agent();
+    cat.entries.push(in_schema(
+        "information_schema",
+        entry("TABLES", &["*"], Read),
+    ));
+    assert_allowed_on(
+        Mysql,
+        "SELECT table_name FROM information_schema.tables",
+        &cat,
+    );
+    assert_allowed_on(
+        Mysql,
+        "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES",
+        &cat,
+    );
+    assert_allowed_on(Mysql, "SHOW TABLES", &cat);
+    // Database names compare exactly too (they are directories, like tables).
+    let shop = allow(vec![in_schema("shop", entry("orders", &["*"], Read))]);
+    assert_denied_on(
+        Mysql,
+        "SELECT id FROM SHOP.orders",
+        &shop,
+        "SHOP.orders:read",
+    );
+
+    // SQL Server and Oracle: unchanged, ASCII case-insensitive.
+    assert_allowed_on(MsSql, "SELECT ID, Name FROM [Customers]", &p);
+    assert_allowed_on(MsSql, "SELECT id FROM DBO.CUSTOMERS", &p);
+    assert_allowed_on(Oracle, "SELECT ID, NAME FROM CUSTOMERS", &p);
+    assert_allowed_on(Oracle, "SELECT \"ID\" FROM \"CUSTOMERS\"", &p);
+}
+
+#[test]
+fn sql_level_prepared_statements_are_denied() {
+    // The engine cannot know which statement an EXECUTE runs: the name is
+    // bound in the session, possibly by an earlier call, or by text the
+    // engine never sees (MySQL `PREPARE s FROM @sql`).
+    let p = agent();
+    for (sql, want) in [
+        (
+            "PREPARE p AS SELECT id FROM customers WHERE id = $1",
+            "PREPARE:ddl",
+        ),
+        ("PREPARE p (int) AS SELECT * FROM secrets", "PREPARE:ddl"),
+        ("EXECUTE p(1)", "EXECUTE:ddl"),
+        ("EXECUTE p", "EXECUTE:ddl"),
+        ("EXPLAIN EXECUTE p(1)", "EXECUTE:ddl"),
+        ("DEALLOCATE p", "DEALLOCATE:ddl"),
+        ("DEALLOCATE PREPARE ALL", "DEALLOCATE:ddl"),
+    ] {
+        assert_denied_on(Postgres, sql, &p, want);
+    }
+    // MySQL's `PREPARE s FROM '…'` does not parse (sqlparser reads only
+    // `PREPARE s AS …`): a parse error, which blocks under an enforced policy.
+    let o = eval(Mysql, "PREPARE s FROM 'SELECT id FROM customers'", &p);
+    assert_eq!(o.decision, Decision::Block, "{o:?}");
+    for (sql, want) in [
+        ("PREPARE s AS SELECT id FROM customers", "PREPARE:ddl"),
+        ("EXECUTE s", "EXECUTE:ddl"),
+        ("EXECUTE s USING @a, @b", "EXECUTE:ddl"),
+        ("DEALLOCATE PREPARE s", "DEALLOCATE:ddl"),
+    ] {
+        assert_denied_on(Mysql, sql, &p, want);
+    }
+    // SQL Server's EXEC is the same statement (`EXEC sp_executesql @sql`).
+    assert_denied_on(MsSql, "EXEC refresh_stats", &p, "EXECUTE:ddl");
+    // Observe mode reports them.
+    let observe = AccessPolicy {
+        mode: AccessMode::Observe,
+        ..agent()
+    };
+    let o = eval(Postgres, "EXECUTE p(1)", &observe);
+    assert_eq!(o.decision, Decision::Flag, "{o:?}");
+    assert_eq!(o.rule_code.as_deref(), Some(ACCESS_RULE_CODE));
+    // Without a policy nothing changes.
+    for (d, sql) in [
+        (Postgres, "PREPARE p AS SELECT 1"),
+        (Postgres, "EXECUTE p"),
+        (Postgres, "DEALLOCATE p"),
+        (Mysql, "EXECUTE s"),
+    ] {
+        let o = crate::evaluate(sql, d, &[], &EnforcementPolicy::default());
+        assert_eq!(o.decision, Decision::Allow, "{d:?} {sql}: {o:?}");
+    }
+}
+
+fn with_default(schema: &str, p: AccessPolicy) -> AccessPolicy {
+    AccessPolicy {
+        default_schema: Some(schema.into()),
+        ..p
+    }
+}
+
+#[test]
+fn the_host_can_name_the_default_schema() {
+    // MySQL: a name qualified with the connection's database is the default
+    // schema, so Prisma's `db`.`User` matches an entry without a schema.
+    let p = with_default(
+        "db",
+        allow(vec![
+            entry("User", &["*"], ReadWrite),
+            entry("Post", &["*"], ReadWrite),
+            entry("users", &["id", "email"], Read),
+        ]),
+    );
+    for sql in [
+        "SELECT `db`.`User`.`id`, `db`.`User`.`email` FROM `db`.`User` WHERE `db`.`User`.`id` = ? LIMIT ? OFFSET ?",
+        "INSERT INTO `db`.`User` (`email`,`name`) VALUES (?,?)",
+        "UPDATE `db`.`User` SET `name` = ? WHERE (`db`.`User`.`id` = ? AND 1=1)",
+        "DELETE FROM `db`.`Post` WHERE (`db`.`Post`.`id` IN (?,?) AND 1=1)",
+        "SELECT `db`.`users`.`email` FROM `db`.`users` WHERE `db`.`users`.`id` = ? LIMIT ? OFFSET ?",
+        "SELECT `id` FROM `User`",
+    ] {
+        assert_allowed_on(Mysql, sql, &p);
+    }
+    // Any other qualifier still needs an entry naming it; the comparison is
+    // exact, like MySQL database names.
+    assert_denied_on(Mysql, "SELECT id FROM other.User", &p, "other.User:read");
+    assert_denied_on(Mysql, "SELECT id FROM DB.User", &p, "DB.User:read");
+    // The catalogue is never the default schema's.
+    let cat = with_default(
+        "information_schema",
+        allow(vec![entry("TABLES", &["*"], Read)]),
+    );
+    assert_denied_on(
+        Mysql,
+        "SELECT * FROM information_schema.TABLES",
+        &cat,
+        "information_schema.TABLES:read",
+    );
+    // Absent: 3.8.1 without it (qualified names need an entry naming them).
+    let absent = AccessPolicy {
+        default_schema: None,
+        ..p.clone()
+    };
+    assert_denied_on(
+        Mysql,
+        "SELECT `db`.`User`.`id` FROM `db`.`User`",
+        &absent,
+        "db.User:read",
+    );
+    assert_allowed_on(Mysql, "SELECT `id` FROM `User`", &absent);
+
+    // Postgres: replaces `public` for unqualified and qualified names.
+    let app = with_default("app", agent());
+    assert_allowed_on(Postgres, "SELECT id FROM orders", &app);
+    assert_allowed_on(Postgres, "SELECT id FROM app.orders", &app);
+    assert_denied_on(
+        Postgres,
+        "SELECT id FROM public.orders",
+        &app,
+        "public.orders:read",
+    );
+    assert_allowed_on(Postgres, "SELECT id FROM public.orders", &agent());
+    // SQL Server: replaces `dbo`.
+    let sales = with_default("sales", agent());
+    assert_allowed_on(MsSql, "SELECT id FROM sales.orders", &sales);
+    assert_allowed_on(MsSql, "SELECT id FROM orders", &sales);
+    assert_denied_on(
+        MsSql,
+        "SELECT id FROM dbo.orders",
+        &sales,
+        "dbo.orders:read",
+    );
+
+    // JSON: optional, and absent by default.
+    let j: AccessPolicy = serde_json::from_str(r#"{"default_schema": "db"}"#).unwrap();
+    assert_eq!(j.default_schema.as_deref(), Some("db"));
+    let j: AccessPolicy = serde_json::from_str("{}").unwrap();
+    assert_eq!(j.default_schema, None);
+    assert!(
+        !serde_json::to_string(&j)
+            .unwrap()
+            .contains("default_schema")
+    );
 }

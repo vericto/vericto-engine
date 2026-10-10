@@ -232,8 +232,23 @@ fn orm_corpus_outcomes_are_unchanged() {
     );
 }
 
-/// Every table the corpus touches, granted read/write on every column.
+/// Every table the corpus touches, granted read/write on every column, the way
+/// the ORMs name them: unqualified (the default schema), and, for Prisma,
+/// qualified with the MySQL database name `db` (since 3.8.1 a schema-less
+/// entry is the default schema's table only, and on MySQL that is the
+/// unqualified name: the engine cannot see the session's database).
 fn permissive() -> AccessPolicy {
+    let mut entries = schema_less_entries();
+    entries.extend(PRISMA_DB_TABLES.iter().map(
+        |t| serde_json::json!({"schema": "db", "table": t, "columns": "*", "access": "read_write"}),
+    ));
+    serde_json::from_value(serde_json::json!({ "mode": "enforce", "entries": entries })).unwrap()
+}
+
+/// The tables Prisma qualifies with the database name in the corpus.
+const PRISMA_DB_TABLES: &[&str] = &["User", "Post", "users"];
+
+fn schema_less_entries() -> Vec<serde_json::Value> {
     let tables = [
         "users",
         "notes",
@@ -250,11 +265,73 @@ fn permissive() -> AccessPolicy {
         "Posts",
         "accounts",
     ];
-    let entries: Vec<serde_json::Value> = tables
+    tables
         .iter()
         .map(|t| serde_json::json!({"table": t, "columns": "*", "access": "read_write"}))
+        .collect()
+}
+
+/// 3.8.1: with schema-less entries only (the 3.8.0 corpus policy) and no
+/// `default_schema` from the host, exactly
+/// the queries that qualify a table with a database name change — Prisma's
+/// `` `db`.`User` `` on MySQL — and they change to a VERICTO-087 denial of
+/// that qualified table. Every unqualified ORM query keeps its decision.
+#[test]
+fn schema_less_entries_do_not_cover_a_database_qualified_name() {
+    let rules = ruleset();
+    let policy = EnforcementPolicy {
+        access_policy: Some(
+            serde_json::from_value(
+                serde_json::json!({ "mode": "enforce", "entries": schema_less_entries() }),
+            )
+            .unwrap(),
+        ),
+        ..EnforcementPolicy::default()
+    };
+    let mut changed = Vec::new();
+    for sql in ORM {
+        let base = evaluate(sql, Dialect::Mysql, &rules, &EnforcementPolicy::default());
+        let o = evaluate(sql, Dialect::Mysql, &rules, &policy);
+        if o.decision != base.decision || !o.access_denied.is_empty() {
+            assert_eq!(o.decision, Decision::Block, "{sql}");
+            assert!(
+                o.access_denied
+                    .iter()
+                    .all(|d| d.schema.as_deref() == Some("db")),
+                "{sql}: {:?}",
+                o.access_denied
+            );
+            changed.push(*sql);
+        }
+    }
+    let qualified: Vec<&str> = ORM
+        .iter()
+        .copied()
+        .filter(|q| q.contains("`db`."))
         .collect();
-    serde_json::from_value(serde_json::json!({ "mode": "enforce", "entries": entries })).unwrap()
+    assert_eq!(changed, qualified);
+    assert_eq!(changed.len(), 6);
+
+    // With the host naming the connection's database (`default_schema`), a
+    // name qualified with it is the default schema's: the same schema-less
+    // entries cover all of them, and no ORM decision changes.
+    let host = EnforcementPolicy {
+        access_policy: Some(
+            serde_json::from_value(serde_json::json!({
+                "mode": "enforce",
+                "default_schema": "db",
+                "entries": schema_less_entries(),
+            }))
+            .unwrap(),
+        ),
+        ..EnforcementPolicy::default()
+    };
+    for sql in ORM {
+        let base = evaluate(sql, Dialect::Mysql, &rules, &EnforcementPolicy::default());
+        let o = evaluate(sql, Dialect::Mysql, &rules, &host);
+        assert_eq!(o.decision, base.decision, "{sql}: {:?}", o.access_denied);
+        assert!(o.access_denied.is_empty(), "{sql}: {:?}", o.access_denied);
+    }
 }
 
 /// An agent granted every table its ORM uses gets exactly the decision it

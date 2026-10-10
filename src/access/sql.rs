@@ -191,7 +191,7 @@ fn catalogue(tags: &Tags, table: &str) -> Result<Class> {
     Ok(Class::Allowed)
 }
 
-/// `CALL f(…)` / `EXECUTE p(…)`: the arguments analysed as `SELECT <args>`.
+/// `CALL f(…)`: the arguments analysed as `SELECT <args>`.
 fn arguments(tags: &Tags, dialect: Dialect, args: &[Expr]) -> Result<Class> {
     if args.is_empty() {
         return Ok(Class::Allowed);
@@ -249,7 +249,7 @@ fn classify(s: &Statement, tags: &Tags, depth: usize, dialect: Dialect) -> Resul
         | Statement::Copy { .. }
         | Statement::Declare { .. } => Ok(Class::Walk),
         // The statement inside is what runs (EXPLAIN ANALYZE executes it).
-        Statement::Explain { statement, .. } | Statement::Prepare { statement, .. } => {
+        Statement::Explain { statement, .. } => {
             match classify(statement, tags, depth + 1, dialect)? {
                 Class::Allowed => Ok(Class::Allowed),
                 other => Ok(other),
@@ -359,7 +359,6 @@ fn classify(s: &Statement, tags: &Tags, depth: usize, dialect: Dialect) -> Resul
         | Statement::SetNamesDefault { .. }
         | Statement::SetTimeZone { .. }
         | Statement::SetTransaction { .. }
-        | Statement::Deallocate { .. }
         | Statement::Fetch { .. }
         | Statement::Close { .. }
         | Statement::Discard { .. }
@@ -368,12 +367,17 @@ fn classify(s: &Statement, tags: &Tags, depth: usize, dialect: Dialect) -> Resul
         | Statement::UnlockTables => Ok(Class::Allowed),
         // Allowed, but the arguments are values the statement reads.
         Statement::Call(f) => arguments(tags, dialect, &[Expr::Function(f.clone())]),
-        Statement::Execute {
-            parameters, using, ..
-        } => {
-            let all: Vec<Expr> = parameters.iter().chain(using).cloned().collect();
-            arguments(tags, dialect, &all)
-        }
+        // SQL-level prepared statements: `EXECUTE s` runs whatever `s` was
+        // bound to in this session (MySQL `PREPARE s FROM @sql`: text the
+        // engine never sees), so no EXECUTE can be judged; the three are
+        // denied together. On SQL Server `EXEC` parses as this too, and is
+        // denied for the same reason (`EXEC sp_executesql @sql`, `EXEC (@sql)`).
+        // Protocol-level prepared statements (COM_STMT_PREPARE) are
+        // unaffected: the host evaluates the statement text when it is
+        // prepared.
+        Statement::Prepare { .. } => denied("PREPARE"),
+        Statement::Execute { .. } => denied("EXECUTE"),
+        Statement::Deallocate { .. } => denied("DEALLOCATE"),
         Statement::CreateTable(ct) if ct.query.is_some() => denied("CREATE TABLE AS"),
         Statement::CreateTable(_) => denied("CREATE TABLE"),
         Statement::CreateView { .. } => denied("CREATE VIEW"),
