@@ -173,20 +173,27 @@ impl<'de> Deserialize<'de> for AccessColumns {
 }
 
 impl AccessColumns {
-    fn covers(&self, column: &str) -> bool {
+    fn covers(&self, dialect: Dialect, column: &str) -> bool {
+        let case = column_case(dialect);
         match self {
             AccessColumns::AllColumns => true,
-            AccessColumns::List(cols) => cols.iter().any(|c| ieq(c, column)),
+            AccessColumns::List(cols) => cols
+                .iter()
+                .any(|c| case.eq(&entry_ident(dialect, c), column)),
         }
     }
 }
 
-/// One grant: a table (in a schema, or in any schema), some or all of its
-/// columns, read or read/write.
+/// One grant: a table (in a schema, or in the default schema), some or all of
+/// its columns, read or read/write.
 ///
 /// JSON: `{"schema":"public","table":"orders","columns":"*","access":"read"}`.
-/// `schema` may be null or absent (any schema; never a catalogue schema);
-/// `schema_name` / `table_name` are accepted as aliases.
+/// `schema` may be null, empty or absent: the **default schema** only
+/// (`public` on Postgres, `dbo` on SQL Server, the unqualified name on MySQL
+/// and Oracle; never a catalogue schema). Names are written unquoted and
+/// compared the way the dialect compares them; on Postgres they fold to lower
+/// case unless written in double quotes (`"Customers"`). `schema_name` /
+/// `table_name` are accepted as aliases.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AccessEntry {
     #[serde(default, alias = "schema_name")]
@@ -212,6 +219,16 @@ pub struct AccessPolicy {
     pub entries: Vec<AccessEntry>,
     #[serde(default)]
     pub ddl: DdlPolicy,
+    /// The schema unqualified names resolve to, **set by the host** (never by
+    /// the customer): on MySQL the connection's current database (the
+    /// handshake's), on Postgres the first schema of a known `search_path`, on
+    /// SQL Server the user's default schema. As stored, unquoted. A name
+    /// qualified with it is the default schema's too, so it matches entries
+    /// without a schema (Prisma's `` `db`.`User` ``). `None` (or empty): `public`
+    /// on Postgres, `dbo` on SQL Server, unknown on MySQL (unqualified names
+    /// only). Ignored on Oracle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_schema: Option<String>,
 }
 
 /// The policies of a database, keyed by database user, as the TCP proxy
@@ -302,26 +319,139 @@ fn effective_schema(dialect: Dialect, schema: Option<&str>, table: &str) -> Opti
 }
 
 /// The schema an unqualified name lands in without a `search_path` change
-/// (which is denied under a policy). MySQL and Oracle default to the
-/// connection's database / user, which the engine cannot see.
-fn default_schema(dialect: Dialect) -> Option<&'static str> {
+/// (which is denied under a policy): the host's
+/// [`AccessPolicy::default_schema`] when it sets one, else `public` on
+/// Postgres and `dbo` on SQL Server. MySQL's is the session's current
+/// database, unknown unless the host names it; Oracle's is the user's schema,
+/// never known.
+fn default_schema(dialect: Dialect, host: Option<&str>) -> Option<&str> {
+    let host = host.filter(|s| !s.is_empty());
     match dialect {
-        Dialect::Postgres => Some("public"),
-        Dialect::MsSql => Some("dbo"),
-        Dialect::Mysql | Dialect::Oracle => None,
+        Dialect::Postgres => host.or(Some("public")),
+        Dialect::MsSql => host.or(Some("dbo")),
+        Dialect::Mysql => host,
+        Dialect::Oracle => None,
     }
 }
 
-fn entry_matches(e: &AccessEntry, dialect: Dialect, schema: Option<&str>, table: &str) -> bool {
-    if !ieq(&e.table, table) {
+/// How the dialect compares an identifier of some kind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Case {
+    /// Byte for byte (after the entry is folded the way the dialect folds it).
+    Exact,
+    /// ASCII case-insensitively.
+    Insensitive,
+}
+
+impl Case {
+    fn eq(self, a: &str, b: &str) -> bool {
+        match self {
+            Case::Exact => a == b,
+            Case::Insensitive => ieq(a, b),
+        }
+    }
+}
+
+/// Schema and table names.
+/// - Postgres: exact. The query's names come out of the parser already
+///   folded (unquoted → lower case, quoted → as written), and the entry's are
+///   folded the same way by [`entry_ident`].
+/// - MySQL: exact, the conservative reading of `lower_case_table_names=0`
+///   (tables and databases are files, so `Orders` and `orders` can be two
+///   tables). `information_schema` is the exception MySQL makes itself: its
+///   names compare case-insensitively under every setting.
+/// - SQL Server and Oracle: ASCII case-insensitive, as in 3.8.0 (SQL
+///   Server's default collations are case-insensitive; Oracle folds unquoted
+///   names to upper case, so only a quoted mixed-case name is compared more
+///   loosely than Oracle does).
+fn relation_case(dialect: Dialect, schema: Option<&str>) -> Case {
+    match dialect {
+        Dialect::Postgres => Case::Exact,
+        Dialect::Mysql if schema.is_some_and(|s| ieq(s, "information_schema")) => Case::Insensitive,
+        Dialect::Mysql => Case::Exact,
+        Dialect::MsSql | Dialect::Oracle => Case::Insensitive,
+    }
+}
+
+/// Column names: exact on Postgres (folded as above); case-insensitive on
+/// MySQL (as MySQL compares them), SQL Server and Oracle.
+fn column_case(dialect: Dialect) -> Case {
+    match dialect {
+        Dialect::Postgres => Case::Exact,
+        Dialect::Mysql | Dialect::MsSql | Dialect::Oracle => Case::Insensitive,
+    }
+}
+
+/// An entry's identifier (schema, table or column) the way the dialect
+/// stores it. Entries are written unquoted, so on Postgres they fold to lower
+/// case, exactly as the same name unquoted in a query would; an entry written
+/// in double quotes (`"Customers"`, with `""` for an embedded quote) is taken
+/// as written. That is how a case-sensitive Postgres name is granted. MySQL
+/// also accepts backticks; elsewhere quotes are stripped and the name compares
+/// as the dialect compares names.
+fn entry_ident(dialect: Dialect, raw: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let unquote = |q: char| -> Option<String> {
+        let inner = raw.strip_prefix(q)?.strip_suffix(q)?;
+        let doubled: String = [q, q].iter().collect();
+        Some(inner.replace(&doubled, &q.to_string()))
+    };
+    if raw.len() >= 2 {
+        if let Some(s) = unquote('"') {
+            return Cow::Owned(s);
+        }
+        if dialect == Dialect::Mysql {
+            if let Some(s) = unquote('`') {
+                return Cow::Owned(s);
+            }
+        }
+    }
+    match dialect {
+        // PostgreSQL folds ASCII letters only (`downcase_identifier`).
+        Dialect::Postgres if raw.bytes().any(|b| b.is_ascii_uppercase()) => {
+            Cow::Owned(raw.to_ascii_lowercase())
+        }
+        _ => Cow::Borrowed(raw),
+    }
+}
+
+/// Whether entry `e` is the relation `schema.table` of the query (`schema`
+/// already through [`effective_schema`]).
+///
+/// An entry without a schema is the table **in the default schema** only
+/// ([`default_schema`]), qualified with it or not in the query; where the
+/// default is unknown (MySQL without a host value, Oracle), only the
+/// unqualified name. A table of the same name in any other schema needs
+/// an entry naming that schema. An entry naming a schema matches that schema,
+/// and the unqualified name where the default schema is known to be it.
+fn entry_matches(
+    e: &AccessEntry,
+    dialect: Dialect,
+    host_default: Option<&str>,
+    schema: Option<&str>,
+    table: &str,
+) -> bool {
+    let case = relation_case(dialect, schema);
+    if !case.eq(&entry_ident(dialect, &e.table), table) {
         return false;
     }
-    match (e.schema.as_deref(), schema) {
-        // A catalogue reference needs an entry naming that schema.
-        (None, Some(qs)) => !is_system(qs),
+    // An empty schema is no schema (a blank field in the dashboard).
+    let entry_schema = e
+        .schema
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| entry_ident(dialect, s));
+    let default = default_schema(dialect, host_default);
+    match (entry_schema.as_deref().or(default), schema.or(default)) {
+        (Some(es), Some(qs)) => {
+            // A catalogue reference needs an entry naming that schema, even
+            // when the host's default schema is a catalogue one.
+            (entry_schema.is_some() || !is_system(qs)) && case.eq(es, qs)
+        }
         (None, None) => true,
-        (Some(es), Some(qs)) => ieq(es, qs),
-        (Some(es), None) => default_schema(dialect).is_some_and(|d| ieq(es, d)),
+        // Default unknown: a schema-less entry is not a qualified name, nor a
+        // qualified entry an unqualified name.
+        _ => false,
     }
 }
 
@@ -444,7 +574,15 @@ fn check(refs: &[Ref], policy: &AccessPolicy, dialect: Dialect) -> Vec<DeniedRef
                 let entries: Vec<&AccessEntry> = policy
                     .entries
                     .iter()
-                    .filter(|e| entry_matches(e, dialect, schema.as_deref(), table))
+                    .filter(|e| {
+                        entry_matches(
+                            e,
+                            dialect,
+                            policy.default_schema.as_deref(),
+                            schema.as_deref(),
+                            table,
+                        )
+                    })
                     .collect();
                 let (needed, column) = match r {
                     Ref::Write { column, .. } => (Needed::Write, column.as_deref()),
@@ -471,7 +609,7 @@ fn check(refs: &[Ref], policy: &AccessPolicy, dialect: Dialect) -> Vec<DeniedRef
                     Some("*") => candidates
                         .iter()
                         .any(|e| e.columns == AccessColumns::AllColumns),
-                    Some(c) => candidates.iter().any(|e| e.columns.covers(c)),
+                    Some(c) => candidates.iter().any(|e| e.columns.covers(dialect, c)),
                 };
                 if !ok {
                     denied.insert(deny(schema, table, column, needed));

@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.8.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.8.1" }
 ```
 
 ### Quick example
@@ -477,7 +477,7 @@ assert_eq!(probe.access_denied[0].column.as_deref(), Some("email")); // for the 
 ```
 
 An entry is `{"schema": null, "table": "orders", "columns": "*" | ["id", …], "access": "read" | "read_write"}`
-(`schema` optional = any schema). The policy is `{"mode": "observe" | "enforce", "ddl": "deny", "entries": [ … ]}`.
+(`schema` optional = the default schema, see *Names* below). The policy is `{"mode": "observe" | "enforce", "ddl": "deny", "entries": [ … ]}`.
 Absent or unknown values fail safe: `mode` → `enforce`, `access` → `read`,
 `columns` other than `"*"` never widen to every column. The TCP proxy receives one
 policy per database user ([`AccessPolicyMap`](src/access/mod.rs), with an optional
@@ -501,17 +501,47 @@ because a predicate lets an agent probe a value it may not read. Every table in
 - **DDL is always denied**, and so are the statements that change who the session
   is or where unqualified names resolve (`SET ROLE`, `SET SESSION AUTHORIZATION`,
   `SET search_path`, `USE`). A statement kind not known to be harmless is denied;
-  transaction control, settings, cursors, `PREPARE`/`EXECUTE` and `CALL` are allowed
-  (functions are out of scope).
+  transaction control, settings, cursors and `CALL` are allowed (functions are out
+  of scope).
+- **SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE` are denied** (`needed: ddl`), on
+  every dialect (SQL Server's `EXEC` included): `EXECUTE p` runs whatever `p` was
+  bound to earlier in the session, or to text the engine never sees (MySQL
+  `PREPARE s FROM @sql`), so no `EXECUTE` can be judged. MySQL's
+  `PREPARE s FROM '…'` does not parse and blocks as a parse error under an
+  enforced policy. Protocol-level prepared statements (Postgres Parse/Bind,
+  MySQL `COM_STMT_PREPARE`) are unaffected: the host evaluates the statement text
+  when it is prepared.
 - **The catalogue** (`information_schema`, `pg_catalog`, `mysql`,
   `performance_schema`, `sys`) is denied unless an entry names that schema
   explicitly; an unqualified `pg_*` relation is `pg_catalog`'s, and MySQL `SHOW
   TABLES`/`COLUMNS`/`DATABASES`/`CREATE …` read `information_schema`.
 - **Names resolve conservatively.** An unqualified column resolves against every
   relation in scope (subqueries see the outer ones) and must be allowed in all of
-  them — otherwise it is denied and the message says to qualify it. An unqualified
-  table matches an entry without a schema, or `public` (Postgres) / `dbo` (SQL
-  Server). A qualifier that names nothing in scope is taken as a table.
+  them — otherwise it is denied and the message says to qualify it. A qualifier
+  that names nothing in scope is taken as a table.
+- **An entry without a schema is the table in the default schema only**:
+  `public` on Postgres and `dbo` on SQL Server (qualified or not in the query);
+  on MySQL (the session's database) and Oracle (the user's schema), which the
+  engine cannot see, the unqualified name only. The host can name the default
+  schema in `AccessPolicy::default_schema` (never the customer): on MySQL the
+  connection's database, so a name qualified with it (Prisma's
+  `` `db`.`User` ``, compared exactly) matches entries without a schema; on
+  Postgres and SQL Server it replaces `public` / `dbo`. A table of the same name
+  in any other schema — on MySQL, a name qualified with any other database —
+  needs an entry naming that schema.
+  An entry naming a schema matches that schema, and the unqualified name where
+  the default schema is known to be it (`public`, `dbo`). An empty `schema` is no
+  schema.
+- **Identifier case follows the dialect.** Postgres: unquoted names fold to lower
+  case and quoted names compare exactly, in the query and in the entry alike —
+  an entry `Customers` is `customers`; a case-sensitive name is sent quoted,
+  `"Customers"` (an embedded `"` doubled), in `schema`, `table` or a column.
+  MySQL: table and database names compare exactly (the conservative reading of
+  `lower_case_table_names=0`; `information_schema`'s names case-insensitively, as
+  MySQL compares them), column names case-insensitively; backticks around an
+  entry's name are accepted. SQL Server and Oracle: ASCII case-insensitive, as
+  before (SQL Server's default collations are; on Oracle a quoted mixed-case name
+  compares more loosely than Oracle does).
 - **`SET` is deny by default** under a policy: an unlisted setting can be
   dangerous even with a literal value (`session_replication_role`,
   `foreign_key_checks`, `unique_checks`, `sql_log_bin`,

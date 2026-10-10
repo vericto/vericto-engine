@@ -15,10 +15,10 @@ enum Class {
     /// Reads or writes tables: walked.
     Walk,
     /// Touches no table and cannot widen access (transaction control,
-    /// settings, cursors, prepared-statement plumbing).
+    /// settings, cursors).
     Allowed,
-    /// `CALL f(…)` / `EXECUTE p(…)`: allowed, but the arguments are values
-    /// the statement reads (`CALL f((SELECT email FROM customers))`).
+    /// `CALL f(…)`: allowed, but the arguments are values the statement
+    /// reads (`CALL f((SELECT email FROM customers))`).
     Arguments,
     /// DDL, or a statement that changes the identity or how names resolve.
     Denied(String),
@@ -65,7 +65,6 @@ fn statement(node: &mut NodeEnum, tags: &Tags) -> Result<()> {
                         }]
                     })
                     .unwrap_or_default(),
-                NodeEnum::ExecuteStmt(e) => e.params.clone(),
                 _ => Vec::new(),
             };
             let target_list = args
@@ -120,21 +119,25 @@ fn classify(node: &NodeEnum, depth: usize) -> Result<Class> {
             Class::Allowed => Ok(Class::Walk),
             other => Ok(other),
         },
-        NodeEnum::PrepareStmt(p) => match inner(p.query.as_deref(), depth)? {
-            Class::Allowed => Ok(Class::Walk),
-            other => Ok(other),
-        },
+        // SQL-level prepared statements: `EXECUTE p` runs whatever `p` was
+        // bound to in this session, possibly by an earlier call the engine
+        // never saw together with this one, so no EXECUTE can be judged; the
+        // three are denied together. Protocol-level prepared statements (the
+        // extended protocol's Parse) are unaffected: the host evaluates the
+        // statement text when it is parsed.
+        NodeEnum::PrepareStmt(_) => denied("PREPARE"),
+        NodeEnum::ExecuteStmt(_) => denied("EXECUTE"),
+        NodeEnum::DeallocateStmt(_) => denied("DEALLOCATE"),
         NodeEnum::VariableSetStmt(v) => Ok(variable_set(v)),
         NodeEnum::TransactionStmt(_)
         | NodeEnum::VariableShowStmt(_)
-        | NodeEnum::DeallocateStmt(_)
         | NodeEnum::ClosePortalStmt(_)
         | NodeEnum::FetchStmt(_)
         | NodeEnum::ListenStmt(_)
         | NodeEnum::UnlistenStmt(_)
         | NodeEnum::NotifyStmt(_)
         | NodeEnum::DiscardStmt(_) => Ok(Class::Allowed),
-        NodeEnum::CallStmt(_) | NodeEnum::ExecuteStmt(_) => Ok(Class::Arguments),
+        NodeEnum::CallStmt(_) => Ok(Class::Arguments),
         NodeEnum::CreateTableAsStmt(c) => {
             if c.objtype == ObjectType::ObjectMatview as i32 {
                 denied("CREATE MATERIALIZED VIEW")

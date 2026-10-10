@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.8.1] — 2026-10-09
+
+Name semantics of the agent access allowlists (VERICTO-087). Three gaps let an
+allowlist grant more than the table it named; each is closed. Nothing changes
+without an `access_policy`: the 3.7.0/3.8.0 golden ORM corpus is identical byte
+for byte. One optional field is added (`AccessPolicy::default_schema`); no rule
+code, JSON shape of existing fields or precedence changes. A host that builds
+`AccessPolicy` with a struct literal adds `default_schema: None` (or
+`..Default::default()`). Every fix below narrows what an allowlist allows; the
+widenings are an empty `schema` string read as no schema (it matched nothing
+before) and a host-named default schema.
+
+### Added
+
+- **`AccessPolicy::default_schema`** (JSON `"default_schema"`, optional), set by
+  the host, never by the customer: the schema unqualified names resolve to. On
+  MySQL it is the connection's current database, and a name qualified with it
+  (compared exactly) is the default schema's, so Prisma's `` `db`.`User` ``
+  matches an entry without a schema instead of needing a duplicate entry per
+  table; a name qualified with any other database still needs an entry naming
+  it. On Postgres it replaces `public` (for a host that knows the session's
+  `search_path`) and on SQL Server `dbo`, for unqualified names and names
+  qualified with it. Absent or empty: `public`, `dbo`, and on MySQL unqualified
+  names only. Ignored on Oracle. A catalogue schema is never matched by a
+  schema-less entry, even when named as the default.
+
+### Fixed
+
+- **An entry without a schema matched the table in every schema.** An entry
+  `{"table": "orders"}` written for `public.orders` also allowed
+  `archive.orders`, `audit.orders` or any other schema's table of that name, so
+  an agent could read (or, with `read_write`, change) a table nobody granted by
+  qualifying it. A schema-less entry is now the table in the **default schema**
+  only: `public` on Postgres and `dbo` on SQL Server, qualified or not; on MySQL
+  (the session's database) and Oracle (the user's schema), which the engine
+  cannot see, the unqualified name only. A table in any other schema needs an
+  entry that names that schema; entries that name a schema work as before.
+  On MySQL a name qualified with the current database itself (Prisma's
+  `` `db`.`User` ``) is the default schema's only when the host names that
+  database in `default_schema`; otherwise it needs an entry with
+  `"schema": "db"`.
+- **Identifiers compared case-insensitively on every dialect.** On Postgres,
+  `"Customers"` (quoted) and `customers` are two tables, and `"Email"` and
+  `email` two columns; an entry for one allowed the other. Postgres now folds
+  as Postgres does: unquoted names (in the query and in the entry) fold to
+  lower case, quoted names compare exactly; an entry written in double quotes,
+  `"Customers"`, is a case-sensitive name. On MySQL, table and database names
+  now compare exactly (the conservative reading of `lower_case_table_names=0`,
+  where `Orders` and `orders` can be two tables; `information_schema`'s names
+  stay case-insensitive, as MySQL compares them), and column names
+  case-insensitively, as MySQL compares them. SQL Server and Oracle keep the
+  ASCII case-insensitive comparison.
+- **SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE` were allowed.** `EXECUTE p`
+  runs whatever `p` was bound to earlier in the session, possibly by a call the
+  engine evaluated on its own, or by text it never sees (MySQL
+  `PREPARE s FROM @sql`), so the engine cannot know what an `EXECUTE` reads or
+  writes. The three are now denied under any access policy (`needed: ddl`,
+  `AccessPolicy > EXECUTE (ddl): denied for this identity`), on Postgres, MySQL
+  and SQL Server (whose `EXEC` is the same statement: `EXEC sp_executesql
+  @sql`); MySQL's `PREPARE s FROM '…'` does not parse and blocks as a parse
+  error under an enforced policy. Protocol-level prepared statements (Postgres
+  Parse/Bind, MySQL `COM_STMT_PREPARE`) are unaffected: the host evaluates their
+  text when it is prepared.
+
 ## [3.8.0] — 2026-10-09
 
 Agent access allowlists: a new rule, **VERICTO-087 "Access outside the agent's
@@ -1110,7 +1174,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.8.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.8.1...HEAD
+[3.8.1]: https://github.com/vericto/vericto-engine/compare/v3.8.0...v3.8.1
 [3.8.0]: https://github.com/vericto/vericto-engine/compare/v3.7.0...v3.8.0
 [3.7.0]: https://github.com/vericto/vericto-engine/compare/v3.6.1...v3.7.0
 [3.6.1]: https://github.com/vericto/vericto-engine/compare/v3.6.0...v3.6.1

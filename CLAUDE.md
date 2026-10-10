@@ -19,7 +19,7 @@ Bumping the version here means bumping the tag in both consumers (they are usual
 Requires `libclang` and `protobuf` on the system — `pg_query` builds vendored PostgreSQL sources via bindgen.
 
 ```bash
-cargo test --all                       # 304 tests: unit, proptest, integration
+cargo test --all                       # 310 tests: unit, proptest, integration
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 
