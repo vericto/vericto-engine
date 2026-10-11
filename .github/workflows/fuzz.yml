@@ -1,0 +1,94 @@
+# Weekly, time-boxed fuzzing of the public parse + evaluate entry point
+# (fuzz/fuzz_targets/evaluate.rs). The only job in this workflow runs the
+# fuzzer; it never runs on pull requests.
+#
+# The repository is public, so its logs and artifacts are too: a crash input
+# is a reproducer for a denial of service. The fuzzer's own output therefore
+# stays in a file on the runner, and crash inputs leave it only encrypted to
+# the age public key in the FUZZ_ARTIFACT_AGE_RECIPIENT repository variable
+# (see fuzz/README.md). Without that variable the job just fails.
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    name: fuzz evaluate (10 min)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # cargo-fuzz needs nightly (sanitizer flags). The repository's
+      # rust-toolchain.toml pins stable, so every cargo call names +nightly.
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: nightly
+
+      - name: Install system dependencies (libclang + protoc for pg_query)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libclang-dev clang protobuf-compiler
+
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked --version 0.13.2
+
+      # The corpus the fuzzer grew in earlier runs (inputs that reach new code,
+      # not crashes), so each week starts where the last one stopped.
+      - name: Restore corpus
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: fuzz/corpus/evaluate
+          key: fuzz-corpus-evaluate-${{ github.run_id }}
+          restore-keys: fuzz-corpus-evaluate-
+
+      - name: Fuzz for 10 minutes
+        id: fuzz
+        run: |
+          mkdir -p fuzz/corpus/evaluate
+          if cargo +nightly fuzz run evaluate -- \
+               -max_total_time=600 -max_len=65537 -timeout=10 -rss_limit_mb=2048 \
+               > "$RUNNER_TEMP/fuzz.log" 2>&1; then
+            echo "No crash in 10 minutes."
+            tail -n 3 "$RUNNER_TEMP/fuzz.log"
+          else
+            # Deliberately not printing the log: it holds the crash input.
+            echo "::error::The fuzzer found a crash or the build failed; details are withheld from this public log."
+            grep -m1 -E '^(INFO: Seed|error(\[|:))' "$RUNNER_TEMP/fuzz.log" | cut -c1-200 || true
+            echo "crashed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Encrypt crash inputs
+        if: steps.fuzz.outputs.crashed == 'true' && vars.FUZZ_ARTIFACT_AGE_RECIPIENT != ''
+        env:
+          RECIPIENT: ${{ vars.FUZZ_ARTIFACT_AGE_RECIPIENT }}
+        run: |
+          sudo apt-get install -y --no-install-recommends age
+          tar -czf "$RUNNER_TEMP/findings.tar.gz" -C fuzz artifacts -C "$RUNNER_TEMP" fuzz.log
+          age -r "$RECIPIENT" -o "$RUNNER_TEMP/findings.tar.gz.age" "$RUNNER_TEMP/findings.tar.gz"
+
+      - name: Upload encrypted crash inputs
+        if: steps.fuzz.outputs.crashed == 'true' && vars.FUZZ_ARTIFACT_AGE_RECIPIENT != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-findings-encrypted
+          path: ${{ runner.temp }}/findings.tar.gz.age
+          retention-days: 7
+
+      - name: Fail on a crash
+        if: steps.fuzz.outputs.crashed == 'true'
+        run: exit 1
