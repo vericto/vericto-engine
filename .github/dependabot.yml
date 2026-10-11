@@ -1,7 +1,11 @@
-# Keeps the SHA-pinned GitHub Actions in ci.yml current. Security updates for
-# Cargo dependencies are enabled in the repository settings; routine Cargo version
-# bumps are deliberately left out — a pg_query or sqlparser upgrade can change how
-# SQL is parsed, so it is done by hand with its own CHANGELOG entry.
+# Keeps the SHA-pinned GitHub Actions current, and proposes Cargo updates once
+# a month in a single grouped PR.
+#
+# pg_query and sqlparser are left out of the version updates: an upgrade of
+# either can change how SQL is parsed, so it is done by hand with its own
+# CHANGELOG entry. Security fixes are not missed for them: Dependabot security
+# updates are on in the repository settings, and the `supply-chain` CI job
+# (cargo-deny + cargo-audit) fails every PR while a RustSec advisory applies.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -10,3 +14,20 @@ updates:
       interval: weekly
     commit-message:
       prefix: ci
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: chore(deps)
+    ignore:
+      - dependency-name: pg_query
+      - dependency-name: sqlparser
+      # Major bumps change APIs; they are done by hand.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    groups:
+      cargo:
+        patterns: ["*"]

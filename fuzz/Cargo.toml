@@ -1,0 +1,28 @@
+# cargo-fuzz harness for the engine (https://rust-fuzz.github.io/book/).
+# Not part of the published crate: its own workspace, built with nightly by
+# `cargo +nightly fuzz run evaluate` (see fuzz/README.md and
+# .github/workflows/fuzz.yml).
+[package]
+name = "vericto-engine-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Elastic-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+vericto-engine = { path = ".." }
+
+# Keeps the fuzz crate out of any parent workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "evaluate"
+path = "fuzz_targets/evaluate.rs"
+test = false
+doc = false
+bench = false
