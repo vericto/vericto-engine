@@ -33,6 +33,11 @@
 //! assert!(result.decision == Decision::Block);
 //! ```
 
+// No `unsafe` in this crate: the only unsafe code it runs is in its parser
+// dependencies (libpg_query over FFI in `pg_query`). Forbidding it keeps a
+// future change from adding any without an explicit, reviewed opt-out.
+#![forbid(unsafe_code)]
+
 pub mod access;
 pub mod error;
 pub mod parser;
