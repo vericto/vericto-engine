@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.8.1" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.8.2" }
 ```
 
 ### Quick example
