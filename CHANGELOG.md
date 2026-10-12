@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **RUSTSEC-2024-0449: `serde_yaml` replaced by `serde_norway`.** Custom-rule YAML
+  (`ast_condition_yaml`) was parsed with `serde_yaml` 0.9, which is deprecated
+  and runs `unsafe-libyaml`, a machine translation of libyaml that is
+  unmaintained (RUSTSEC-2024-0449). That advisory failed `cargo deny` and
+  `cargo audit` on every build of 3.8.2. `serde_norway` 0.9.42 is the
+  maintained fork of `serde_yaml` 0.9: the same parser, the same `Value` and the
+  same error messages, under MIT OR Apache-2.0, with a minimum Rust version of
+  1.71. The YAML a rule accepts is unchanged: the same text parses to the same
+  rule, and a rule the old parser rejected is still rejected and skipped with
+  the same warning text, field and position included. The rule templates of the
+  dashboard editor and the documented examples are now tests
+  (`tests/custom_rule_yaml.rs`). `cargo deny check` and `cargo audit` pass with
+  no ignored advisory.
+
 ## [3.8.2] — 2026-10-11
 
 Security hardening from the 2026-10 review of the public repositories. **No rule,
