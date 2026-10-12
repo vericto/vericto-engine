@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.9.0] — 2026-10-12
+
+Dependency release: `serde_yaml` is replaced (RUSTSEC-2024-0449, which fails
+`cargo deny` and `cargo audit` on 3.8.2) and sqlparser, the parser of MySQL,
+Oracle and MS SQL, moves from 0.52 to 0.63. **No public API changes**: hosts
+build against 3.9.0 unchanged, and no rule code, JSON shape or precedence
+changes. What changes is the SQL the sqlparser dialects accept: text 3.8.2
+could not parse, whose outcome was the host's `parse_error` choice, is now
+evaluated by the rules (below). Statement kinds the engine does not model keep
+resolving as parse errors, and every verdict was compared with 3.8.2 on the
+SQL of the test suites, fixtures and documentation of the engine and its
+consumers: nothing 3.8.2 blocked by a rule is allowed, unless sqlparser 0.52
+had misread the text (MySQL SELECT modifiers read as columns, `--1` read as a
+comment). PostgreSQL (`pg_query`) is unaffected.
+
+**3.8.2 was never tagged.** Its changes (the hardening release of 2026-10-11:
+`#![forbid(unsafe_code)]`, cargo-deny/cargo-audit, gitleaks, Dependabot and the
+fuzz target) ship in this release; a host on 3.8.1 moving to 3.9.0 gets both
+entries below.
+
+### Changed
+
+- **sqlparser 0.52 → 0.63** (the parser of MySQL, Oracle and MS SQL; PostgreSQL
+  still uses `pg_query`). No public API changes: no sqlparser type is part of the
+  crate's API. What changes is the SQL these dialects accept. Most text 3.8.2
+  could not parse now parses and is evaluated by the rules like any other
+  statement, so its outcome is the rules' verdict instead of the host's
+  `parse_error` choice (with a protective tag or an enforced allowlist: a block).
+  Among the statements in the test suites and fixtures, these change:
+  data-modifying CTEs (`WITH d AS (DELETE … RETURNING …) SELECT …`) on every
+  dialect, and `DELETE … RETURNING`, `UPDATE … FROM`, `DROP INDEX i ON t`,
+  `ALTER TABLE … ALTER COLUMN … TYPE`, `COPY … FROM STDIN`, `COMMENT ON`,
+  `ANALYZE` and `DROP TRIGGER … ON t` where a dialect rejected them; MySQL's
+  `SET SESSION TRANSACTION …` (sent on connect by Django, Hibernate and
+  SQLAlchemy), now allowed as it is on PostgreSQL; MySQL index hints,
+  `WITH ROLLUP`, `b'…'` bit literals and SELECT modifiers (`HIGH_PRIORITY`,
+  `SQL_CALC_FOUND_ROWS`, `SQL_NO_CACHE`, …), which sqlparser misread as a column
+  with an alias (an allowlist reported a read of a column named
+  `HIGH_PRIORITY`); MySQL `--` not followed by a space, which sqlparser now reads
+  as MySQL does (two minus signs), so such text is analysed for sensitive
+  columns instead of blocked as unreadable; SQL Server `DECLARE … CURSOR FOR
+  SELECT …`. A mask rewrite now keeps the client's spelling of table aliases
+  (no inserted `AS`), `LIMIT a, b` and `INNER JOIN`. Parse error messages are
+  sqlparser's own and may read differently.
+- sqlparser's default `recursive-protection` feature adds `recursive`, `stacker`
+  and `psm` (MIT / MIT OR Apache-2.0): the parser grows its stack instead of
+  overflowing on deeply nested input. The engine's own nesting guard
+  (`MAX_AST_DEPTH`, `guard_nesting_depth`) is unchanged.
+
+### Fixed
+
+- A data-modifying statement inside a CTE (`WITH x AS (UPDATE accounts SET
+  balance = 0 RETURNING id) SELECT …`) was parsed on the sqlparser dialects but
+  never evaluated: the walker skipped CTE bodies that are not a `SELECT`, so an
+  `UPDATE` without `WHERE` in one was not reported. It is now evaluated as a
+  nested statement, as on PostgreSQL. This widens what is blocked; MySQL, Oracle
+  and SQL Server reject the syntax themselves, so no working query is affected.
+
 ### Security
 
 - **RUSTSEC-2024-0449: `serde_yaml` replaced by `serde_norway`.** Custom-rule YAML
@@ -22,8 +80,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dashboard editor and the documented examples are now tests
   (`tests/custom_rule_yaml.rs`). `cargo deny check` and `cargo audit` pass with
   no ignored advisory.
+- **What sqlparser 0.63 reads that 0.52 rejected is never silently allowed.**
+  Statement kinds that are new in sqlparser and that the engine does not model
+  (`VACUUM`, `LOCK TABLE`, `RESET`, `RENAME TABLE`, `DENY`, `CREATE USER`, SQL
+  Server's `IF`/`WHILE`/`BEGIN … END` blocks, `PRINT`, `RAISERROR`, `THROW`,
+  `WAITFOR`, …), the server-wide `SET GLOBAL …`, `SET SESSION AUTHORIZATION`,
+  SQL Server's session options (`SET NOCOUNT ON`, …) and the pipe syntax
+  (`FROM t |> SELECT …`) still resolve as the parse errors they were. The
+  classification is an exhaustive match on sqlparser's statement kinds, so the
+  next upgrade fails to compile until every kind it adds is classified.
+- sqlparser's MySQL and Generic tokenizers now splice the content of a
+  `/*! … */` comment into the statement as code, whatever its version number.
+  Oracle (Generic dialect) never executes such a comment: it is read as a
+  comment again, as in 3.8.2, so `DELETE FROM t /*!99999 WHERE id = 1 */` is
+  still the unbounded `DELETE` Oracle runs. The MySQL sensitive-column analysis
+  still refuses text with executable comments (MySQL's own reading goes through
+  the lexical normalizer, unchanged).
+- Shapes sqlparser now reads differently keep their verdict: SQL Server's
+  `WHERE true` / `WHERE NOT FALSE` (the words are identifiers since 0.53) are
+  still tautologies (VERICTO-003); MySQL's `"public"."User"."email"` (a column
+  under `ANSI_QUOTES`, now read as field access on a string) is still a read of
+  that column (VERICTO-085, VERICTO-087); SQL Server's `db..t` resolves to the
+  default schema; `OUTPUT` clauses are analysed like `RETURNING`, and MySQL's
+  `INSERT … SET` like `UPDATE … SET`. Pinned in `tests/sqlparser_upgrade.rs`.
 
-## [3.8.2] — 2026-10-11
+## [3.8.2] — 2026-10-11 (not tagged; included in 3.9.0)
 
 Security hardening from the 2026-10 review of the public repositories. **No rule,
 API or behaviour changes**: the crate's public API, JSON shapes and evaluation
@@ -1251,7 +1332,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.8.1...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.9.0...HEAD
+[3.9.0]: https://github.com/vericto/vericto-engine/compare/v3.8.1...v3.9.0
 [3.8.1]: https://github.com/vericto/vericto-engine/compare/v3.8.0...v3.8.1
 [3.8.0]: https://github.com/vericto/vericto-engine/compare/v3.7.0...v3.8.0
 [3.7.0]: https://github.com/vericto/vericto-engine/compare/v3.6.1...v3.7.0

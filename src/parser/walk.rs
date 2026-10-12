@@ -11,8 +11,8 @@ use crate::parser::{
 };
 
 use sqlparser::ast::{
-    Expr, FromTable, FunctionArguments, ObjectType, Query, SelectItem, SetExpr, Statement,
-    TableFactor, TableWithJoins, Value,
+    Expr, FromTable, FunctionArguments, LimitClause, ObjectType, Query, SelectItem, SetExpr,
+    Statement, TableFactor, TableWithJoins, Value, ValueWithSpan,
 };
 use sqlparser::dialect::Dialect as SqlDialect;
 use sqlparser::parser::Parser as SqlAstParser;
@@ -46,6 +46,13 @@ pub(crate) fn parse_text<D: SqlDialect>(
 
     let statements =
         SqlAstParser::parse_sql(dialect, sql).map_err(|e| ProxyError::ParseError(e.to_string()))?;
+    // A statement kind sqlparser 0.52 rejected still resolves as the parse
+    // error it was (see `not_analysed`).
+    if let Some(kind) = statements.iter().find_map(not_analysed) {
+        return Err(ProxyError::ParseError(format!(
+            "{kind}: statement not supported by the engine"
+        )));
+    }
 
     let mut collected: Vec<StatementInfo> = Vec::new();
     for stmt in &statements {
@@ -61,6 +68,260 @@ pub(crate) fn parse_text<D: SqlDialect>(
         },
         mysql: None,
     })
+}
+
+/// The statement kind a parsed statement has when the engine must treat it
+/// as it treated it before the sqlparser 0.52 → 0.63 upgrade: as a parse
+/// error. `None` for every kind the engine already knew.
+///
+/// These kinds did not exist in sqlparser 0.52, so their text failed to parse
+/// and resolved through the host's `parse_error` policy (blocked under a
+/// `block`/`mask` tag or an enforced allowlist). The engine has no analysis
+/// for any of them; reading them as ordinary statements would let them through
+/// silently. They keep failing closed exactly as before until a rule models
+/// them. The match is exhaustive on purpose (no catch-all): the next sqlparser
+/// upgrade fails to compile on every statement kind it adds, so each new kind
+/// is classified here, by a person, before it can reach a verdict.
+///
+/// `SHOW PROCESSLIST` and `SHOW CHARSET` are the exception: 0.52 parsed them
+/// as `ShowVariable`, which the engine already handles, so they stay
+/// analysed. Known kinds that gained a body 0.52 rejected (SQL Server's
+/// `BEGIN … END`) are treated like a new kind. Inside `SET`, which became one statement kind, the forms 0.52
+/// rejected are the server-wide `SET GLOBAL …`, `SET SESSION AUTHORIZATION`
+/// and SQL Server's session options (`SET NOCOUNT ON`, …).
+pub(crate) fn not_analysed(stmt: &Statement) -> Option<&'static str> {
+    use sqlparser::ast::{ContextModifier, Set};
+    match stmt {
+        // The statement inside is what runs.
+        Statement::Explain { statement, .. } | Statement::Prepare { statement, .. } => {
+            not_analysed(statement)
+        }
+        Statement::Set(set) => match set {
+            Set::SingleAssignment {
+                scope: Some(ContextModifier::Global),
+                ..
+            } => Some("SET GLOBAL"),
+            Set::MultipleAssignments { assignments }
+                if assignments
+                    .iter()
+                    .any(|a| matches!(a.scope, Some(ContextModifier::Global))) =>
+            {
+                Some("SET GLOBAL")
+            }
+            Set::SetSessionAuthorization(_) => Some("SET SESSION AUTHORIZATION"),
+            Set::SetSessionParam(_) => Some("SET (session option)"),
+            Set::SingleAssignment { .. }
+            | Set::MultipleAssignments { .. }
+            | Set::ParenthesizedAssignments { .. }
+            | Set::SetRole { .. }
+            | Set::SetTimeZone { .. }
+            | Set::SetNames { .. }
+            | Set::SetNamesDefault { .. }
+            | Set::SetTransaction { .. } => None,
+        },
+        Statement::ShowProcessList { .. } | Statement::ShowCharset { .. } => None,
+        // SQL Server's `BEGIN … END` block (and a transaction with an
+        // exception handler) holds statements of its own; 0.52 rejected it.
+        Statement::StartTransaction {
+            statements,
+            exception,
+            ..
+        } if !statements.is_empty() || exception.is_some() => Some("BEGIN … END block"),
+        Statement::AlterIndex { .. }
+        | Statement::AlterPolicy { .. }
+        | Statement::AlterRole { .. }
+        | Statement::AlterTable { .. }
+        | Statement::AlterView { .. }
+        | Statement::Analyze { .. }
+        | Statement::Assert { .. }
+        | Statement::AttachDatabase { .. }
+        | Statement::AttachDuckDBDatabase { .. }
+        | Statement::Cache { .. }
+        | Statement::Call { .. }
+        | Statement::Close { .. }
+        | Statement::Comment { .. }
+        | Statement::Commit { .. }
+        | Statement::Copy { .. }
+        | Statement::CopyIntoSnowflake { .. }
+        | Statement::CreateDatabase { .. }
+        | Statement::CreateExtension { .. }
+        | Statement::CreateFunction { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::CreateMacro { .. }
+        | Statement::CreatePolicy { .. }
+        | Statement::CreateProcedure { .. }
+        | Statement::CreateRole { .. }
+        | Statement::CreateSchema { .. }
+        | Statement::CreateSecret { .. }
+        | Statement::CreateSequence { .. }
+        | Statement::CreateStage { .. }
+        | Statement::CreateTable { .. }
+        | Statement::CreateTrigger { .. }
+        | Statement::CreateType { .. }
+        | Statement::CreateView { .. }
+        | Statement::CreateVirtualTable { .. }
+        | Statement::Deallocate { .. }
+        | Statement::Declare { .. }
+        | Statement::Delete { .. }
+        | Statement::DetachDuckDBDatabase { .. }
+        | Statement::Directory { .. }
+        | Statement::Discard { .. }
+        | Statement::Drop { .. }
+        | Statement::DropFunction { .. }
+        | Statement::DropPolicy { .. }
+        | Statement::DropProcedure { .. }
+        | Statement::DropSecret { .. }
+        | Statement::DropTrigger { .. }
+        | Statement::Execute { .. }
+        | Statement::ExplainTable { .. }
+        | Statement::Fetch { .. }
+        | Statement::Flush { .. }
+        | Statement::Grant { .. }
+        | Statement::Insert { .. }
+        | Statement::Install { .. }
+        | Statement::Kill { .. }
+        | Statement::LISTEN { .. }
+        | Statement::Load { .. }
+        | Statement::LockTables { .. }
+        | Statement::Merge { .. }
+        | Statement::Msck { .. }
+        | Statement::NOTIFY { .. }
+        | Statement::OptimizeTable { .. }
+        | Statement::Pragma { .. }
+        | Statement::Query { .. }
+        | Statement::ReleaseSavepoint { .. }
+        | Statement::Revoke { .. }
+        | Statement::Rollback { .. }
+        | Statement::Savepoint { .. }
+        | Statement::ShowCollation { .. }
+        | Statement::ShowColumns { .. }
+        | Statement::ShowCreate { .. }
+        | Statement::ShowDatabases { .. }
+        | Statement::ShowFunctions { .. }
+        | Statement::ShowSchemas { .. }
+        | Statement::ShowStatus { .. }
+        | Statement::ShowTables { .. }
+        | Statement::ShowVariable { .. }
+        | Statement::ShowVariables { .. }
+        | Statement::ShowViews { .. }
+        | Statement::StartTransaction { .. }
+        | Statement::Truncate { .. }
+        | Statement::UNCache { .. }
+        | Statement::Unload { .. }
+        | Statement::UnlockTables
+        | Statement::Update { .. }
+        | Statement::Use { .. } => None,
+        Statement::AlterCollation { .. }
+        | Statement::AlterConnector { .. }
+        | Statement::AlterFunction { .. }
+        | Statement::AlterOperator { .. }
+        | Statement::AlterOperatorClass { .. }
+        | Statement::AlterOperatorFamily { .. }
+        | Statement::AlterSchema { .. }
+        | Statement::AlterSession { .. }
+        | Statement::AlterTextSearch { .. }
+        | Statement::AlterType { .. }
+        | Statement::AlterUser { .. }
+        | Statement::Case { .. }
+        | Statement::CreateCollation { .. }
+        | Statement::CreateConnector { .. }
+        | Statement::CreateDomain { .. }
+        | Statement::CreateFileFormat { .. }
+        | Statement::CreateOperator { .. }
+        | Statement::CreateOperatorClass { .. }
+        | Statement::CreateOperatorFamily { .. }
+        | Statement::CreateServer { .. }
+        | Statement::CreateTextSearch { .. }
+        | Statement::CreateUser { .. }
+        | Statement::CreateWarehouse { .. }
+        | Statement::Deny { .. }
+        | Statement::DropConnector { .. }
+        | Statement::DropDomain { .. }
+        | Statement::DropExtension { .. }
+        | Statement::DropOperator { .. }
+        | Statement::DropOperatorClass { .. }
+        | Statement::DropOperatorFamily { .. }
+        | Statement::ExportData { .. }
+        | Statement::If { .. }
+        | Statement::List { .. }
+        | Statement::LoadData { .. }
+        | Statement::Lock { .. }
+        | Statement::Open { .. }
+        | Statement::Print { .. }
+        | Statement::Put { .. }
+        | Statement::RaisError { .. }
+        | Statement::Raise { .. }
+        | Statement::Remove { .. }
+        | Statement::RenameTable { .. }
+        | Statement::Reset { .. }
+        | Statement::Return { .. }
+        | Statement::ShowCatalogs { .. }
+        | Statement::ShowObjects { .. }
+        | Statement::Throw { .. }
+        | Statement::UNLISTEN { .. }
+        | Statement::Vacuum { .. }
+        | Statement::WaitFor { .. }
+        | Statement::While { .. } => Some(statement_kind(stmt)),
+    }
+}
+
+/// `RenameTable` → `RenameTable`: the variant name, for the parse error text.
+fn statement_kind(stmt: &Statement) -> &'static str {
+    // Every variant listed in `not_analysed` as new, by name.
+    match stmt {
+        Statement::AlterCollation { .. } => "AlterCollation",
+        Statement::AlterConnector { .. } => "AlterConnector",
+        Statement::AlterFunction { .. } => "AlterFunction",
+        Statement::AlterOperator { .. } => "AlterOperator",
+        Statement::AlterOperatorClass { .. } => "AlterOperatorClass",
+        Statement::AlterOperatorFamily { .. } => "AlterOperatorFamily",
+        Statement::AlterSchema { .. } => "AlterSchema",
+        Statement::AlterSession { .. } => "AlterSession",
+        Statement::AlterTextSearch { .. } => "AlterTextSearch",
+        Statement::AlterType { .. } => "AlterType",
+        Statement::AlterUser { .. } => "AlterUser",
+        Statement::Case { .. } => "Case",
+        Statement::CreateCollation { .. } => "CreateCollation",
+        Statement::CreateConnector { .. } => "CreateConnector",
+        Statement::CreateDomain { .. } => "CreateDomain",
+        Statement::CreateFileFormat { .. } => "CreateFileFormat",
+        Statement::CreateOperator { .. } => "CreateOperator",
+        Statement::CreateOperatorClass { .. } => "CreateOperatorClass",
+        Statement::CreateOperatorFamily { .. } => "CreateOperatorFamily",
+        Statement::CreateServer { .. } => "CreateServer",
+        Statement::CreateTextSearch { .. } => "CreateTextSearch",
+        Statement::CreateUser { .. } => "CreateUser",
+        Statement::CreateWarehouse { .. } => "CreateWarehouse",
+        Statement::Deny { .. } => "Deny",
+        Statement::DropConnector { .. } => "DropConnector",
+        Statement::DropDomain { .. } => "DropDomain",
+        Statement::DropExtension { .. } => "DropExtension",
+        Statement::DropOperator { .. } => "DropOperator",
+        Statement::DropOperatorClass { .. } => "DropOperatorClass",
+        Statement::DropOperatorFamily { .. } => "DropOperatorFamily",
+        Statement::ExportData { .. } => "ExportData",
+        Statement::If { .. } => "If",
+        Statement::List { .. } => "List",
+        Statement::LoadData { .. } => "LoadData",
+        Statement::Lock { .. } => "Lock",
+        Statement::Open { .. } => "Open",
+        Statement::Print { .. } => "Print",
+        Statement::Put { .. } => "Put",
+        Statement::RaisError { .. } => "RaisError",
+        Statement::Raise { .. } => "Raise",
+        Statement::Remove { .. } => "Remove",
+        Statement::RenameTable { .. } => "RenameTable",
+        Statement::Reset { .. } => "Reset",
+        Statement::Return { .. } => "Return",
+        Statement::ShowCatalogs { .. } => "ShowCatalogs",
+        Statement::ShowObjects { .. } => "ShowObjects",
+        Statement::Throw { .. } => "Throw",
+        Statement::UNLISTEN { .. } => "UNLISTEN",
+        Statement::Vacuum { .. } => "Vacuum",
+        Statement::WaitFor { .. } => "WaitFor",
+        Statement::While { .. } => "While",
+        _ => "statement",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -108,9 +369,9 @@ fn walk_statement(
         }
 
         // ── UPDATE ─────────────────────────────────────────────────────────
-        Statement::Update {
+        Statement::Update(sqlparser::ast::Update {
             selection, table, ..
-        } => {
+        }) => {
             let presence = where_presence(selection.as_ref());
             let relation = relation_from_table_with_joins(table);
             let tautology = selection.as_ref().map(has_or_tautology).unwrap_or(false);
@@ -163,7 +424,7 @@ fn walk_statement(
         }
 
         // ── TRUNCATE ───────────────────────────────────────────────────────
-        Statement::Truncate { table_names, .. } => {
+        Statement::Truncate(sqlparser::ast::Truncate { table_names, .. }) => {
             let relation = table_names.first().map(|t| t.name.to_string());
             out.push(StatementInfo {
                 kind: StatementKind::Truncate,
@@ -175,9 +436,9 @@ fn walk_statement(
         }
 
         // ── ALTER TABLE ────────────────────────────────────────────────────
-        Statement::AlterTable {
+        Statement::AlterTable(sqlparser::ast::AlterTable {
             name, operations, ..
-        } => {
+        }) => {
             for op in operations {
                 use sqlparser::ast::{AlterColumnOperation, AlterTableOperation};
                 let (kind, path) = match op {
@@ -188,8 +449,12 @@ fn walk_statement(
                     | AlterTableOperation::RenameColumn { .. } => {
                         (AlterTableKind::Rename, "AlterTableStmt > Rename")
                     }
+                    // MySQL's `DROP FOREIGN KEY fk` is its spelling of
+                    // dropping a constraint (sqlparser reads it since 0.56;
+                    // it was a parse error before, so it never reached here).
                     AlterTableOperation::DropConstraint { .. }
-                    | AlterTableOperation::DropPrimaryKey => (
+                    | AlterTableOperation::DropPrimaryKey { .. }
+                    | AlterTableOperation::DropForeignKey { .. } => (
                         AlterTableKind::DropConstraint,
                         "AlterTableStmt > DropConstraint",
                     ),
@@ -255,7 +520,7 @@ fn walk_statement(
                             .as_ref()
                             .map(|e| !is_always_true(e))
                             .unwrap_or(false);
-                        effective_where || query.limit.is_some() || query.fetch.is_some()
+                        effective_where || has_row_limit(query) || query.fetch.is_some()
                     }
                     _ => false,
                 },
@@ -264,7 +529,7 @@ fn walk_statement(
 
             out.push(StatementInfo {
                 kind: StatementKind::Insert,
-                relation: Some(insert.table_name.to_string()),
+                relation: Some(insert.table.to_string()),
                 is_nested,
                 ast_node_path: "InsertStmt".to_string(),
                 insert_has_columns: has_columns,
@@ -309,7 +574,7 @@ fn walk_statement(
         }
 
         // ── MERGE (VERICTO-083) ──────────────────────────────────────────────
-        Statement::Merge { table, .. } => {
+        Statement::Merge(sqlparser::ast::Merge { table, .. }) => {
             out.push(StatementInfo {
                 kind: StatementKind::Merge,
                 relation: relation_from_table_factor(table),
@@ -349,6 +614,15 @@ fn walk_query(
         return Err(ProxyError::AstTooDeep);
     }
 
+    // Pipe syntax (`FROM t |> SELECT …`), which sqlparser's Generic dialect
+    // (Oracle here) reads since 0.57 and 0.52 rejected. No walker models it:
+    // it stays the parse error it was.
+    if !query.pipe_operators.is_empty() {
+        return Err(ProxyError::ParseError(
+            "pipe syntax (`|>`): not supported by the engine".to_string(),
+        ));
+    }
+
     // CTEs (WITH … AS (…))
     if let Some(with) = query.with.as_ref() {
         for cte in &with.cte_tables {
@@ -361,10 +635,23 @@ fn walk_query(
     // bound belongs to the enclosing Query, so we resolve it here and thread it
     // into the SELECT node, fixing ENG-001 (every non-PG SELECT was flagged by
     // VERICTO-050 because `select_has_limit` was hard-coded to `false`).
-    let has_limit = query.limit.is_some() || query.fetch.is_some();
+    let has_limit = has_row_limit(query) || query.fetch.is_some();
 
     walk_set_expr(query.body.as_ref(), is_nested, has_limit, depth + 1, out)?;
     Ok(())
+}
+
+/// True when the query carries a row bound: `LIMIT n` or MySQL's
+/// `LIMIT offset, n`. Since sqlparser 0.56 LIMIT and OFFSET live together in
+/// `Query::limit_clause`, which is `Some` for a bare `OFFSET n` or `LIMIT ALL`
+/// too; neither bounds anything, exactly as when `Query::limit` was `None`
+/// for them, so only an actual limit expression counts.
+fn has_row_limit(query: &Query) -> bool {
+    match &query.limit_clause {
+        Some(LimitClause::LimitOffset { limit, .. }) => limit.is_some(),
+        Some(LimitClause::OffsetCommaLimit { .. }) => true,
+        None => false,
+    }
 }
 
 fn walk_set_expr(
@@ -407,8 +694,9 @@ fn walk_set_expr(
             for item in &select.projection {
                 match item {
                     SelectItem::UnnamedExpr(e) => walk_expr(e, depth + 1, out)?,
-                    SelectItem::ExprWithAlias { expr, .. } => walk_expr(expr, depth + 1, out)?,
-                    _ => {}
+                    SelectItem::ExprWithAlias { expr, .. }
+                    | SelectItem::ExprWithAliases { expr, .. } => walk_expr(expr, depth + 1, out)?,
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {}
                 }
             }
 
@@ -453,7 +741,18 @@ fn walk_set_expr(
             walk_set_expr(left.as_ref(), is_nested, has_limit, depth + 1, out)?;
             walk_set_expr(right.as_ref(), is_nested, has_limit, depth + 1, out)?;
         }
-        _ => {}
+        // A data-modifying statement used as a query body: a CTE such as
+        // `WITH d AS (DELETE FROM t RETURNING id) SELECT …`, which sqlparser
+        // reads on every dialect since 0.56 (`DELETE`, `MERGE`) and which used
+        // to be a parse error there. It runs, so its rules apply as nested.
+        SetExpr::Insert(stmt)
+        | SetExpr::Update(stmt)
+        | SetExpr::Delete(stmt)
+        | SetExpr::Merge(stmt) => {
+            walk_statement(stmt, true, depth + 1, out)?;
+        }
+        // VALUES and TABLE t: no statement, no call.
+        SetExpr::Values(_) | SetExpr::Table(_) => {}
     }
 
     Ok(())
@@ -493,6 +792,7 @@ fn walk_expr(expr: &Expr, depth: usize, out: &mut Vec<StatementInfo>) -> Result<
                 .name
                 .0
                 .last()
+                .and_then(|p| p.as_ident())
                 .map(|p| p.value.to_ascii_lowercase())
                 .unwrap_or_default();
 
@@ -572,9 +872,22 @@ fn where_presence(selection: Option<&Expr>) -> WherePresence {
 fn is_always_true(expr: &Expr) -> bool {
     use sqlparser::ast::{BinaryOperator, UnaryOperator};
     match expr {
-        Expr::Value(Value::Boolean(true)) => true,
+        Expr::Value(ValueWithSpan {
+            value: Value::Boolean(true),
+            ..
+        }) => true,
+        // Since sqlparser 0.53 the MS SQL dialect reads `true`/`false` as
+        // identifiers (T-SQL has no boolean literals). `WHERE true` was a
+        // tautology to the engine before the upgrade and stays one: T-SQL
+        // rejects it as a predicate anyway, so blocking it costs nothing.
+        Expr::Identifier(i) if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("true") => {
+            true
+        }
         // Bare truthy numeric literal: `WHERE 1`.
-        Expr::Value(Value::Number(n, _)) => n.parse::<f64>().map(|v| v != 0.0).unwrap_or(false),
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) => n.parse::<f64>().map(|v| v != 0.0).unwrap_or(false),
         Expr::Nested(inner) => is_always_true(inner),
         Expr::UnaryOp {
             op: UnaryOperator::Not,
@@ -629,8 +942,18 @@ fn is_always_true(expr: &Expr) -> bool {
 fn is_always_false(expr: &Expr) -> bool {
     use sqlparser::ast::{BinaryOperator, UnaryOperator};
     match expr {
-        Expr::Value(Value::Boolean(false)) => true,
-        Expr::Value(Value::Number(n, _)) => n.parse::<f64>().map(|v| v == 0.0).unwrap_or(false),
+        Expr::Value(ValueWithSpan {
+            value: Value::Boolean(false),
+            ..
+        }) => true,
+        // MS SQL: see `is_always_true`.
+        Expr::Identifier(i) if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("false") => {
+            true
+        }
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) => n.parse::<f64>().map(|v| v == 0.0).unwrap_or(false),
         Expr::Nested(inner) => is_always_false(inner),
         Expr::UnaryOp {
             op: UnaryOperator::Not,
@@ -690,8 +1013,10 @@ fn unwrap_nested(expr: &Expr) -> &Expr {
 /// mistaken for a tautology.
 fn non_null_literal(expr: &Expr) -> Option<&Value> {
     match unwrap_nested(expr) {
-        Expr::Value(Value::Null) => None,
-        Expr::Value(v) => Some(v),
+        Expr::Value(ValueWithSpan {
+            value: Value::Null, ..
+        }) => None,
+        Expr::Value(v) => Some(&v.value),
         _ => None,
     }
 }
@@ -757,7 +1082,13 @@ fn value_eq(a: &Value, b: &Value) -> bool {
 fn const_cmp_true(left: &Expr, op: &sqlparser::ast::BinaryOperator, right: &Expr) -> bool {
     use sqlparser::ast::BinaryOperator;
     let (l, r) = (unwrap_nested(left), unwrap_nested(right));
-    let (Expr::Value(a), Expr::Value(b)) = (l, r) else {
+    // Compare the values, not the nodes: since sqlparser 0.55 a literal node
+    // carries its source span, so two equal literals at different positions
+    // would never have the same debug string and `'a' = 'a'` would stop being
+    // a tautology.
+    let (Expr::Value(ValueWithSpan { value: a, .. }), Expr::Value(ValueWithSpan { value: b, .. })) =
+        (l, r)
+    else {
         return false;
     };
     if let (Value::Number(x, _), Value::Number(y, _)) = (a, b) {
@@ -814,7 +1145,10 @@ fn has_or_tautology(expr: &Expr) -> bool {
 
 fn expr_as_i64(expr: &Expr) -> Option<i64> {
     match expr {
-        Expr::Value(Value::Number(n, _)) => n.parse().ok(),
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) => n.parse().ok(),
         _ => None,
     }
 }

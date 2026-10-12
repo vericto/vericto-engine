@@ -114,7 +114,7 @@ fn strip(stmts: &mut [Statement], masked: &[&str]) {
                     if out_name(item)
                         .is_some_and(|n| masked.iter().any(|m| squash(m) == squash(&n)))
                     {
-                        *item = SelectItem::UnnamedExpr(Expr::Value(Value::Null));
+                        *item = SelectItem::UnnamedExpr(Expr::Value(Value::Null.into()));
                     }
                 }
             }
@@ -128,8 +128,12 @@ fn strip(stmts: &mut [Statement], masked: &[&str]) {
     }
     fn query(q: &mut sqlparser::ast::Query, masked: &[&str]) {
         body(&mut q.body, masked);
-        if let Some(ob) = q.order_by.as_mut() {
-            for e in ob.exprs.iter_mut() {
+        if let Some(sqlparser::ast::OrderBy {
+            kind: sqlparser::ast::OrderByKind::Expressions(exprs),
+            ..
+        }) = q.order_by.as_mut()
+        {
+            for e in exprs.iter_mut() {
                 if let Expr::Function(f) = &e.expr {
                     if f.name.to_string().eq_ignore_ascii_case("COALESCE") {
                         if let sqlparser::ast::FunctionArguments::List(l) = &f.args {
@@ -414,19 +418,45 @@ fn text_the_renderer_cannot_reproduce_blocks() {
         "SELECT SQL_CALC_FOUND_ROWS email FROM customers",
         "SELECT HIGH_PRIORITY email FROM customers",
         "SELECT STRAIGHT_JOIN email FROM customers",
-        // sqlparser reads `b'101'` as `b AS '101'`.
-        "SELECT b'101' AS bits, email FROM customers",
         // Where this literal ends depends on the string-escape mode.
         r"SELECT id, 'it\'s', email FROM customers",
-        // sqlparser does not parse these MySQL forms: parse error → block.
-        "SELECT email FROM customers USE INDEX (ix_email)",
+        // sqlparser does not parse this MySQL form: parse error → block.
         "SELECT email FROM customers LOCK IN SHARE MODE",
-        "SELECT email, COUNT(*) FROM customers GROUP BY email WITH ROLLUP",
     ] {
         let why = blocked(sql);
         assert!(!why.is_empty(), "{sql}");
     }
     assert!(blocked("SELECT HIGH_PRIORITY email FROM customers").contains("reproduced faithfully"));
+}
+
+/// Forms sqlparser 0.52 misread or rejected, so they blocked, and 0.63 reads
+/// as MySQL does: the bit-value literal (it was `b AS '101'`), index hints and
+/// `WITH ROLLUP` (parse errors). They are now masked like any other query, the
+/// rest of the text forwarded as the client wrote it.
+#[test]
+fn forms_sqlparser_now_reads_are_masked() {
+    for (sql, kept) in [
+        (
+            "SELECT b'101' AS bits, email FROM customers",
+            "B'101' AS bits",
+        ),
+        (
+            "SELECT email FROM customers USE INDEX (ix_email)",
+            "USE INDEX (ix_email)",
+        ),
+        (
+            "SELECT email, COUNT(*) FROM customers GROUP BY email WITH ROLLUP",
+            "WITH ROLLUP",
+        ),
+    ] {
+        let out = rewritten(sql);
+        assert!(out.contains(kept), "{sql}: {out}");
+        assert!(
+            !out.contains(" email,") && !out.starts_with("SELECT email"),
+            "{sql}: {out}"
+        );
+        same_tree_minus(sql, &["email"]);
+    }
 }
 
 #[test]

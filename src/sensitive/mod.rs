@@ -190,6 +190,25 @@ impl Ord for SensitivePolicy {
 // Tag index
 // ---------------------------------------------------------------------------
 
+/// The text of one part of a name in the sqlparser tree.
+///
+/// Since sqlparser 0.55 a part may also be a function computing an identifier
+/// (Snowflake's `IDENTIFIER('t')`), which none of the engine's dialects
+/// produce. Such a part has no name the engine can resolve: it reads as a
+/// string no unquoted identifier can spell, so it matches no tag and no
+/// allowlist entry (an access policy denies it).
+pub(crate) fn name_part(p: &sqlparser::ast::ObjectNamePart) -> &str {
+    match p.as_ident() {
+        Some(i) => &i.value,
+        None => "IDENTIFIER()",
+    }
+}
+
+/// Every part of a sqlparser name, as text (see [`name_part`]).
+pub(crate) fn name_parts(n: &sqlparser::ast::ObjectName) -> Vec<&str> {
+    n.0.iter().map(name_part).collect()
+}
+
 pub(crate) fn ieq(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }

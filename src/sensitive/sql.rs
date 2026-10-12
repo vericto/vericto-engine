@@ -6,17 +6,19 @@
 //! reads and prints them the way MySQL does.
 
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, Cte, Expr, FromTable, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, Ident, MergeAction, MergeInsertKind, ObjectName,
-    OnConflictAction, OnInsert, OrderBy, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
-    TableFactor, TableWithJoins, Value,
+    AccessExpr, Assignment, AssignmentTarget, Cte, Expr, FromTable, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, Ident, LimitClause, MergeAction, MergeInsertKind,
+    MergeUpdateKind, ObjectName, OnConflictAction, OnInsert, OrderBy, OrderByKind, OutputClause,
+    Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, Subscript,
+    TableAlias, TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, Value,
+    ValueWithSpan,
 };
 
 use crate::error::{MAX_AST_DEPTH, ProxyError, Result};
 use crate::sensitive::mysql::{self, Prepared};
 use crate::sensitive::{
     Item, Lineage, OutCol, Scopes, Sink, Tags, Touches, ieq, indirect, mask_style_for, merge,
-    outcol_all, outcols_all, starred,
+    name_part, name_parts, outcol_all, outcols_all, starred,
 };
 
 /// Why the MySQL analysis could not run.
@@ -161,14 +163,26 @@ fn too_deep(depth: usize) -> Result<()> {
 
 /// `[db.]schema.table` → (schema, table).
 fn split_name(name: &ObjectName) -> (Option<String>, String) {
-    let parts = &name.0;
-    let table = parts.last().map(|i| i.value.clone()).unwrap_or_default();
+    let parts = name_parts(name);
+    let table = parts.last().map(|p| p.to_string()).unwrap_or_default();
+    // SQL Server's `db..t` (which sqlparser 0.52 rejected) leaves the schema
+    // empty: it is the default schema, i.e. unqualified, not a schema named
+    // "" that no tag would match.
     let schema = if parts.len() >= 2 {
-        Some(parts[parts.len() - 2].value.clone())
+        Some(parts[parts.len() - 2])
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     } else {
         None
     };
     (schema, table)
+}
+
+/// The column a column list names. Since sqlparser 0.62 an `INSERT`/`MERGE`
+/// column list holds names, not identifiers; a qualified one (`t.col`) is
+/// still the column `col` of the target.
+fn column_of(name: &ObjectName) -> String {
+    name.0.last().map(name_part).unwrap_or_default().to_string()
 }
 
 fn rename(mut cols: Vec<OutCol>, alias: Option<&TableAlias>) -> Vec<OutCol> {
@@ -178,7 +192,7 @@ fn rename(mut cols: Vec<OutCol>, alias: Option<&TableAlias>) -> Vec<OutCol> {
     }
     for (c, n) in cols.iter_mut().zip(&a.columns) {
         if let OutCol::Named { name, .. } = c {
-            *name = n.value.clone();
+            *name = n.name.value.clone();
         }
     }
     cols
@@ -201,10 +215,35 @@ fn column_name(e: &Expr) -> Option<&str> {
     }
 }
 
+/// The dotted name a field-access chain spells, when every part is a name:
+/// an identifier, or (`ansi_quotes`) a double-quoted string MySQL may read as
+/// one. `None` for a subscript or any other part.
+fn dotted_name(root: &Expr, chain: &[AccessExpr], ansi_quotes: bool) -> Option<Vec<Ident>> {
+    let name = |e: &Expr| match e {
+        Expr::Identifier(i) => Some(i.clone()),
+        Expr::Value(ValueWithSpan {
+            value: Value::DoubleQuotedString(s),
+            ..
+        }) if ansi_quotes => Some(Ident::with_quote('"', s.clone())),
+        _ => None,
+    };
+    let mut out = vec![name(root)?];
+    for a in chain {
+        match a {
+            AccessExpr::Dot(e) => out.push(name(e)?),
+            AccessExpr::Subscript(_) => return None,
+        }
+    }
+    Some(out)
+}
+
 /// A 1-based position (`ORDER BY 2`, `GROUP BY 1`) → 0-based index.
 fn position(e: &Expr) -> Option<usize> {
     match e {
-        Expr::Value(Value::Number(n, _)) => n.parse::<usize>().ok()?.checked_sub(1),
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) => n.parse::<usize>().ok()?.checked_sub(1),
         _ => None,
     }
 }
@@ -235,7 +274,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         n: &ObjectName,
         target: Option<&Item>,
     ) -> Vec<(Option<String>, String)> {
-        let parts: Vec<&str> = n.0.iter().map(|i| i.value.as_str()).collect();
+        let parts = name_parts(n);
         match parts.as_slice() {
             [] => Vec::new(),
             [_] => match target {
@@ -279,21 +318,32 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 self.query(q, Some(visible), d)?;
             }
             Statement::Insert(ins) => {
-                let (schema, table) = split_name(&ins.table_name);
+                let (schema, table) = match &ins.table {
+                    TableObject::TableName(name) => split_name(name),
+                    // `INSERT INTO TABLE FUNCTION f(…)` / `INSERT INTO (SELECT …)`
+                    // (ClickHouse, Oracle): no table name the engine can
+                    // resolve. Recorded under the statement's own text, which
+                    // matches no tag and no allowlist entry: denied under an
+                    // allowlist.
+                    other => (None, other.to_string()),
+                };
                 // Access analysis: the target and each column written (no
                 // column list, or REPLACE, which deletes rows: every column).
+                // MySQL's `INSERT … SET a = …` (parsed since sqlparser 0.54)
+                // names its columns in the assignments, walked below.
                 self.tags.write(schema.as_deref(), &table, None);
-                if ins.columns.is_empty() || ins.replace_into {
+                if (ins.columns.is_empty() && ins.assignments.is_empty()) || ins.replace_into {
                     self.tags.write(schema.as_deref(), &table, Some("*"));
                 }
                 for c in &ins.columns {
-                    self.tags.write(schema.as_deref(), &table, Some(&c.value));
+                    self.tags
+                        .write(schema.as_deref(), &table, Some(&column_of(c)));
                 }
                 let target = Item::Base {
                     refname: ins
                         .table_alias
                         .as_ref()
-                        .map(|a| a.value.clone())
+                        .map(|a| a.alias.value.clone())
                         .unwrap_or_else(|| table.clone()),
                     schema,
                     table,
@@ -303,12 +353,20 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                     for (j, c) in outs.iter().enumerate() {
                         let mut lin = outcol_all(self.tags, c);
                         if let (false, Some(dest)) = (self.all, ins.columns.get(j)) {
-                            for k in target.column(self.tags, &dest.value).keys() {
+                            for k in target.column(self.tags, &column_of(dest)).keys() {
                                 lin.remove(k);
                             }
                         }
                         self.touches.record(&lin, Sink::Copy);
                     }
+                }
+                // MySQL's `INSERT INTO t SET a = <expr>, …` stores each value
+                // like `UPDATE … SET`.
+                if !ins.assignments.is_empty() {
+                    self.scopes.push();
+                    let r = self.assignments(&mut ins.assignments, Some(&target), d);
+                    self.scopes.pop();
+                    r?;
                 }
                 // `ON DUPLICATE KEY UPDATE x = <expr>` / `ON CONFLICT DO
                 // UPDATE SET x = <expr>` store a value like `UPDATE … SET`.
@@ -361,30 +419,43 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 }
                 if let Some(ret) = ins.returning.as_mut() {
                     self.scopes.push();
-                    self.scopes.add(target);
+                    self.scopes.add(target.clone());
                     let r = self.projection(ret, Some(visible), d);
                     self.scopes.pop();
                     r?;
                 }
+                if let Some(out) = ins.output.as_mut() {
+                    self.output(out, std::slice::from_ref(&target), visible, d)?;
+                }
             }
-            Statement::Update {
+            Statement::Update(sqlparser::ast::Update {
                 table,
                 assignments,
                 from,
                 selection,
                 returning,
+                output,
+                order_by,
+                limit,
                 ..
-            } => {
+            }) => {
                 self.scopes.push();
                 let r = (|| -> Result<()> {
                     let targets = self.table_with_joins(table, d)?;
                     let target = targets.first().cloned();
-                    for it in targets {
+                    for it in targets.iter().cloned() {
                         self.scopes.add(it);
                     }
-                    if let Some(f) = from {
-                        for it in self.table_with_joins(f, d)? {
-                            self.scopes.add(it);
+                    // `UPDATE … FROM t1, t2` (the Snowflake form puts it
+                    // before SET).
+                    if let Some(
+                        UpdateTableFromKind::BeforeSet(f) | UpdateTableFromKind::AfterSet(f),
+                    ) = from
+                    {
+                        for twj in f.iter_mut() {
+                            for it in self.table_with_joins(twj, d)? {
+                                self.scopes.add(it);
+                            }
                         }
                     }
                     self.assignments(assignments, target.as_ref(), d)?;
@@ -392,9 +463,20 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                         if let Some(w) = selection {
                             self.expr(w, d)?;
                         }
+                        // MySQL's `UPDATE … ORDER BY … LIMIT n` (which
+                        // sqlparser 0.52 rejected), read like DELETE's.
+                        for o in order_by.iter_mut() {
+                            self.expr(&mut o.expr, d)?;
+                        }
+                        if let Some(l) = limit.as_mut() {
+                            self.expr(l, d)?;
+                        }
                     }
                     if let Some(ret) = returning {
                         self.projection(ret, Some(visible), d)?;
+                    }
+                    if let Some(out) = output {
+                        self.output(out, &targets, visible, d)?;
                     }
                     Ok(())
                 })();
@@ -402,7 +484,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 r?;
             }
             Statement::Delete(del) => {
-                if del.returning.is_some() || self.all {
+                if del.returning.is_some() || del.output.is_some() || self.all {
                     self.scopes.push();
                     let r = (|| -> Result<()> {
                         let from = match &mut del.from {
@@ -426,8 +508,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                         }
                         if self.all {
                             for n in &del.tables {
-                                let parts: Vec<&str> =
-                                    n.0.iter().map(|i| i.value.as_str()).collect();
+                                let parts = name_parts(n);
                                 let found = self.scopes.base_tables(&parts);
                                 if found.is_empty() {
                                     targets.push(target_of(n));
@@ -453,6 +534,22 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                         if let Some(ret) = del.returning.as_mut() {
                             self.projection(ret, Some(visible), d)?;
                         }
+                        if let Some(out) = del.output.as_mut() {
+                            // SQL Server's `deleted.*` is the removed rows of
+                            // the target: the first relation (or the table list).
+                            let mut bases: Vec<Item> = Vec::new();
+                            for twj in from.iter() {
+                                if let TableFactor::Table { name, .. } = &twj.relation {
+                                    let (schema, table) = split_name(name);
+                                    bases.push(Item::Base {
+                                        refname: table.clone(),
+                                        schema,
+                                        table,
+                                    });
+                                }
+                            }
+                            self.output(out, &bases, visible, d)?;
+                        }
                         Ok(())
                     })();
                     self.scopes.pop();
@@ -464,7 +561,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                     self.query(q, Some(Sink::Copy), d)?;
                 }
             }
-            Statement::CreateView { query, .. } => {
+            Statement::CreateView(sqlparser::ast::CreateView { query, .. }) => {
                 self.query(query, Some(Sink::Copy), d)?;
             }
             Statement::Directory { source, .. } => {
@@ -532,19 +629,32 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             }
             // `SET @v = (SELECT email …)`: the value moves into a session
             // variable the next statement reads freely — a copy.
-            Statement::SetVariable { value, .. } => {
-                for e in value.iter_mut() {
+            Statement::Set(set) => {
+                use sqlparser::ast::Set;
+                let values: Vec<&mut Expr> = match set {
+                    Set::SingleAssignment { values, .. }
+                    | Set::ParenthesizedAssignments { values, .. } => values.iter_mut().collect(),
+                    Set::MultipleAssignments { assignments } => {
+                        assignments.iter_mut().map(|a| &mut a.value).collect()
+                    }
+                    // Roles, time zone, names, transactions, session
+                    // parameters: no value read from a table, as before
+                    // (they were their own statements before sqlparser 0.56).
+                    _ => Vec::new(),
+                };
+                for e in values {
                     let lin = self.expr(e, d)?;
                     self.touches.record(&lin, Sink::Copy);
                 }
             }
-            Statement::Merge {
+            Statement::Merge(sqlparser::ast::Merge {
                 table,
                 source,
                 on,
                 clauses,
+                output,
                 ..
-            } => {
+            }) => {
                 self.scopes.push();
                 let r = (|| -> Result<()> {
                     let target = self.table_factor(table, d)?.into_iter().next();
@@ -575,25 +685,51 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                                 let schema = schema.as_deref();
                                 match &c.action {
                                     // A table-level write: the target's
-                                    // `None` write above.
-                                    MergeAction::Delete => {}
+                                    // `None` write above. `DO NOTHING`
+                                    // (PostgreSQL 17) writes nothing more.
+                                    MergeAction::Delete { .. } | MergeAction::DoNothing { .. } => {}
                                     MergeAction::Insert(ins) if ins.columns.is_empty() => {
                                         self.tags.write(schema, table, Some("*"))
                                     }
                                     MergeAction::Insert(ins) => {
                                         for col in &ins.columns {
-                                            self.tags.write(schema, table, Some(&col.value));
+                                            self.tags.write(schema, table, Some(&column_of(col)));
                                         }
                                     }
-                                    MergeAction::Update { .. } => {}
+                                    MergeAction::Update(_) => {}
                                 }
                             }
                         }
                         match &mut c.action {
-                            MergeAction::Update { assignments } => {
-                                self.assignments(assignments, target.as_ref(), d)?
+                            MergeAction::Update(u) => {
+                                match &mut u.kind {
+                                    MergeUpdateKind::Set(assignments) => {
+                                        self.assignments(assignments, target.as_ref(), d)?
+                                    }
+                                    // `UPDATE *` copies every source column
+                                    // into the same-named target column.
+                                    MergeUpdateKind::Wildcard => {
+                                        if let (true, Some((schema, table))) = (self.all, &tgt) {
+                                            self.tags.write(schema.as_deref(), table, Some("*"));
+                                        }
+                                        let lin = self.everything_in_scope();
+                                        self.touches.record(&lin, Sink::Copy);
+                                    }
+                                }
+                                // Oracle's `UPDATE … WHERE … DELETE WHERE …`.
+                                if self.all {
+                                    for p in [&mut u.update_predicate, &mut u.delete_predicate]
+                                        .into_iter()
+                                        .flatten()
+                                    {
+                                        self.expr(p, d)?;
+                                    }
+                                }
                             }
                             MergeAction::Insert(ins) => {
+                                if let (true, Some(p)) = (self.all, ins.insert_predicate.as_mut()) {
+                                    self.expr(p, d)?;
+                                }
                                 if let MergeInsertKind::Values(v) = &mut ins.kind {
                                     for row in v.rows.iter_mut() {
                                         for (j, e) in row.iter_mut().enumerate() {
@@ -601,7 +737,9 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                                             if let (false, Some(dest), Some(t)) =
                                                 (self.all, ins.columns.get(j), target.as_ref())
                                             {
-                                                for k in t.column(self.tags, &dest.value).keys() {
+                                                for k in
+                                                    t.column(self.tags, &column_of(dest)).keys()
+                                                {
                                                     lin.remove(k);
                                                 }
                                             }
@@ -610,8 +748,12 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                                     }
                                 }
                             }
-                            MergeAction::Delete => {}
+                            MergeAction::Delete { .. } | MergeAction::DoNothing { .. } => {}
                         }
+                    }
+                    if let Some(out) = output {
+                        let targets: Vec<Item> = target.iter().cloned().collect();
+                        self.output(out, &targets, visible, d)?;
                     }
                     Ok(())
                 })();
@@ -621,6 +763,48 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             _ => {}
         }
         Ok(())
+    }
+
+    /// The `OUTPUT` clause of SQL Server (and `RETURNING` on `MERGE`), which
+    /// sqlparser now reads on every dialect: what it projects goes to
+    /// the client like `RETURNING`, or into a table with `OUTPUT … INTO`, a
+    /// copy. `inserted.*` / `deleted.*` are the target's rows.
+    fn output(
+        &mut self,
+        out: &mut OutputClause,
+        targets: &[Item],
+        visible: Sink,
+        depth: usize,
+    ) -> Result<()> {
+        let (items, into) = match out {
+            OutputClause::Output {
+                select_items,
+                into_table,
+                ..
+            } => (select_items, into_table.is_some()),
+            OutputClause::Returning { select_items, .. } => (select_items, false),
+        };
+        if self.all && into {
+            // Writes a table the clause names: denied under an allowlist.
+            self.tags.statement("OUTPUT INTO");
+        }
+        let sink = if into { Sink::Copy } else { visible };
+        self.scopes.push();
+        for t in targets {
+            if let Item::Base { schema, table, .. } = t {
+                for refname in ["inserted", "deleted"] {
+                    self.scopes.add(Item::Base {
+                        refname: refname.to_string(),
+                        schema: schema.clone(),
+                        table: table.clone(),
+                    });
+                }
+            }
+            self.scopes.add(t.clone());
+        }
+        let r = self.projection(items, Some(sink), depth + 1);
+        self.scopes.pop();
+        r.map(|_| ())
     }
 
     fn assignments(
@@ -638,7 +822,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                     AssignmentTarget::Tuple(ns) => ns.iter().collect(),
                 };
                 for n in names {
-                    let col = n.0.last().map(|i| i.value.clone()).unwrap_or_default();
+                    let col = column_of(n);
                     for (schema, table) in self.write_targets(n, target) {
                         self.tags.write(schema.as_deref(), &table, None);
                         self.tags.write(schema.as_deref(), &table, Some(&col));
@@ -649,7 +833,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             }
             if let (AssignmentTarget::ColumnName(n), Some(t)) = (&a.target, target) {
                 if let Some(col) = n.0.last() {
-                    for k in t.column(self.tags, &col.value).keys() {
+                    for k in t.column(self.tags, name_part(col)).keys() {
                         lin.remove(k);
                     }
                 }
@@ -663,6 +847,14 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
 
     fn query(&mut self, q: &mut Query, sink: Option<Sink>, depth: usize) -> Result<Vec<OutCol>> {
         too_deep(depth)?;
+        // Pipe syntax (`|> SELECT …`, Generic dialect only) projects and
+        // filters in ways this walker does not model: not analysed (a block
+        // under a protective tag or an enforced allowlist).
+        if !q.pipe_operators.is_empty() {
+            return Err(ProxyError::ParseError(
+                "pipe syntax (`|>`) is not analysed".to_string(),
+            ));
+        }
         let pushed = if let Some(with) = q.with.as_mut() {
             self.ctes.push(Vec::new());
             let recursive = with.recursive;
@@ -732,12 +924,25 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         let out = match (all, out) {
             (true, Ok(o)) => {
                 let r = (|| -> Result<()> {
-                    if let Some(l) = q.limit.as_mut() {
-                        self.expr(l, depth + 1)?;
-                    }
-                    self.exprs(&mut q.limit_by, depth + 1)?;
-                    if let Some(o) = q.offset.as_mut() {
-                        self.expr(&mut o.value, depth + 1)?;
+                    match q.limit_clause.as_mut() {
+                        Some(LimitClause::LimitOffset {
+                            limit,
+                            offset,
+                            limit_by,
+                        }) => {
+                            if let Some(l) = limit.as_mut() {
+                                self.expr(l, depth + 1)?;
+                            }
+                            self.exprs(limit_by, depth + 1)?;
+                            if let Some(o) = offset.as_mut() {
+                                self.expr(&mut o.value, depth + 1)?;
+                            }
+                        }
+                        Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+                            self.expr(offset, depth + 1)?;
+                            self.expr(limit, depth + 1)?;
+                        }
+                        None => {}
                     }
                     if let Some(f) = q.fetch.as_mut().and_then(|f| f.quantity.as_mut()) {
                         self.expr(f, depth + 1)?;
@@ -758,7 +963,11 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
     /// column IS that output (MySQL and the others resolve ORDER BY names to
     /// the select list first), already counted.
     fn order_by(&mut self, ob: &mut OrderBy, outs: &[OutCol], depth: usize) -> Result<()> {
-        for item in ob.exprs.iter_mut() {
+        // `ORDER BY ALL` orders by the outputs, already counted.
+        let OrderByKind::Expressions(items) = &mut ob.kind else {
+            return Ok(());
+        };
+        for item in items.iter_mut() {
             let output = match &item.expr {
                 Expr::Identifier(id) => outs
                     .iter()
@@ -859,7 +1068,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                     })
                     .collect())
             }
-            SetExpr::Insert(s) | SetExpr::Update(s) => {
+            SetExpr::Insert(s) | SetExpr::Update(s) | SetExpr::Delete(s) | SetExpr::Merge(s) => {
                 self.stmt(s, d)?;
                 Ok(Vec::new())
             }
@@ -892,12 +1101,10 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             // `SELECT … INTO t` creates a table (SQL Server, Postgres via
             // sqlparser); `INTO @v` (MySQL) only sets a session variable.
             if let Some(into) = &sel.into {
-                if !into
-                    .name
-                    .0
-                    .first()
-                    .is_some_and(|i| i.value.starts_with('@'))
-                {
+                // The targets are expressions since sqlparser 0.63 (MySQL's
+                // `INTO @a, @b`): only user variables are not a table.
+                let variable = |e: &Expr| matches!(e, Expr::Identifier(i) if i.quote_style.is_none() && i.value.starts_with('@'));
+                if into.targets.is_empty() || !into.targets.iter().all(variable) {
                     self.tags.statement("SELECT INTO");
                 }
             }
@@ -924,7 +1131,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 Ok(())
             })?;
             for n in &lock_of {
-                let parts: Vec<&str> = n.0.iter().map(|i| i.value.as_str()).collect();
+                let parts = name_parts(n);
                 let bases = self.scopes.base_tables(&parts);
                 if bases.is_empty() {
                     // Not a base table in scope: taken as a table name,
@@ -979,7 +1186,9 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         }
         self.exprs(&mut sel.cluster_by, d)?;
         self.exprs(&mut sel.distribute_by, d)?;
-        self.exprs(&mut sel.sort_by, d)?;
+        for o in sel.sort_by.iter_mut() {
+            self.expr(&mut o.expr, d)?;
+        }
         if let Some(sqlparser::ast::Distinct::On(exprs)) = &mut sel.distinct {
             self.exprs(exprs, d)?;
         }
@@ -991,9 +1200,15 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         for lv in sel.lateral_views.iter_mut() {
             self.expr(&mut lv.lateral_view, d)?;
         }
-        if let Some(cb) = sel.connect_by.as_mut() {
-            self.expr(&mut cb.condition, d)?;
-            self.exprs(&mut cb.relationships, d)?;
+        for cb in sel.connect_by.iter_mut() {
+            match cb {
+                sqlparser::ast::ConnectByKind::ConnectBy { relationships, .. } => {
+                    self.exprs(relationships, d)?;
+                }
+                sqlparser::ast::ConnectByKind::StartWith { condition, .. } => {
+                    self.expr(condition, d)?;
+                }
+            }
         }
         if let Some(sqlparser::ast::TopQuantity::Expr(e)) =
             sel.top.as_mut().and_then(|t| t.quantity.as_mut())
@@ -1092,7 +1307,11 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         if let Some(c) = column_name(e) {
             return c.to_string();
         }
-        if let Expr::Value(Value::SingleQuotedString(s) | Value::DoubleQuotedString(s)) = e {
+        if let Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+            ..
+        }) = e
+        {
             return s.clone();
         }
         let text = match self.mysql {
@@ -1119,9 +1338,20 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
                     has_star = true;
                     let (lin, cols) = match item {
-                        SelectItem::QualifiedWildcard(name, _) => {
-                            let q: Vec<&str> = name.0.iter().map(|i| i.value.as_str()).collect();
+                        SelectItem::QualifiedWildcard(
+                            SelectItemQualifiedWildcardKind::ObjectName(name),
+                            _,
+                        ) => {
+                            let q = name_parts(name);
                             self.scopes.star(self.tags, &q)
+                        }
+                        // `<expr>.*` (BigQuery): every field of the value.
+                        SelectItem::QualifiedWildcard(
+                            SelectItemQualifiedWildcardKind::Expr(e),
+                            _,
+                        ) => {
+                            let lin = self.expr(e, depth + 1)?;
+                            (lin.clone(), vec![OutCol::OpaqueStar { lin }])
                         }
                         _ => self.scopes.star(self.tags, &[]),
                     };
@@ -1129,6 +1359,26 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                         self.touches.record(&lin, sink);
                     }
                     outs.extend(cols);
+                    continue;
+                }
+                // `expr AS (a, b)` (Spark/Databricks only): every output may
+                // carry the value. Not rewritten: a mask refuses the query.
+                SelectItem::ExprWithAliases { expr, aliases } => {
+                    let lin = self.expr(expr, depth + 1)?;
+                    if let Some(sink) = sink {
+                        self.touches.record(&lin, sink);
+                        if let (Sink::Projected { rewrite: true }, Some(_)) =
+                            (sink, mask_style_for(self.tags, &lin))
+                        {
+                            self.refuse("a multi-alias select item cannot be masked".to_string());
+                        }
+                    }
+                    for a in aliases.iter() {
+                        outs.push(OutCol::Named {
+                            name: a.value.clone(),
+                            lin: lin.clone(),
+                        });
+                    }
                     continue;
                 }
                 SelectItem::UnnamedExpr(e) => {
@@ -1196,8 +1446,14 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 for j in twj.joins.iter_mut() {
                     use sqlparser::ast::{JoinConstraint, JoinOperator as J};
                     let (constraint, matching) = match &mut j.join_operator {
-                        J::Inner(c)
+                        J::Join(c)
+                        | J::Inner(c)
+                        | J::Left(c)
                         | J::LeftOuter(c)
+                        | J::Right(c)
+                        | J::Semi(c)
+                        | J::Anti(c)
+                        | J::StraightJoin(c)
                         | J::RightOuter(c)
                         | J::FullOuter(c)
                         | J::LeftSemi(c)
@@ -1208,7 +1464,12 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                             match_condition,
                             constraint,
                         } => (Some(constraint), Some(match_condition)),
-                        J::CrossJoin | J::CrossApply | J::OuterApply => (None, None),
+                        J::CrossJoin(c) => (Some(c), None),
+                        J::CrossApply
+                        | J::OuterApply
+                        | J::ArrayJoin
+                        | J::LeftArrayJoin
+                        | J::InnerArrayJoin => (None, None),
                     };
                     if let Some(m) = matching {
                         self.expr(m, depth + 1)?;
@@ -1219,8 +1480,9 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                         }
                         Some(JoinConstraint::Using(cols)) => {
                             for c in cols.iter() {
+                                let c = column_of(c);
                                 for it in &items {
-                                    it.column(self.tags, &c.value);
+                                    it.column(self.tags, &c);
                                 }
                             }
                         }
@@ -1340,6 +1602,48 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 refname: alias_name(alias),
                 lin: indirect(self.expr(json_expr, d)?),
             }],
+            // SQL Server's `OPENJSON(…)`: rows computed from a value, like
+            // JSON_TABLE.
+            TableFactor::OpenJsonTable {
+                json_expr, alias, ..
+            } => vec![Item::Opaque {
+                refname: alias_name(alias),
+                lin: indirect(self.expr(json_expr, d)?),
+            }],
+            // `XMLTABLE(… PASSING x …)`: rows computed from the values passed.
+            TableFactor::XmlTable {
+                row_expression,
+                passing,
+                alias,
+                ..
+            } => {
+                let mut lin = self.expr(row_expression, d)?;
+                for a in passing.arguments.iter_mut() {
+                    merge(&mut lin, self.expr(&mut a.expr, d)?);
+                }
+                vec![Item::Opaque {
+                    refname: alias_name(alias),
+                    lin: indirect(lin),
+                }]
+            }
+            // Redshift's `UNPIVOT expr AS v`: values of the expression.
+            TableFactor::UnpivotExpr {
+                expression,
+                value_alias,
+                ..
+            } => vec![Item::Opaque {
+                refname: Some(value_alias.value.clone()),
+                lin: indirect(self.expr(expression, d)?),
+            }],
+            // Snowflake's `SEMANTIC_VIEW(v …)`: reads the view, whole.
+            TableFactor::SemanticView { name, alias, .. } => {
+                let (schema, table) = split_name(name);
+                self.tags.relation(schema.as_deref(), &table);
+                vec![Item::Opaque {
+                    refname: alias_name(alias),
+                    lin: indirect(self.tags.of_table(schema.as_deref(), &table)),
+                }]
+            }
             TableFactor::NestedJoin {
                 table_with_joins,
                 alias,
@@ -1368,18 +1672,20 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
 
     fn function_arg(&mut self, a: &mut FunctionArg, depth: usize) -> Result<Lineage> {
         let arg = match a {
-            FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => arg,
+            FunctionArg::Named { arg, .. }
+            | FunctionArg::ExprNamed { arg, .. }
+            | FunctionArg::Unnamed(arg) => arg,
         };
         Ok(match arg {
             FunctionArgExpr::Expr(e) => self.expr(e, depth)?,
-            FunctionArgExpr::Wildcard => {
+            FunctionArgExpr::Wildcard | FunctionArgExpr::WildcardWithOptions(_) => {
                 // `COUNT(*)` counts rows; `JSON_OBJECT(*)`-style uses do not
                 // exist in these dialects, but be conservative for any other
                 // function: a bare `*` argument reads the whole row.
                 Lineage::new()
             }
             FunctionArgExpr::QualifiedWildcard(name) => {
-                let q: Vec<&str> = name.0.iter().map(|i| i.value.as_str()).collect();
+                let q = name_parts(name);
                 self.scopes.star(self.tags, &q).0
             }
         })
@@ -1430,12 +1736,14 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             // With `ANSI_QUOTES` (server-wide, or per statement through a
             // `SET_VAR` hint) MySQL reads `"email"` as the column. The engine
             // cannot see the SQL mode: treat it as a possible column.
-            Expr::Value(Value::DoubleQuotedString(s)) if self.ansi_quotes => {
-                self.scopes.column(self.tags, &[], s)
-            }
-            Expr::Value(_) | Expr::TypedString { .. } | Expr::IntroducedString { .. } => {
-                Lineage::new()
-            }
+            Expr::Value(ValueWithSpan {
+                value: Value::DoubleQuotedString(s),
+                ..
+            }) if self.ansi_quotes => self.scopes.column(self.tags, &[], s),
+            Expr::Value(_) | Expr::TypedString { .. } => Lineage::new(),
+            // `_utf8mb4'x'` (an introducer, `IntroducedString` before
+            // sqlparser 0.56): the value is a literal.
+            Expr::Prefixed { value, .. } => self.expr(value, d)?,
             Expr::Nested(x) => return self.expr(x, d),
             // Only the arguments are values; FILTER / OVER / WITHIN GROUP decide
             // which rows and in what order, like WHERE.
@@ -1527,7 +1835,14 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             | Expr::Named { expr, .. }
             | Expr::OuterJoin(expr)
             | Expr::Prior(expr)
-            | Expr::CompositeAccess { expr, .. } => self.expr(expr, d)?,
+            | Expr::IsNormalized { expr, .. }
+            | Expr::IsJson { expr, .. } => self.expr(expr, d)?,
+            // MySQL's `v MEMBER OF (json_array)`.
+            Expr::MemberOf(m) => {
+                let mut l = self.expr(&mut m.value, d)?;
+                merge(&mut l, self.expr(&mut m.array, d)?);
+                l
+            }
             Expr::JsonAccess { value, .. } => self.expr(value, d)?,
             Expr::Convert { expr, styles, .. } => {
                 let mut l = self.expr(expr, d)?;
@@ -1619,15 +1934,17 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             Expr::Case {
                 operand,
                 conditions,
-                results,
                 else_result,
+                ..
             } => {
                 let mut l = Lineage::new();
                 if let Some(o) = operand {
                     merge(&mut l, self.expr(o, d)?);
                 }
-                merge(&mut l, self.exprs(conditions, d)?);
-                merge(&mut l, self.exprs(results, d)?);
+                for w in conditions.iter_mut() {
+                    merge(&mut l, self.expr(&mut w.condition, d)?);
+                    merge(&mut l, self.expr(&mut w.result, d)?);
+                }
                 if let Some(x) = else_result {
                     merge(&mut l, self.expr(x, d)?);
                 }
@@ -1643,24 +1960,53 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 }
                 l
             }
-            Expr::MapAccess { column, keys } => {
-                let mut l = self.expr(column, d)?;
-                for k in keys.iter_mut() {
-                    merge(&mut l, self.expr(&mut k.key, d)?);
+            // `a[1]`, `m['k']`, `(x).f` (MapAccess / Subscript /
+            // CompositeAccess before sqlparser 0.54/0.55): the value comes from the
+            // root; a computed subscript (`a[(SELECT …)]`) is read as well.
+            // `"public"."User"."email"` on MySQL: with `ANSI_QUOTES` a column
+            // name, which sqlparser 0.63 reads as field access on the string
+            // `"public"` (0.52 rejected it). Read as the dotted name it is.
+            Expr::CompoundFieldAccess { root, access_chain }
+                if dotted_name(root, access_chain, self.ansi_quotes).is_some() =>
+            {
+                let ids = dotted_name(root, access_chain, self.ansi_quotes).unwrap_or_default();
+                return Ok(self.compound(&ids));
+            }
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                let mut l = self.expr(root, d)?;
+                for a in access_chain.iter_mut() {
+                    match a {
+                        AccessExpr::Subscript(Subscript::Index { index }) => {
+                            merge(&mut l, self.expr(index, d)?);
+                        }
+                        AccessExpr::Subscript(Subscript::Slice {
+                            lower_bound,
+                            upper_bound,
+                            stride,
+                        }) => {
+                            for x in [lower_bound, upper_bound, stride].into_iter().flatten() {
+                                merge(&mut l, self.expr(x, d)?);
+                            }
+                        }
+                        // A field name, not a value.
+                        AccessExpr::Dot(_) => {}
+                    }
                 }
                 l
             }
-            Expr::Subscript { expr, .. } => self.expr(expr, d)?,
             Expr::MatchAgainst { columns, .. } => {
                 let mut l = Lineage::new();
                 for c in columns.iter() {
-                    merge(&mut l, self.scopes.column(self.tags, &[], &c.value));
+                    let parts = name_parts(c);
+                    if let [q @ .., col] = parts.as_slice() {
+                        merge(&mut l, self.scopes.column(self.tags, q, col));
+                    }
                 }
                 l
             }
-            Expr::Wildcard => self.scopes.star(self.tags, &[]).0,
-            Expr::QualifiedWildcard(name) => {
-                let q: Vec<&str> = name.0.iter().map(|i| i.value.as_str()).collect();
+            Expr::Wildcard(_) => self.scopes.star(self.tags, &[]).0,
+            Expr::QualifiedWildcard(name, _) => {
+                let q = name_parts(name);
                 self.scopes.star(self.tags, &q).0
             }
             // Struct / Dictionary / Map / Lambda: not produced by these dialects'
@@ -1708,7 +2054,17 @@ fn fix_order_by(ob: &mut OrderBy, rw: &[Rewritten], star: bool) -> std::result::
         .filter(|(_, n, orig)| !column_name(orig).is_some_and(|c| ieq(c, n)))
         .map(|(_, n, _)| n.as_str())
         .collect();
-    for item in ob.exprs.iter_mut() {
+    let items = match &mut ob.kind {
+        OrderByKind::Expressions(items) => items,
+        // `ORDER BY ALL` would sort by the masked values.
+        OrderByKind::All(_) => {
+            return Err(
+                "ORDER BY ALL sorts by the masked output(s); order by the expressions themselves"
+                    .to_string(),
+            );
+        }
+    };
+    for item in items.iter_mut() {
         let hit = match &item.expr {
             Expr::Identifier(id) => rw.iter().find(|(_, n, _)| ieq(n, &id.value)),
             e => position(e)

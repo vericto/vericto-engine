@@ -256,6 +256,65 @@ pub(crate) enum SourceAst {
     },
 }
 
+/// Byte offset of every token start (tokenizer locations are 1-based line and
+/// character column).
+pub(crate) fn byte_offsets(sql: &str, toks: &[sqlparser::tokenizer::TokenWithSpan]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(toks.len());
+    let mut chars = sql.char_indices().peekable();
+    let (mut line, mut col) = (1u64, 1u64);
+    for t in toks {
+        let want = (t.span.start.line, t.span.start.column);
+        while (line, col) < want {
+            match chars.next() {
+                Some((_, '\n')) => {
+                    line += 1;
+                    col = 1;
+                }
+                Some(_) => col += 1,
+                None => break,
+            }
+        }
+        out.push(chars.peek().map_or(sql.len(), |(b, _)| *b));
+    }
+    out
+}
+
+/// Byte offsets of the `/*! … */` comments in `sql`, as `dialect`'s
+/// tokenizer reads comments. `None` when the text does not tokenize.
+///
+/// Since sqlparser 0.61 the MySQL and Generic tokenizers no longer return
+/// such a comment: they splice its content into the token stream as code,
+/// whatever its version number (`/*!99999 … */` included), so the comment
+/// cannot be seen in the tokens any more. It is found here by tokenizing the
+/// text with every `/*!` turned into `/* ` (same length, so offsets carry
+/// over): a comment that starts where the original text has `/*!` is one.
+/// A `/*!` inside a string literal or a quoted identifier stays inside it.
+pub(crate) fn executable_comments<D: sqlparser::dialect::Dialect>(
+    dialect: &D,
+    sql: &str,
+) -> Option<Vec<usize>> {
+    use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+    if !sql.contains("/*!") {
+        return Some(Vec::new());
+    }
+    let masked = sql.replace("/*!", "/* ");
+    let toks = Tokenizer::new(dialect, &masked)
+        .with_unescape(false)
+        .tokenize_with_location()
+        .ok()?;
+    let offs = byte_offsets(&masked, &toks);
+    Some(
+        toks.iter()
+            .zip(offs)
+            .filter(|(t, o)| {
+                matches!(t.token, Token::Whitespace(Whitespace::MultiLineComment(_)))
+                    && sql[*o..].starts_with("/*!")
+            })
+            .map(|(_, o)| o)
+            .collect(),
+    )
+}
+
 /// Common interface for dialect-specific parsers (Strategy Pattern).
 pub trait SqlParser: Send + Sync {
     /// Parses the query and returns the normalized representation.
