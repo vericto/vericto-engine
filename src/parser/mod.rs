@@ -68,6 +68,10 @@ pub enum DropObjectKind {
     Database,
     Schema,
     Index,
+    /// `DROP TRIGGER`: removes a data-integrity or audit protection for good,
+    /// so VERICTO-019 reports it alongside `DISABLE TRIGGER`. Not accepted by
+    /// the custom-rule `object_type:` predicate.
+    Trigger,
     Other,
 }
 
@@ -178,6 +182,11 @@ pub struct StatementInfo {
     /// PROGRAM '…'`), which executes a shell command on the server (RCE /
     /// data exfiltration). Used by VERICTO-080.
     pub copy_is_program: bool,
+    /// Whether a `COPY` statement loads rows from a file on the database
+    /// server (`COPY t FROM '/path'`). `false` for `FROM STDIN` (the client
+    /// sends the rows), for `FROM PROGRAM` (`copy_is_program`) and for every
+    /// `COPY … TO`. Used by VERICTO-061.
+    pub copy_from_file: bool,
     /// Whether the WHERE clause contains a trivially-true OR branch
     /// (e.g. `WHERE id = 1 OR 1=1`). Used by VERICTO-090 to detect
     /// SQL injection tautologies. Populated for all statement types that
@@ -205,6 +214,7 @@ impl Default for StatementInfo {
             select_is_star: false,
             function_name: None,
             copy_is_program: false,
+            copy_from_file: false,
             has_or_tautology: false,
         }
     }

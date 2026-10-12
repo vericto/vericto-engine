@@ -71,8 +71,8 @@ impl Severity {
 #[serde(rename_all = "snake_case")]
 pub enum RuleClass {
     /// Schema/DDL changes: DROP TABLE/DATABASE/SCHEMA, TRUNCATE, ALTER TABLE,
-    /// DROP INDEX. Destructive against a live DB, but normal in a versioned
-    /// migration — the class a CI channel may want to soften to Flag.
+    /// DROP INDEX, DROP TRIGGER. Destructive against a live DB, but normal in a
+    /// versioned migration — the class a CI channel may want to soften to Flag.
     SchemaMigration,
     /// Data mutation without adequate scope: DELETE/UPDATE without WHERE,
     /// INSERT..SELECT / CREATE TABLE AS with no filter, MERGE. Dangerous on

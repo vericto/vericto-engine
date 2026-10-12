@@ -11,16 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Dependency release: `serde_yaml` is replaced (RUSTSEC-2024-0449, which fails
 `cargo deny` and `cargo audit` on 3.8.2) and sqlparser, the parser of MySQL,
-Oracle and MS SQL, moves from 0.52 to 0.63. **No public API changes**: hosts
-build against 3.9.0 unchanged, and no rule code, JSON shape or precedence
-changes. What changes is the SQL the sqlparser dialects accept: text 3.8.2
-could not parse, whose outcome was the host's `parse_error` choice, is now
-evaluated by the rules (below). Statement kinds the engine does not model keep
+Oracle and MS SQL, moves from 0.52 to 0.63. **No breaking API changes**: hosts
+build against 3.9.0 unchanged, and no rule code is added, no JSON shape or
+precedence changes. Two existing rules cover more statements: `DROP TRIGGER`
+(VERICTO-019) and `COPY … FROM` a server-side file (VERICTO-061), on every
+dialect including PostgreSQL (below). What changes otherwise is the SQL the
+sqlparser dialects accept: text 3.8.2 could not parse, whose outcome was the
+host's `parse_error` choice, is now evaluated by the rules (below). Statement kinds the engine does not model keep
 resolving as parse errors, and every verdict was compared with 3.8.2 on the
 SQL of the test suites, fixtures and documentation of the engine and its
 consumers: nothing 3.8.2 blocked by a rule is allowed, unless sqlparser 0.52
 had misread the text (MySQL SELECT modifiers read as columns, `--1` read as a
-comment). PostgreSQL (`pg_query`) is unaffected.
+comment). PostgreSQL (`pg_query`) is unaffected by the parser change; only
+the two rule extensions change its verdicts.
 
 **3.8.2 was never tagged.** Its changes (the hardening release of 2026-10-11:
 `#![forbid(unsafe_code)]`, cargo-deny/cargo-audit, gitleaks, Dependabot and the
@@ -39,9 +42,9 @@ entries below.
   data-modifying CTEs (`WITH d AS (DELETE … RETURNING …) SELECT …`) on every
   dialect, and `DELETE … RETURNING`, `UPDATE … FROM`, `DROP INDEX i ON t`,
   `ALTER TABLE … ALTER COLUMN … TYPE`, `COPY … FROM STDIN`, `COMMENT ON`,
-  `ANALYZE` and `DROP TRIGGER … ON t` where a dialect rejected them; MySQL's
-  `SET SESSION TRANSACTION …` (sent on connect by Django, Hibernate and
-  SQLAlchemy), now allowed as it is on PostgreSQL; MySQL index hints,
+  `ANALYZE`, `DROP TRIGGER` and `COPY … FROM '/path'` where a dialect rejected
+  them; MySQL's `SET SESSION TRANSACTION …` (sent on connect by Django,
+  Hibernate and SQLAlchemy), now allowed as it is on PostgreSQL; MySQL index hints,
   `WITH ROLLUP`, `b'…'` bit literals and SELECT modifiers (`HIGH_PRIORITY`,
   `SQL_CALC_FOUND_ROWS`, `SQL_NO_CACHE`, …), which sqlparser misread as a column
   with an alias (an allowlist reported a read of a column named
@@ -55,6 +58,21 @@ entries below.
   and `psm` (MIT / MIT OR Apache-2.0): the parser grows its stack instead of
   overflowing on deeply nested input. The engine's own nesting guard
   (`MAX_AST_DEPTH`, `guard_nesting_depth`) is unchanged.
+- **Behaviour note: statements that now get the rules' verdict.** On MySQL,
+  Oracle and SQL Server, `SET SESSION TRANSACTION …`, `ANALYZE`, `COMMENT ON`,
+  `DROP TRIGGER` and `COPY … FROM` used to be rejected only because sqlparser
+  0.52 did not parse them, so under a fail-closed policy (`parse_error: block`,
+  a `block`/`mask` tag or an enforced allowlist) they were blocked as parse
+  errors. They are now evaluated like on PostgreSQL. `SET SESSION
+  TRANSACTION`, `ANALYZE` and `COMMENT ON` match no rule and are allowed;
+  `DROP TRIGGER` and `COPY … FROM` a server-side file are reported (Security,
+  below); `COPY … FROM STDIN` and `COPY … TO` (STDOUT or a file) match no rule.
+  MySQL's `LOAD DATA [LOCAL] INFILE` and SQL Server's `DROP TRIGGER … ON ALL
+  SERVER` still do not parse in sqlparser 0.63 and stay parse errors.
+- `parser::DropObjectKind::Trigger` and `StatementInfo::copy_from_file` are
+  added (additive enum/struct changes, as in earlier minor releases).
+  `DropObjectKind::from_yaml` does not accept `trigger`, so custom rules are
+  unchanged: a `statement: drop` rule still matches `DROP TRIGGER`.
 
 ### Fixed
 
@@ -67,6 +85,23 @@ entries below.
 
 ### Security
 
+- **`DROP TRIGGER` is reported by VERICTO-019** ("ALTER TABLE DISABLE TRIGGER /
+  RLS"), on every dialect: PostgreSQL, MySQL, Oracle and SQL Server, with `IF
+  EXISTS`, `CASCADE`/`RESTRICT` and SQL Server's `DROP TRIGGER … ON DATABASE`.
+  Dropping a trigger removes the same protection `DISABLE TRIGGER` turns off,
+  for good. It is enforced like `DROP TABLE`: VERICTO-019 is a
+  `SchemaMigration` rule, so it blocks at runtime under the default policy
+  (High → block) and a CI channel's `schema_migration_cap = Flag` turns the
+  block into a flag. Evidence path `DropStmt > ObjectType = TRIGGER`.
+  PostgreSQL allowed it in 3.8.2 (no rule matched); MySQL, Oracle and SQL
+  Server rejected it as a parse error. VERICTO-010 still does not fire on it.
+- **`COPY … FROM` a server-side file is flagged by VERICTO-061** (bulk load),
+  on every dialect where it parses: the database server reads a file from its
+  own filesystem into the table. VERICTO-061 is Medium (flag) and a
+  `Performance` rule, so it flags on every channel and never blocks under the
+  default policy. Evidence path `CopyStmt > FROM file`. `COPY … FROM STDIN`
+  (the path VERICTO-061 recommends) stays allowed, `COPY … FROM PROGRAM` stays
+  VERICTO-080 alone, and `COPY … TO` is unchanged.
 - **RUSTSEC-2024-0449: `serde_yaml` replaced by `serde_norway`.** Custom-rule YAML
   (`ast_condition_yaml`) was parsed with `serde_yaml` 0.9, which is deprecated
   and runs `unsafe-libyaml`, a machine translation of libyaml that is

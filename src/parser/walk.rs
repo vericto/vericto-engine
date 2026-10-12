@@ -406,9 +406,10 @@ fn walk_statement(
                 ObjectType::Database => DropObjectKind::Database,
                 ObjectType::Schema => DropObjectKind::Schema,
                 ObjectType::Index => DropObjectKind::Index,
-                // View/Trigger/Function/Policy/Sequence/… stay `Other`: they are
-                // not destructive table/data drops, so VERICTO-010 must not fire
-                // on them (that was the DROP POLICY false positive).
+                // View/Function/Policy/Sequence/… stay `Other`: they are not
+                // destructive table/data drops, so VERICTO-010 must not fire on
+                // them (that was the DROP POLICY false positive). DROP TRIGGER
+                // is its own statement kind, below.
                 _ => DropObjectKind::Other,
             };
             let relation = names.first().map(|n| n.to_string());
@@ -416,6 +417,27 @@ fn walk_statement(
                 kind: StatementKind::Drop,
                 relation,
                 drop_object: Some(drop_object),
+                is_nested,
+                ast_node_path: "DropStmt".to_string(),
+                drop_index_if_exists: *if_exists,
+                ..Default::default()
+            });
+        }
+
+        // ── DROP TRIGGER (VERICTO-019) ─────────────────────────────────────
+        // Its own statement kind in sqlparser; libpg_query reads it as a
+        // `DropStmt` with object type TRIGGER, recorded the same way. On SQL
+        // Server, `ON DATABASE` (a DDL trigger) reads as the table name.
+        Statement::DropTrigger(sqlparser::ast::DropTrigger {
+            if_exists,
+            trigger_name,
+            table_name,
+            ..
+        }) => {
+            out.push(StatementInfo {
+                kind: StatementKind::Drop,
+                relation: Some(table_name.as_ref().unwrap_or(trigger_name).to_string()),
+                drop_object: Some(DropObjectKind::Trigger),
                 is_nested,
                 ast_node_path: "DropStmt".to_string(),
                 drop_index_if_exists: *if_exists,
@@ -547,8 +569,9 @@ fn walk_statement(
 
         // ── COPY … TO/FROM PROGRAM (VERICTO-080) ─────────────────────────────
         // The PROGRAM target/source runs a shell command on the server (RCE /
-        // exfiltration). Non-program forms are still recorded for telemetry.
-        Statement::Copy { target, .. } => {
+        // exfiltration). Non-program forms are still recorded; `FROM` a
+        // server-side file is a bulk load VERICTO-061 reports.
+        Statement::Copy { to, target, .. } => {
             use sqlparser::ast::CopyTarget;
             out.push(StatementInfo {
                 kind: StatementKind::Copy,
@@ -559,6 +582,7 @@ fn walk_statement(
                     "CopyStmt".to_string()
                 },
                 copy_is_program: matches!(target, CopyTarget::Program { .. }),
+                copy_from_file: !*to && matches!(target, CopyTarget::File { .. }),
                 ..Default::default()
             });
         }
