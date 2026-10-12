@@ -470,7 +470,7 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
 /// ```
 ///
 /// Predicates live under `condition:`. We deserialize `condition` as a raw
-/// `serde_yaml::Value` so we can distinguish `where_clause: null` (key present,
+/// `serde_norway::Value` so we can distinguish `where_clause: null` (key present,
 /// value null → "no WHERE clause") from the key being absent — an important
 /// signal that a typed `Option<T>` would collapse into `None` either way.
 ///
@@ -484,7 +484,7 @@ struct CustomRuleSpec {
     #[allow(dead_code)]
     message: Option<String>,
     #[serde(default)]
-    condition: serde_yaml::Value,
+    condition: serde_norway::Value,
 }
 
 /// The predicate keys recognized inside a custom rule's `condition:` block.
@@ -506,7 +506,7 @@ fn evaluate_custom(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
     let yaml = rule.ast_condition_yaml.as_ref()?;
     // A malformed rule must not silently "allow" the query: this evaluator is a
     // last line of defense, so log and skip it rather than fail open in silence.
-    let spec: CustomRuleSpec = match serde_yaml::from_str(yaml) {
+    let spec: CustomRuleSpec = match serde_norway::from_str(yaml) {
         Ok(spec) => spec,
         Err(e) => {
             tracing::warn!(
@@ -540,7 +540,7 @@ fn evaluate_custom(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
     let cond = &spec.condition;
     // A node_type with no `condition:` block fires for every matching node
     // (e.g. `node_type: DropStmt` blocks any DROP).
-    let cond_get = |key: &str| cond.get(serde_yaml::Value::from(key));
+    let cond_get = |key: &str| cond.get(serde_norway::Value::from(key));
 
     // Warn on any predicate the engine doesn't understand. We only iterate the
     // condition when it's a mapping; a missing/scalar `condition:` has no keys.
@@ -1240,6 +1240,31 @@ mod tests {
     fn custom_malformed_yaml_never_matches() {
         let rule = make_custom_rule("node_type: [this is: not valid");
         assert!(evaluate_rule(&rule, &parse("DELETE FROM users", Dialect::Postgres)).is_none());
+    }
+
+    // The parse error a skipped rule logs keeps naming the field and the
+    // position, as it did with serde_yaml: it is what an author sees in the
+    // warning when a rule never fires. Pinned on the malformed fixtures above
+    // and on the nested form (`node_type` under `rule:`) the editor warns about.
+    #[test]
+    fn custom_yaml_errors_name_the_field_and_position() {
+        let err = |yaml: &str| {
+            serde_norway::from_str::<CustomRuleSpec>(yaml)
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            err("node_type: [this is: not valid"),
+            "node_type: invalid type: sequence, expected a string at line 1 column 12"
+        );
+        assert_eq!(
+            err("rule:\n  node_type: SelectStmt"),
+            "rule: invalid type: map, expected a string at line 2 column 3"
+        );
+        assert_eq!(
+            err("node_type: DropStmt\n  object_type: table"),
+            "mapping values are not allowed in this context at line 2 column 14"
+        );
     }
 
     // An unrecognized object_type value matches nothing (safe failure), rather
