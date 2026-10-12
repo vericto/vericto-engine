@@ -10,3 +10,5 @@
 Cargo.lock
 # Internal/working docs — not versioned
 docs/
+# Local agent instructions — not versioned
+CLAUDE.md
