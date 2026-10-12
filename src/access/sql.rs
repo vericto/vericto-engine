@@ -4,16 +4,16 @@
 //! ([`crate::sensitive::sql::access_walk`]).
 
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, ObjectName, Query,
-    Select, SelectItem, SetExpr, Statement, Value,
+    ContextModifier, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
+    Query, Select, SelectItem, Set, SetExpr, Statement, Value, ValueWithSpan,
 };
 
 use crate::access::session::{self, ModePiece, Setting};
 
 use crate::error::{MAX_AST_DEPTH, ProxyError, Result};
 use crate::parser::Dialect;
-use crate::sensitive::Tags;
 use crate::sensitive::sql::access_walk;
+use crate::sensitive::{Tags, name_part, name_parts};
 
 enum Class {
     /// Reads or writes tables: walked.
@@ -42,9 +42,13 @@ pub(crate) fn collect(statements: &[Statement], tags: &Tags, dialect: Dialect) -
 }
 
 fn split(name: &ObjectName) -> (Option<String>, String) {
-    let parts = &name.0;
-    let table = parts.last().map(|i| i.value.clone()).unwrap_or_default();
-    let schema = (parts.len() >= 2).then(|| parts[parts.len() - 2].value.clone());
+    let parts = name_parts(name);
+    let table = parts.last().map(|p| p.to_string()).unwrap_or_default();
+    // SQL Server's `db..t`: an empty schema is the default one.
+    let schema = (parts.len() >= 2)
+        .then(|| parts[parts.len() - 2])
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     (schema, table)
 }
 
@@ -57,7 +61,7 @@ fn set_denial(name: &ObjectName, values: &[&Expr]) -> Option<String> {
     let last = name
         .0
         .last()
-        .map(|i| i.value.trim_start_matches('@').to_ascii_lowercase())
+        .map(|p| name_part(p).trim_start_matches('@').to_ascii_lowercase())
         .unwrap_or_default();
     match last.as_str() {
         "search_path" => return Some("SET search_path".into()),
@@ -65,12 +69,7 @@ fn set_denial(name: &ObjectName, values: &[&Expr]) -> Option<String> {
         "session_authorization" => return Some("SET SESSION AUTHORIZATION".into()),
         _ => {}
     }
-    let joined = name
-        .0
-        .iter()
-        .map(|i| i.value.as_str())
-        .collect::<Vec<_>>()
-        .join(".");
+    let joined = name_parts(name).join(".");
     let computed = || Some("SET (computed value)".to_string());
     let Some(setting_name) = session::session_name(&joined) else {
         // `@v` (a user variable): harmless with a literal. `@@GLOBAL.x`,
@@ -94,14 +93,29 @@ fn set_denial(name: &ObjectName, values: &[&Expr]) -> Option<String> {
             }
         }
         Setting::StandardConformingStrings => match values {
-            [Expr::Value(Value::SingleQuotedString(v))]
+            [
+                Expr::Value(ValueWithSpan {
+                    value: Value::SingleQuotedString(v),
+                    ..
+                }),
+            ]
             | [Expr::Identifier(Ident { value: v, .. })]
                 if session::scs_on(v) =>
             {
                 None
             }
-            [Expr::Value(Value::Boolean(true))] => None,
-            [Expr::Value(Value::Number(n, _))] if n == "1" => None,
+            [
+                Expr::Value(ValueWithSpan {
+                    value: Value::Boolean(true),
+                    ..
+                }),
+            ] => None,
+            [
+                Expr::Value(ValueWithSpan {
+                    value: Value::Number(n, _),
+                    ..
+                }),
+            ] if n == "1" => None,
             _ => Some("SET standard_conforming_strings".into()),
         },
         Setting::SqlMode => match values {
@@ -124,9 +138,10 @@ fn sql_mode_pieces(e: &Expr) -> Option<Vec<ModePiece>> {
         _ => false,
     };
     match e {
-        Expr::Value(Value::SingleQuotedString(s) | Value::DoubleQuotedString(s)) => {
-            Some(vec![ModePiece::Literal(s.clone())])
-        }
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+            ..
+        }) => Some(vec![ModePiece::Literal(s.clone())]),
         Expr::Identifier(i)
             if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("DEFAULT") =>
         {
@@ -144,7 +159,7 @@ fn sql_mode_pieces(e: &Expr) -> Option<Vec<ModePiece>> {
         Expr::Nested(x) => sql_mode_pieces(x),
         Expr::Function(f)
             if f.name.0.len() == 1
-                && f.name.0[0].value.eq_ignore_ascii_case("concat")
+                && name_part(&f.name.0[0]).eq_ignore_ascii_case("concat")
                 && f.filter.is_none()
                 && f.over.is_none()
                 && f.within_group.is_empty()
@@ -198,16 +213,21 @@ fn arguments(tags: &Tags, dialect: Dialect, args: &[Expr]) -> Result<Class> {
     }
     let projection = args.iter().cloned().map(SelectItem::UnnamedExpr).collect();
     let select = Select {
+        select_token: sqlparser::ast::helpers::attached_token::AttachedToken::empty(),
+        optimizer_hints: Vec::new(),
         distinct: None,
+        select_modifiers: None,
         top: None,
         top_before_distinct: false,
         projection,
+        exclude: None,
         into: None,
         from: Vec::new(),
         lateral_views: Vec::new(),
         prewhere: None,
         selection: None,
-        group_by: GroupByExpr::Expressions(Vec::new(), Vec::new()),
+        connect_by: Vec::new(),
+        group_by: sqlparser::ast::GroupByExpr::Expressions(Vec::new(), Vec::new()),
         cluster_by: Vec::new(),
         distribute_by: Vec::new(),
         sort_by: Vec::new(),
@@ -216,22 +236,102 @@ fn arguments(tags: &Tags, dialect: Dialect, args: &[Expr]) -> Result<Class> {
         qualify: None,
         window_before_qualify: false,
         value_table_mode: None,
-        connect_by: None,
+        flavor: sqlparser::ast::SelectFlavor::Standard,
     };
     let mut stmt = Statement::Query(Box::new(Query {
         with: None,
         body: Box::new(SetExpr::Select(Box::new(select))),
         order_by: None,
-        limit: None,
-        limit_by: Vec::new(),
-        offset: None,
+        limit_clause: None,
         fetch: None,
         locks: Vec::new(),
         for_clause: None,
         settings: None,
         format_clause: None,
+        pipe_operators: Vec::new(),
     }));
     access_walk(&mut stmt, tags, dialect)?;
+    Ok(Class::Allowed)
+}
+
+/// `SET …`, one statement kind since sqlparser 0.56 (`SetVariable`,
+/// `SetRole`, `SetNames`, `SetTimeZone`, `SetTransaction` before). Every
+/// assignment must be allowed.
+fn set_class(set: &Set) -> Result<Class> {
+    let denied = |w: &str| Ok(Class::Denied(w.to_string()));
+    let assignments: Vec<(ObjectName, Vec<&Expr>)> = match set {
+        // `SET GLOBAL x = …` is server-wide (it did not parse before: a
+        // parse error, which blocks).
+        Set::SingleAssignment {
+            scope: Some(ContextModifier::Global),
+            ..
+        } => return denied("SET GLOBAL"),
+        Set::SingleAssignment {
+            variable, values, ..
+        } => {
+            // sqlparser may still read `SET a = 1, b = 2` as one variable
+            // whose values are `1` and the expression `b = 2`: each later
+            // `name = value` starts the next assignment.
+            let mut out: Vec<(ObjectName, Vec<&Expr>)> = vec![(variable.clone(), Vec::new())];
+            for e in values {
+                match e {
+                    Expr::BinaryOp {
+                        left,
+                        op: sqlparser::ast::BinaryOperator::Eq,
+                        right,
+                    } if matches!(
+                        left.as_ref(),
+                        Expr::Identifier(_) | Expr::CompoundIdentifier(_)
+                    ) =>
+                    {
+                        let name = match left.as_ref() {
+                            Expr::Identifier(i) => ObjectName::from(i.clone()),
+                            Expr::CompoundIdentifier(ids) => ObjectName::from(ids.clone()),
+                            _ => unreachable!("matched above"),
+                        };
+                        out.push((name, vec![right.as_ref()]));
+                    }
+                    other => {
+                        if let Some(last) = out.last_mut() {
+                            last.1.push(other);
+                        }
+                    }
+                }
+            }
+            out
+        }
+        // MySQL's `SET a = 1, b = 2` as separate assignments.
+        Set::MultipleAssignments { assignments } => {
+            if assignments
+                .iter()
+                .any(|a| matches!(a.scope, Some(ContextModifier::Global)))
+            {
+                return denied("SET GLOBAL");
+            }
+            assignments
+                .iter()
+                .map(|a| (a.name.clone(), vec![&a.value]))
+                .collect()
+        }
+        Set::ParenthesizedAssignments { .. } => return denied("SET (…)"),
+        Set::SetRole { .. } => return denied("SET ROLE"),
+        Set::SetSessionAuthorization(_) => return denied("SET SESSION AUTHORIZATION"),
+        // Character set, time zone and transaction characteristics: allowed,
+        // as before.
+        Set::SetNames { .. }
+        | Set::SetNamesDefault { .. }
+        | Set::SetTimeZone { .. }
+        | Set::SetTransaction { .. } => return Ok(Class::Allowed),
+        // SQL Server session options (`SET NOCOUNT ON`, `SET IDENTITY_INSERT
+        // t ON`, …), which sqlparser 0.52 rejected: denied, as
+        // anything not on the closed list.
+        Set::SetSessionParam(p) => return Ok(Class::Denied(format!("SET {p}"))),
+    };
+    for (name, values) in &assignments {
+        if let Some(what) = set_denial(name, values) {
+            return Ok(Class::Denied(what));
+        }
+    }
     Ok(Class::Allowed)
 }
 
@@ -269,56 +369,7 @@ fn classify(s: &Statement, tags: &Tags, depth: usize, dialect: Dialect) -> Resul
             }
             Ok(Class::Allowed)
         }
-        Statement::SetVariable {
-            variables, value, ..
-        } => {
-            // sqlparser reads `SET a = 1, b = 2` as one variable whose values
-            // are `1` and the expression `b = 2`: each later `name = value`
-            // starts the next assignment. Every assignment must be allowed.
-            if variables.iter().count() != 1 {
-                return denied("SET (…)");
-            }
-            let mut assignments: Vec<(ObjectName, Vec<&Expr>)> = vec![(
-                variables
-                    .iter()
-                    .next()
-                    .cloned()
-                    .unwrap_or(ObjectName(Vec::new())),
-                Vec::new(),
-            )];
-            for e in value {
-                match e {
-                    Expr::BinaryOp {
-                        left,
-                        op: sqlparser::ast::BinaryOperator::Eq,
-                        right,
-                    } if matches!(
-                        left.as_ref(),
-                        Expr::Identifier(_) | Expr::CompoundIdentifier(_)
-                    ) =>
-                    {
-                        let name = match left.as_ref() {
-                            Expr::Identifier(i) => ObjectName(vec![i.clone()]),
-                            Expr::CompoundIdentifier(ids) => ObjectName(ids.clone()),
-                            _ => unreachable!("matched above"),
-                        };
-                        assignments.push((name, vec![right]));
-                    }
-                    other => {
-                        if let Some(last) = assignments.last_mut() {
-                            last.1.push(other);
-                        }
-                    }
-                }
-            }
-            for (name, values) in &assignments {
-                if let Some(what) = set_denial(name, values) {
-                    return Ok(Class::Denied(what));
-                }
-            }
-            Ok(Class::Allowed)
-        }
-        Statement::SetRole { .. } => denied("SET ROLE"),
+        Statement::Set(set) => set_class(set),
         Statement::Use(_) => denied("USE"),
         Statement::ShowTables { .. } => catalogue(tags, "TABLES"),
         Statement::ShowViews { .. } => catalogue(tags, "VIEWS"),
@@ -347,6 +398,10 @@ fn classify(s: &Statement, tags: &Tags, depth: usize, dialect: Dialect) -> Resul
                 Ok(Class::Denied(format!("SHOW {}", words.join(" "))))
             }
         }
+        // Their own statement kinds in newer sqlparser (`ShowVariable`
+        // before): decided as before.
+        Statement::ShowProcessList { .. } => denied("SHOW PROCESSLIST"),
+        Statement::ShowCharset { .. } => Ok(Class::Allowed),
         Statement::ShowVariables { .. }
         | Statement::ShowStatus { .. }
         | Statement::ShowCollation { .. }
@@ -355,10 +410,6 @@ fn classify(s: &Statement, tags: &Tags, depth: usize, dialect: Dialect) -> Resul
         | Statement::Rollback { .. }
         | Statement::Savepoint { .. }
         | Statement::ReleaseSavepoint { .. }
-        | Statement::SetNames { .. }
-        | Statement::SetNamesDefault { .. }
-        | Statement::SetTimeZone { .. }
-        | Statement::SetTransaction { .. }
         | Statement::Fetch { .. }
         | Statement::Close { .. }
         | Statement::Discard { .. }

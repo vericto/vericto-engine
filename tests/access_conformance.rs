@@ -163,10 +163,6 @@ fn block(r: Refs) -> Want {
 fn parse_error() -> Want {
     Want::Decided(Decision::Block, Refs::Exact(&[]), Some(PARSE_ERROR))
 }
-/// A parse error left to the host's `parse_error` (default: allow and report).
-fn host_parse_error() -> Want {
-    Want::Decided(Decision::Flag, Refs::Exact(&[]), Some(PARSE_ERROR))
-}
 /// Allowed by the allowlist, blocked by a VERICTO-085 tag (contract §4).
 fn tag_block() -> Want {
     Want::Decided(Decision::Block, Refs::Exact(&[]), Some("VERICTO-085"))
@@ -663,11 +659,11 @@ rows! {
     my_set_max_execution_time: Mysql, Fixture, "SET max_execution_time = 1000" => allow();
     my_set_session_track: Mysql, Fixture, "SET session_track_schema = 1" => allow();
     my_set_transaction_isolation_var: Mysql, Fixture, "SET transaction_isolation = 'READ-COMMITTED'" => allow();
-    // Does not parse in sqlparser; on the session-boilerplate list, so neither
-    // the allowlist nor the block/mask tags force a block (v3.3): the host's
-    // parse_error (default allow-and-report) stands.
+    // sqlparser 0.52 did not parse it (the host's parse_error stood; it is
+    // on the session-boilerplate list, so nothing forced a block). 0.63 reads
+    // it as a transaction setting, allowed like `SET TRANSACTION`.
     my_set_session_transaction: Mysql, Fixture,
-        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED" => host_parse_error();
+        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED" => allow();
     my_set_user_variable: Mysql, Fixture, "SET @v = 1" => allow();
     my_set_sql_mode_literal: Mysql, Fixture, "SET sql_mode = 'STRICT_ALL_TABLES'" => allow();
     my_set_rails_setup: Mysql, Fixture,

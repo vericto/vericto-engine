@@ -2020,15 +2020,16 @@ fn session_boilerplate_is_not_blocked_by_tags_an_allowlist_or_both() {
             "{name}"
         );
     }
-    // Django's isolation level on a tagged MySQL workspace: sqlparser rejects
-    // it; the host's parse_error (allow and report) stands.
+    // Django's isolation level on a tagged MySQL workspace: sqlparser 0.52
+    // rejected it (the host's parse_error stood, a flag); 0.63 reads it as the
+    // transaction setting it is, which reads no table: allowed.
     let o = crate::evaluate(
         "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
         Mysql,
         &[],
         &tags_only,
     );
-    assert_eq!(o.decision, Decision::Flag, "{o:?}");
+    assert_eq!(o.decision, Decision::Allow, "{o:?}");
 }
 
 #[test]

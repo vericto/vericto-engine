@@ -199,7 +199,10 @@ fn render() -> String {
             let o = evaluate(sql, dialect, &rules, &policy);
             // 3.8.0 added `access_denied`, always empty without an
             // `access_policy` (asserted here). The golden file is the 3.7.0
-            // one, byte for byte: everything else must be unchanged.
+            // one, byte for byte, except six lines changed by sqlparser 0.63
+            // in 3.9.0: MySQL's `SET SESSION TRANSACTION …` now parses
+            // (allowed, as on Postgres, instead of a parse error) and a mask
+            // rewrite keeps a table alias without `AS` as the client wrote it.
             assert!(o.access_denied.is_empty(), "{sql}");
             let line = format!("{o:?}").replace(", access_denied: []", "");
             out.push_str(&format!("{dialect:?}\t{name}\t{sql:?}\t{line}\n"));

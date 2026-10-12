@@ -35,7 +35,9 @@
 use sqlparser::ast::{Expr, Statement};
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Token, TokenWithLocation, Tokenizer, Whitespace};
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
+
+use crate::parser::executable_comments;
 
 /// The text cannot be analysed the way MySQL reads it.
 #[derive(Debug, Clone)]
@@ -81,36 +83,13 @@ fn dialect() -> MySqlDialect {
     MySqlDialect {}
 }
 
-/// Byte offset of every token start (tokenizer locations are 1-based line and
-/// character column).
-fn byte_offsets(sql: &str, toks: &[TokenWithLocation]) -> Vec<usize> {
-    let mut out = Vec::with_capacity(toks.len());
-    let mut chars = sql.char_indices().peekable();
-    let (mut line, mut col) = (1u64, 1u64);
-    for t in toks {
-        let want = (t.location.line, t.location.column);
-        while (line, col) < want {
-            match chars.next() {
-                Some((_, '\n')) => {
-                    line += 1;
-                    col = 1;
-                }
-                Some(_) => col += 1,
-                None => break,
-            }
-        }
-        out.push(chars.peek().map_or(sql.len(), |(b, _)| *b));
-    }
-    out
-}
-
-fn raw_tokens(sql: &str) -> Result<(Vec<TokenWithLocation>, Vec<usize>), String> {
+fn raw_tokens(sql: &str) -> Result<(Vec<TokenWithSpan>, Vec<usize>), String> {
     let d = dialect();
     let toks = Tokenizer::new(&d, sql)
         .with_unescape(false)
         .tokenize_with_location()
         .map_err(|e| e.to_string())?;
-    let offs = byte_offsets(sql, &toks);
+    let offs = crate::parser::byte_offsets(sql, &toks);
     Ok((toks, offs))
 }
 
@@ -133,8 +112,16 @@ fn escapes_quote(raw: &str, quote: char) -> bool {
 /// Reads `sql` (which must already parse) for the analysis. `numbered` = the
 /// text is a rendering of ours, whose placeholders are already `?1 … ?n`.
 fn read(sql: &str, numbered: bool) -> Result<Prepared<'_>, Unreadable> {
+    // sqlparser 0.61+ splices a `/*! … */` comment into the tokens as code
+    // (see `parser::executable_comments`), so the comment check below would
+    // no longer see it: look for it in the text first.
+    if executable_comments(&dialect(), sql).is_none_or(|at| !at.is_empty()) {
+        return Err(Unreadable(
+            "MySQL executes `/*! … */` comments; the engine cannot read them".into(),
+        ));
+    }
     let (toks, offs) = raw_tokens(sql).map_err(Unreadable)?;
-    let mut out: Vec<TokenWithLocation> = Vec::with_capacity(toks.len());
+    let mut out: Vec<TokenWithSpan> = Vec::with_capacity(toks.len());
     let mut sig: Vec<Sig> = Vec::new();
     let mut unfaithful: Option<String> = None;
     let mut params = 0usize;
@@ -248,9 +235,9 @@ fn read(sql: &str, numbered: bool) -> Result<Prepared<'_>, Unreadable> {
             });
             gap = false;
         }
-        out.push(TokenWithLocation {
+        out.push(TokenWithSpan {
             token: tok,
-            location: t.location,
+            span: t.span,
         });
     }
     let d = dialect();
@@ -927,14 +914,15 @@ fn splice(e: &mut Expr, orig: &Expr) {
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             for x in operand.iter_mut().chain(else_result.iter_mut()) {
                 splice(x, orig);
             }
-            for x in conditions.iter_mut().chain(results.iter_mut()) {
-                splice(x, orig);
+            for w in conditions.iter_mut() {
+                splice(&mut w.condition, orig);
+                splice(&mut w.result, orig);
             }
         }
         Expr::Function(f) => {

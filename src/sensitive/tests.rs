@@ -1087,7 +1087,6 @@ fn mysql_text_sqlparser_reads_differently_cannot_hide_a_read() {
         "SELECT id, /*! email, */ id FROM customers",
         "SELECT id /*!50000 , email */ FROM customers",
         "SELECT id /*M! , email */ FROM customers",
-        "SELECT 0 --card\n FROM customers",
         // The literal ends at a different place in each string-escape mode
         // (measured on 8.0).
         r"SELECT 'a\', email, '' FROM customers -- '",
@@ -1106,6 +1105,21 @@ fn mysql_text_sqlparser_reads_differently_cannot_hide_a_read() {
         let o = eval_on(sql, Dialect::Mysql, vec![]);
         assert_eq!(o.decision, Decision::Allow, "no tags: unchanged: {sql}");
     }
+    // `--` not followed by a space is not a comment in MySQL. sqlparser 0.52
+    // read one there, so the text could not be analysed; 0.63 reads
+    // `0 - -card` as MySQL does, and the read of `card` is seen directly.
+    let sql = "SELECT 0 --card\n FROM customers";
+    let o = eval_on(sql, Dialect::Mysql, tags());
+    assert_eq!(o.decision, Decision::Block, "{sql}: {o:?}");
+    assert_eq!(
+        o.ast_node_path.as_deref(),
+        Some("SensitiveColumn > customers.card (block)"),
+        "{sql}: {o:?}"
+    );
+    let o = eval_on(sql, Dialect::Mysql, vec![tag("customers", "card", Flag)]);
+    assert_eq!(o.decision, Decision::Flag, "flag-only tags flag: {sql}");
+    let o = eval_on(sql, Dialect::Mysql, vec![]);
+    assert_eq!(o.decision, Decision::Allow, "no tags: unchanged: {sql}");
     // MySQL and sqlparser disagree on where this comment ends, and MySQL's own
     // reading depends on context: the engine does not guess, VERICTO-086
     // blocks it whatever the tags (3.7.0).
