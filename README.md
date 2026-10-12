@@ -162,7 +162,7 @@ Low/Informational → Monitor).
 | VERICTO-016 | ALTER TABLE RENAME | Renames a table or column — breaks any code referencing the old name. |
 | VERICTO-017 | ALTER TABLE DROP CONSTRAINT | Drops a FK/PK/CHECK (or `DROP PRIMARY KEY`) — silently removes a data-integrity invariant. |
 | VERICTO-018 | ALTER TABLE ALTER COLUMN TYPE | Changes a column type — table rewrite, potentially lossy/blocking cast. |
-| VERICTO-019 | ALTER TABLE DISABLE TRIGGER / RLS | `DISABLE TRIGGER` or `DISABLE ROW LEVEL SECURITY` — disables a protection. |
+| VERICTO-019 | ALTER TABLE DISABLE TRIGGER / RLS | `DISABLE TRIGGER` or `DISABLE ROW LEVEL SECURITY` — disables a protection; `DROP TRIGGER` removes it for good. |
 | VERICTO-031 | UPDATE in CTE without WHERE | A data-modifying CTE (`WITH x AS (UPDATE … )`) whose `UPDATE` has no WHERE. |
 | VERICTO-033 | DELETE in subquery/CTE without WHERE | A nested `DELETE` with no WHERE inside a subquery or CTE. |
 | VERICTO-040 | INSERT INTO … SELECT without filter | `INSERT … SELECT` whose source has no filter — copies every source row. |
@@ -179,7 +179,7 @@ Low/Informational → Monitor).
 |---|---|---|
 | VERICTO-050 | SELECT without LIMIT | A top-level `SELECT` with no `LIMIT`/`FETCH`/`TOP` — unbounded read. Scoped to the client-visible query, not inner subqueries. |
 | VERICTO-051 | SELECT * without WHERE | `SELECT *` with no `WHERE` — unfiltered full-column scan; detected at any nesting depth. |
-| VERICTO-061 | INSERT batch > 10k rows | `INSERT … VALUES` with more than 10,000 row tuples — oversized batch. |
+| VERICTO-061 | INSERT batch > 10k rows | `INSERT … VALUES` with more than 10,000 row tuples — oversized batch; also `COPY … FROM` a file on the database server (`FROM STDIN` is not reported). |
 
 ### Low
 
@@ -251,7 +251,7 @@ Every built-in code carries a static [`RuleClass`](src/rules/engine.rs) — the
 
 | Class | Codes | What it covers |
 |---|---|---|
-| `SchemaMigration` | 010–019 | DROP TABLE/DATABASE/SCHEMA, TRUNCATE, ALTER TABLE, DROP INDEX. Destructive against a live database, but normal in a versioned migration. |
+| `SchemaMigration` | 010–019 | DROP TABLE/DATABASE/SCHEMA, TRUNCATE, ALTER TABLE, DROP INDEX, DROP TRIGGER. Destructive against a live database, but normal in a versioned migration. |
 | `DataMutation` | 001, 002, 003, 030, 031, 033, 040, 042, 083, 084 | Data mutation without adequate scope. Dangerous on *any* channel — a WHERE-less DELETE is never intended, even in a migration. |
 | `Security` | 070, 080, 081, 082, 085, 086, 087, 090 | Injection tautologies, `COPY … PROGRAM`, `DO` blocks, GRANT/REVOKE, sleep-based probing, reads of sensitive columns, MySQL text read differently, access outside an agent's allowlist. |
 | `Performance` | 050, 051, 060, 061 | Best-practice / performance hints. Advisory. |

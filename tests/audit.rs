@@ -928,3 +928,215 @@ fn a_recorded_function_call_carries_its_own_name_in_the_evidence() {
         Some("FunctionCall > pg_read_file()")
     );
 }
+
+// ── DROP TRIGGER (VERICTO-019) and COPY … FROM a server file (VERICTO-061) ──
+//
+// sqlparser 0.63 parses DROP TRIGGER and COPY on MySQL, MS SQL and Oracle, so
+// 3.9.0 gives them the rules' verdict instead of a parse error. On PostgreSQL
+// both already parsed and no rule matched them.
+
+/// DROP TRIGGER forms each dialect parses. PostgreSQL requires `ON table`.
+fn drop_trigger_cases() -> Vec<(&'static str, Vec<Dialect>)> {
+    let (pg, my, ora, ms) = (
+        Dialect::Postgres,
+        Dialect::Mysql,
+        Dialect::Oracle,
+        Dialect::MsSql,
+    );
+    vec![
+        ("DROP TRIGGER audit_orders ON orders", vec![pg, my, ora, ms]),
+        (
+            "DROP TRIGGER IF EXISTS audit_orders ON orders",
+            vec![pg, my, ora, ms],
+        ),
+        ("DROP TRIGGER audit_orders ON orders CASCADE", vec![pg]),
+        ("DROP TRIGGER audit_orders ON orders RESTRICT", vec![pg]),
+        ("DROP TRIGGER audit_orders", vec![my, ora, ms]),
+        ("DROP TRIGGER IF EXISTS shop.audit_orders", vec![my, ms]),
+        ("DROP TRIGGER hr.audit_orders", vec![ora]),
+        // SQL Server DDL trigger (database scope).
+        ("DROP TRIGGER ddl_audit ON DATABASE", vec![ms]),
+    ]
+}
+
+fn cap_policy() -> EnforcementPolicy {
+    EnforcementPolicy {
+        schema_migration_cap: Some(EnforcementAction::Flag),
+        ..EnforcementPolicy::default()
+    }
+}
+
+#[test]
+fn vericto_019_reports_drop_trigger_on_every_dialect() {
+    for (sql, dialects) in drop_trigger_cases() {
+        for d in dialects {
+            assert_matches("drop trigger", sql, d, vec!["VERICTO-019"]);
+            let o = evaluate(sql, d, &ruleset(), &EnforcementPolicy::default());
+            assert_eq!(o.decision, Decision::Block, "{sql} on {d:?}: {o:?}");
+            assert_eq!(
+                o.rule_code.as_deref(),
+                Some("VERICTO-019"),
+                "{sql} on {d:?}"
+            );
+            assert_eq!(
+                o.ast_node_path.as_deref(),
+                Some("DropStmt > ObjectType = TRIGGER"),
+                "{sql} on {d:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn drop_trigger_is_capped_to_flag_on_ci_and_blocked_at_runtime() {
+    let block_on_parse_error = EnforcementPolicy {
+        parse_error: vericto_engine::ParseErrorAction::Block,
+        ..EnforcementPolicy::default()
+    };
+    for (sql, dialects) in drop_trigger_cases() {
+        for d in dialects {
+            // CI channel: schema_migration_cap = Flag.
+            let ci = evaluate(sql, d, &ruleset(), &cap_policy());
+            assert_eq!(ci.decision, Decision::Flag, "CI {sql} on {d:?}: {ci:?}");
+            assert_eq!(
+                ci.action,
+                Some(EnforcementAction::Flag),
+                "CI {sql} on {d:?}"
+            );
+            assert_eq!(
+                ci.rule_code.as_deref(),
+                Some("VERICTO-019"),
+                "CI {sql} on {d:?}"
+            );
+            // Runtime channel, block policy (no cap): still blocked.
+            for p in [EnforcementPolicy::default(), block_on_parse_error.clone()] {
+                let rt = evaluate(sql, d, &ruleset(), &p);
+                assert_eq!(
+                    rt.decision,
+                    Decision::Block,
+                    "runtime {sql} on {d:?}: {rt:?}"
+                );
+                assert_eq!(rt.rule_code.as_deref(), Some("VERICTO-019"));
+            }
+        }
+    }
+}
+
+#[test]
+fn disable_trigger_keeps_its_verdict() {
+    for sql in [
+        "ALTER TABLE orders DISABLE TRIGGER audit_orders",
+        "ALTER TABLE orders DISABLE TRIGGER ALL",
+    ] {
+        for d in ALL_DIALECTS {
+            assert_matches("disable trigger", sql, d, vec!["VERICTO-019"]);
+            let o = evaluate(sql, d, &ruleset(), &EnforcementPolicy::default());
+            assert_eq!(o.decision, Decision::Block, "{sql} on {d:?}");
+            assert_eq!(
+                o.ast_node_path.as_deref(),
+                Some("AlterTableStmt > DisableTrigger"),
+                "{sql} on {d:?}"
+            );
+            let ci = evaluate(sql, d, &ruleset(), &cap_policy());
+            assert_eq!(ci.decision, Decision::Flag, "CI {sql} on {d:?}");
+        }
+    }
+}
+
+#[test]
+fn drop_trigger_is_not_a_table_drop() {
+    for (sql, dialects) in drop_trigger_cases() {
+        for d in dialects {
+            let m = matching_codes(sql, d, &ruleset(), &EnforcementPolicy::default());
+            assert!(
+                !m.contains(&"VERICTO-010".to_string()),
+                "{sql} on {d:?}: {m:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn vericto_061_flags_copy_from_a_server_file() {
+    for sql in [
+        "COPY orders FROM '/tmp/orders.csv' WITH (FORMAT csv)",
+        "COPY orders FROM '/var/lib/import/orders.csv'",
+        "COPY orders (id, total) FROM '/tmp/orders.csv' WITH (FORMAT csv, HEADER true)",
+    ] {
+        for d in ALL_DIALECTS {
+            assert_matches("copy from file", sql, d, vec!["VERICTO-061"]);
+            // Flag, not block, on every channel (Performance class: no cap).
+            for p in [EnforcementPolicy::default(), cap_policy()] {
+                let o = evaluate(sql, d, &ruleset(), &p);
+                assert_eq!(o.decision, Decision::Flag, "{sql} on {d:?}: {o:?}");
+                assert_eq!(
+                    o.rule_code.as_deref(),
+                    Some("VERICTO-061"),
+                    "{sql} on {d:?}"
+                );
+                assert_eq!(
+                    o.ast_node_path.as_deref(),
+                    Some("CopyStmt > FROM file"),
+                    "{sql} on {d:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn copy_from_stdin_and_copy_to_keep_their_verdict() {
+    // FROM STDIN is the bulk path VERICTO-061 recommends; TO STDOUT / TO a
+    // file are outside its scope. None of them matches a rule.
+    for sql in [
+        "COPY orders FROM STDIN",
+        "COPY orders FROM STDIN WITH (FORMAT csv)",
+        "COPY orders (id, total) FROM STDIN",
+        "COPY orders TO STDOUT",
+        "COPY orders TO STDOUT WITH (FORMAT csv)",
+        "COPY orders TO '/tmp/orders.csv'",
+    ] {
+        for d in ALL_DIALECTS {
+            assert_matches("copy unchanged", sql, d, vec![]);
+            let o = evaluate(sql, d, &ruleset(), &EnforcementPolicy::default());
+            assert_eq!(o.decision, Decision::Allow, "{sql} on {d:?}: {o:?}");
+        }
+    }
+    // FROM PROGRAM stays VERICTO-080 alone.
+    for d in ALL_DIALECTS {
+        assert_matches(
+            "copy from program",
+            "COPY orders FROM PROGRAM 'gunzip -c /tmp/orders.csv.gz'",
+            d,
+            vec!["VERICTO-080"],
+        );
+    }
+}
+
+#[test]
+fn load_data_infile_and_server_scope_drop_trigger_stay_parse_errors() {
+    // sqlparser 0.63 only reads Hive's `LOAD DATA … INPATH`; MySQL's INFILE
+    // form keeps resolving through the host's parse_error, as in 3.8.2.
+    let strict = EnforcementPolicy {
+        parse_error: vericto_engine::ParseErrorAction::Block,
+        ..EnforcementPolicy::default()
+    };
+    for sql in [
+        "LOAD DATA INFILE '/tmp/orders.csv' INTO TABLE orders",
+        "LOAD DATA LOCAL INFILE '/tmp/orders.csv' INTO TABLE orders",
+    ] {
+        let o = evaluate(sql, Dialect::Mysql, &ruleset(), &strict);
+        assert_eq!(o.rule_code.as_deref(), Some("VERICTO-PARSE-ERROR"), "{sql}");
+        assert_eq!(o.decision, Decision::Block, "{sql}");
+    }
+    // Same for SQL Server's server-scope DDL trigger, which sqlparser 0.63
+    // does not read.
+    let o = evaluate(
+        "DROP TRIGGER ddl_audit ON ALL SERVER",
+        Dialect::MsSql,
+        &ruleset(),
+        &strict,
+    );
+    assert_eq!(o.rule_code.as_deref(), Some("VERICTO-PARSE-ERROR"));
+    assert_eq!(o.decision, Decision::Block);
+}

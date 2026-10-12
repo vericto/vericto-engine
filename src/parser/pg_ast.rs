@@ -215,7 +215,9 @@ fn walk_node(
         // `COPY t TO PROGRAM 'cmd'` / `COPY t FROM PROGRAM 'cmd'` executes a
         // shell command on the database host — remote code execution and a
         // data-exfiltration channel. The plain file/STDIN forms are recorded
-        // too (as a non-program Copy) for completeness/telemetry.
+        // too (as a non-program Copy); `FROM` a server-side file is a bulk load
+        // VERICTO-061 reports. libpg_query leaves `filename` empty for
+        // STDIN/STDOUT.
         NodeEnum::CopyStmt(stmt) => {
             out.push(StatementInfo {
                 kind: StatementKind::Copy,
@@ -227,6 +229,7 @@ fn walk_node(
                     "CopyStmt".to_string()
                 },
                 copy_is_program: stmt.is_program,
+                copy_from_file: stmt.is_from && !stmt.is_program && !stmt.filename.is_empty(),
                 ..Default::default()
             });
             // A `COPY (SELECT …) TO …` carries an inner query worth scanning.
@@ -1007,6 +1010,7 @@ fn drop_kind(remove_type: i32) -> DropObjectKind {
         Ok(ObjectType::ObjectTable) => DropObjectKind::Table,
         Ok(ObjectType::ObjectSchema) => DropObjectKind::Schema,
         Ok(ObjectType::ObjectIndex) => DropObjectKind::Index,
+        Ok(ObjectType::ObjectTrigger) => DropObjectKind::Trigger,
         _ => DropObjectKind::Other,
     }
 }

@@ -180,19 +180,34 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         }),
 
         // VERICTO-019: ALTER TABLE DISABLE TRIGGER / DISABLE ROW LEVEL SECURITY —
-        // disables a data-integrity or access-control protection.
+        // disables a data-integrity or access-control protection. DROP TRIGGER
+        // removes the same protection for good, so it is reported here too
+        // (same code, same SchemaMigration class: blocked at runtime under the
+        // default policy, capped by `schema_migration_cap` on a CI channel).
         "VERICTO-019" => find(stmts, |s| {
-            s.kind == StatementKind::AlterTable
-                && matches!(s.alter_table_kind, Some(AlterTableKind::DisableTrigger))
+            (s.kind == StatementKind::AlterTable
+                && matches!(s.alter_table_kind, Some(AlterTableKind::DisableTrigger)))
+                || (s.kind == StatementKind::Drop
+                    && matches!(s.drop_object, Some(DropObjectKind::Trigger)))
         })
         .map(|s| {
-            let mut v = violation(
-                rule,
-                s,
-                Some("Keep triggers / RLS enabled; scope the operation instead".to_string()),
-            );
-            v.ast_node_path = "AlterTableStmt > DisableTrigger".to_string();
-            v
+            if s.kind == StatementKind::Drop {
+                let mut v = violation(
+                    rule,
+                    s,
+                    Some("Keep the trigger; drop it only through a reviewed, versioned migration".to_string()),
+                );
+                v.ast_node_path = "DropStmt > ObjectType = TRIGGER".to_string();
+                v
+            } else {
+                let mut v = violation(
+                    rule,
+                    s,
+                    Some("Keep triggers / RLS enabled; scope the operation instead".to_string()),
+                );
+                v.ast_node_path = "AlterTableStmt > DisableTrigger".to_string();
+                v
+            }
         }),
 
         // ── Dangerous statement types (ENG-007) ────────────────────────────
@@ -379,20 +394,34 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
-        // VERICTO-061: INSERT … VALUES with more than 10,000 row tuples.
+        // VERICTO-061: bulk load. INSERT … VALUES with more than 10,000 row
+        // tuples, or COPY … FROM a file on the database server (read by the
+        // server process, outside the client's control). COPY … FROM STDIN, the
+        // path the suggestion recommends, is not reported.
         "VERICTO-061" => find(stmts, |s| {
-            s.kind == StatementKind::Insert
-                && s.insert_row_count.map(|n| n > 10_000).unwrap_or(false)
+            (s.kind == StatementKind::Insert
+                && s.insert_row_count.map(|n| n > 10_000).unwrap_or(false))
+                || (s.kind == StatementKind::Copy && s.copy_from_file)
         })
         .map(|s| {
-            let count = s.insert_row_count.unwrap_or(0);
-            let mut v = violation(
-                rule,
-                s,
-                Some("Split the batch into chunks of ≤1,000 rows with COPY or multiple INSERT statements".to_string()),
-            );
-            v.ast_node_path = format!("InsertStmt > ValuesList count = {count}");
-            v
+            if s.kind == StatementKind::Copy {
+                let mut v = violation(
+                    rule,
+                    s,
+                    Some("Stream the rows from the client with COPY … FROM STDIN (psql \\copy) instead of a server-side file".to_string()),
+                );
+                v.ast_node_path = "CopyStmt > FROM file".to_string();
+                v
+            } else {
+                let count = s.insert_row_count.unwrap_or(0);
+                let mut v = violation(
+                    rule,
+                    s,
+                    Some("Split the batch into chunks of ≤1,000 rows with COPY or multiple INSERT statements".to_string()),
+                );
+                v.ast_node_path = format!("InsertStmt > ValuesList count = {count}");
+                v
+            }
         }),
 
         // VERICTO-085: read of a sensitive column. Not a predicate over
