@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.8.2] — 2026-10-11
+
+Security hardening from the 2026-10 review of the public repositories. **No rule,
+API or behaviour changes**: the crate's public API, JSON shapes and evaluation
+results are identical to 3.8.1, so hosts can take it as a drop-in update. No
+vulnerability affecting users was found in the engine.
+
+### Security
+
+- The crate now forbids `unsafe` code at compile time (`#![forbid(unsafe_code)]`).
+  It already contained none; the guard keeps it that way.
+- CI: `cargo-deny` (advisories, licenses, banned crates, allowed sources, via
+  `deny.toml`) and `cargo-audit` on every pull request.
+- CI: gitleaks secret scan on pull requests.
+- Dependabot for Cargo dependencies.
+- A `cargo-fuzz` target for the parse/evaluate entry point, and a weekly,
+  time-boxed fuzz job. When the optional repository variable
+  `FUZZ_ARTIFACT_AGE_RECIPIENT` is set, crash artifacts are uploaded encrypted.
+
 ## [3.8.1] — 2026-10-09
 
 Name semantics of the agent access allowlists (VERICTO-087). Three gaps let an
