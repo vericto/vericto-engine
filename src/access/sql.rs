@@ -41,7 +41,84 @@ pub(crate) fn collect(statements: &[Statement], tags: &Tags, dialect: Dialect) -
     Ok(())
 }
 
-fn split(name: &ObjectName) -> (Option<String>, String) {
+/// Snowflake's text with its identifiers folded the way Snowflake stores
+/// them, parsed again: unquoted names to upper case, and quoted ones too when
+/// `fold_quoted` (`QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE`). The fold is done
+/// on the text, in place (ASCII upper-casing keeps every byte offset), over
+/// the tokens Snowflake's tokenizer reads as words, so string literals,
+/// comments and `$$` bodies are untouched. Keywords fold too, which changes
+/// nothing. `None` when the text does not tokenize or the folded text does
+/// not parse to as many statements: the caller denies.
+pub(crate) fn fold_snowflake(sql: &str, fold_quoted: bool) -> Option<Vec<Statement>> {
+    use sqlparser::dialect::SnowflakeDialect;
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let dialect = SnowflakeDialect {};
+    let toks = Tokenizer::new(&dialect, sql)
+        .with_unescape(false)
+        .tokenize_with_location()
+        .ok()?;
+    let offs = crate::parser::byte_offsets(sql, &toks);
+    let mut text = sql.as_bytes().to_vec();
+    for (k, t) in toks.iter().enumerate() {
+        let Token::Word(w) = &t.token else { continue };
+        let fold = match w.quote_style {
+            None => true,
+            Some('"') => fold_quoted,
+            Some(_) => false,
+        };
+        if fold {
+            let end = offs.get(k + 1).copied().unwrap_or(sql.len());
+            text[offs[k]..end].make_ascii_uppercase();
+        }
+    }
+    let text = String::from_utf8(text).ok()?;
+    let before = sqlparser::parser::Parser::parse_sql(&dialect, sql)
+        .ok()?
+        .len();
+    let folded = sqlparser::parser::Parser::parse_sql(&dialect, &text).ok()?;
+    (folded.len() == before).then_some(folded)
+}
+
+/// A Snowflake `ALTER SESSION SET` parameter that only changes how values
+/// are formatted, tagged or timed out: allowed under an allowlist. Anything
+/// else, `QUOTED_IDENTIFIERS_IGNORE_CASE` first (it changes how every name
+/// resolves), is denied.
+fn snowflake_session_param_ok(name: &str) -> bool {
+    const OK: &[&str] = &[
+        "QUERY_TAG",
+        "TIMEZONE",
+        "DATE_INPUT_FORMAT",
+        "DATE_OUTPUT_FORMAT",
+        "TIME_INPUT_FORMAT",
+        "TIME_OUTPUT_FORMAT",
+        "TIMESTAMP_INPUT_FORMAT",
+        "TIMESTAMP_OUTPUT_FORMAT",
+        "TIMESTAMP_LTZ_OUTPUT_FORMAT",
+        "TIMESTAMP_NTZ_OUTPUT_FORMAT",
+        "TIMESTAMP_TZ_OUTPUT_FORMAT",
+        "TIMESTAMP_TYPE_MAPPING",
+        "WEEK_START",
+        "WEEK_OF_YEAR_POLICY",
+        "STATEMENT_TIMEOUT_IN_SECONDS",
+        "STATEMENT_QUEUED_TIMEOUT_IN_SECONDS",
+        "LOCK_TIMEOUT",
+        "ABORT_DETACHED_QUERY",
+        "AUTOCOMMIT",
+        "BINARY_OUTPUT_FORMAT",
+        "BINARY_INPUT_FORMAT",
+        "GEOGRAPHY_OUTPUT_FORMAT",
+        "JSON_INDENT",
+        "ROWS_PER_RESULTSET",
+        "USE_CACHED_RESULT",
+        "CLIENT_SESSION_KEEP_ALIVE",
+    ];
+    OK.iter().any(|p| p.eq_ignore_ascii_case(name))
+}
+
+fn split(name: &ObjectName, dialect: Dialect) -> (Option<String>, String) {
+    if dialect == Dialect::Snowflake {
+        return crate::sensitive::sql::split_name_snowflake(name);
+    }
     let parts = name_parts(name);
     let table = parts.last().map(|p| p.to_string()).unwrap_or_default();
     // SQL Server's `db..t`: an empty schema is the default one.
@@ -201,8 +278,13 @@ fn literal_value(e: &Expr) -> bool {
 /// A MySQL `SHOW` that reads the catalogue: recorded as a read of the
 /// `information_schema` table it is a view of, so only an entry naming that
 /// schema allows it.
-fn catalogue(tags: &Tags, table: &str) -> Result<Class> {
-    tags.relation(Some("information_schema"), table);
+fn catalogue(tags: &Tags, table: &str, dialect: Dialect) -> Result<Class> {
+    // Snowflake compares folded names: its catalogue is spelled as stored.
+    if dialect == Dialect::Snowflake {
+        tags.relation(Some("INFORMATION_SCHEMA"), table);
+    } else {
+        tags.relation(Some("information_schema"), table);
+    }
     Ok(Class::Allowed)
 }
 
@@ -357,7 +439,7 @@ fn classify(s: &Statement, tags: &Tags, depth: usize, dialect: Dialect) -> Resul
         }
         // `DESCRIBE t`: the table's structure, i.e. every column.
         Statement::ExplainTable { table_name, .. } => {
-            let (schema, table) = split(table_name);
+            let (schema, table) = split(table_name, dialect);
             tags.relation(schema.as_deref(), &table);
             tags.of_table(schema.as_deref(), &table);
             Ok(Class::Allowed)
@@ -371,14 +453,43 @@ fn classify(s: &Statement, tags: &Tags, depth: usize, dialect: Dialect) -> Resul
         }
         Statement::Set(set) => set_class(set),
         Statement::Use(_) => denied("USE"),
-        Statement::ShowTables { .. } => catalogue(tags, "TABLES"),
-        Statement::ShowViews { .. } => catalogue(tags, "VIEWS"),
-        Statement::ShowColumns { .. } => catalogue(tags, "COLUMNS"),
+        // A block of statements (Snowflake scripting; on every other dialect
+        // it is a parse error): its control flow is not analysed.
+        Statement::StartTransaction {
+            statements,
+            exception,
+            ..
+        } if !statements.is_empty() || exception.is_some() => denied("BEGIN … END block"),
+        // Snowflake.
+        Statement::AlterSession {
+            set: true,
+            session_params,
+        } => match session_params
+            .options
+            .iter()
+            .find(|o| !snowflake_session_param_ok(&o.option_name))
+        {
+            None => Ok(Class::Allowed),
+            Some(o) => Ok(Class::Denied(format!(
+                "ALTER SESSION SET {}",
+                o.option_name.to_ascii_uppercase()
+            ))),
+        },
+        Statement::AlterSession { set: false, .. } => denied("ALTER SESSION UNSET"),
+        Statement::CopyIntoSnowflake { .. } => denied("COPY INTO"),
+        Statement::CreateStage { .. } => denied("CREATE STAGE"),
+        Statement::Put { .. } => denied("PUT"),
+        Statement::List { .. } => denied("LIST"),
+        Statement::Remove { .. } => denied("REMOVE"),
+        Statement::CreateWarehouse(_) => denied("CREATE WAREHOUSE"),
+        Statement::ShowTables { .. } => catalogue(tags, "TABLES", dialect),
+        Statement::ShowViews { .. } => catalogue(tags, "VIEWS", dialect),
+        Statement::ShowColumns { .. } => catalogue(tags, "COLUMNS", dialect),
         Statement::ShowDatabases { .. } | Statement::ShowSchemas { .. } => {
-            catalogue(tags, "SCHEMATA")
+            catalogue(tags, "SCHEMATA", dialect)
         }
-        Statement::ShowCreate { .. } => catalogue(tags, "TABLES"),
-        Statement::ShowFunctions { .. } => catalogue(tags, "ROUTINES"),
+        Statement::ShowCreate { .. } => catalogue(tags, "TABLES", dialect),
+        Statement::ShowFunctions { .. } => catalogue(tags, "ROUTINES", dialect),
         // `SHOW <anything>` the parser does not model (MySQL `SHOW GRANTS`,
         // `SHOW PROCESSLIST`, `SHOW TABLE STATUS`, …): denied, except the
         // few that only describe the session or the server's settings.

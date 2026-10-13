@@ -1,8 +1,9 @@
 //! Multi-dialect AST parsers (Strategy Pattern).
 //!
-//! `PostgresParser`, `MySqlParser`, `OracleParser`, and `MsSqlParser` implement
-//! the same [`SqlParser`] trait and produce a normalized [`ParsedQuery`] that
-//! the rule engine evaluates dialect-agnostically.
+//! `PostgresParser`, `MySqlParser`, `OracleParser`, `MsSqlParser` and
+//! `SnowflakeParser` implement the same [`SqlParser`] trait and produce a
+//! normalized [`ParsedQuery`] that the rule engine evaluates
+//! dialect-agnostically.
 
 pub mod mssql;
 pub mod mysql;
@@ -10,6 +11,7 @@ pub(crate) mod mysql_lex;
 pub mod oracle;
 pub mod pg_ast;
 pub mod postgres;
+pub mod snowflake;
 pub(crate) mod walk;
 
 use crate::error::{ProxyError, Result};
@@ -21,6 +23,10 @@ pub enum Dialect {
     Mysql,
     Oracle,
     MsSql,
+    /// Snowflake (sqlparser's `SnowflakeDialect`). Unlike the other dialects,
+    /// text the engine cannot read fails closed by default (see
+    /// [`crate::EnforcementPolicy::effective_parse_error_for`]).
+    Snowflake,
 }
 
 impl Dialect {
@@ -30,6 +36,7 @@ impl Dialect {
             "mysql" => Ok(Dialect::Mysql),
             "oracle" => Ok(Dialect::Oracle),
             "mssql" | "sqlserver" | "tsql" => Ok(Dialect::MsSql),
+            "snowflake" => Ok(Dialect::Snowflake),
             other => Err(ProxyError::UnsupportedDialect(other.to_string())),
         }
     }
@@ -57,8 +64,41 @@ pub enum StatementKind {
     /// `MERGE INTO …` — can mass-mutate rows like an UPDATE/DELETE without WHERE.
     Merge,
     /// `CREATE TABLE … AS SELECT …` / `SELECT … INTO` — bulk data copy.
+    /// On Snowflake also `CREATE TABLE|SCHEMA|DATABASE … CLONE`.
     CreateTableAs,
     Other,
+}
+
+/// What a Snowflake statement does that only Snowflake can do, for the
+/// Snowflake rules (VERICTO-091 to VERICTO-097). Set by the Snowflake walker
+/// and the Snowflake pre-classifier only, so these rules never fire on
+/// another dialect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnowflakeRisk {
+    /// Data or files leave through a stage: `COPY INTO @stage | 's3://…'`
+    /// (unload), `GET`, `PUT` (VERICTO-091).
+    StageTransfer,
+    /// An external location or integration: `CREATE|ALTER STAGE` with
+    /// `URL =` or inline `CREDENTIALS`, `CREATE STORAGE | EXTERNAL ACCESS |
+    /// API INTEGRATION`, an egress `NETWORK RULE` (VERICTO-092).
+    ExternalAccess,
+    /// Data leaves the account: `GRANT … TO SHARE`, `CREATE SHARE`, `ALTER
+    /// SHARE … ADD|SET ACCOUNTS`, `CREATE LISTING` (VERICTO-093).
+    Share,
+    /// Recovery reduced: `DATA_RETENTION_TIME_IN_DAYS = 0`, `ALTER ACCOUNT`,
+    /// `CREATE OR REPLACE TABLE|SCHEMA|DATABASE`, `INSERT OVERWRITE`,
+    /// `UNDROP` (VERICTO-094).
+    RecoveryReduced,
+    /// Warehouse cost: `CREATE|ALTER WAREHOUSE` setting its size, cluster
+    /// count, type or a never-suspend `AUTO_SUSPEND`, `ALTER RESOURCE
+    /// MONITOR` (VERICTO-095).
+    WarehouseCost,
+    /// Code that runs later, outside any check: `CREATE TASK | STREAM | PIPE |
+    /// PROCEDURE | FUNCTION | ALERT`, `ALTER TASK … RESUME` (VERICTO-096).
+    Persistence,
+    /// Privilege context switch: `USE ROLE`, `USE SECONDARY ROLES ALL`
+    /// (VERICTO-097).
+    RoleSwitch,
 }
 
 /// Object type in a DROP statement.
@@ -192,6 +232,9 @@ pub struct StatementInfo {
     /// SQL injection tautologies. Populated for all statement types that
     /// have a WHERE clause (DELETE, UPDATE, SELECT).
     pub has_or_tautology: bool,
+    /// The Snowflake-only risk this entry records (Snowflake rules). `None`
+    /// on every other dialect.
+    pub snowflake: Option<SnowflakeRisk>,
 }
 
 impl Default for StatementInfo {
@@ -216,6 +259,7 @@ impl Default for StatementInfo {
             copy_is_program: false,
             copy_from_file: false,
             has_or_tautology: false,
+            snowflake: None,
         }
     }
 }
@@ -235,6 +279,25 @@ pub struct ParsedQuery {
     /// are then the base reading, and this carries the rest. `None` for every
     /// other text, which is evaluated exactly as before.
     pub(crate) mysql: Option<std::sync::Arc<MysqlReadings>>,
+    /// Snowflake only: part of the text is code the engine does not read (a
+    /// scripting block, `EXECUTE IMMEDIATE`, a statement only the
+    /// pre-classifier recognised). The rule engine then keeps the stricter of
+    /// the rules' outcome and the parse-error outcome, so whatever the
+    /// engine cannot read still fails closed. `None` everywhere else.
+    pub(crate) unread: Option<String>,
+}
+
+impl ParsedQuery {
+    /// The dialect the statements were read in; `None` for MySQL text that
+    /// cannot be read with certainty.
+    pub(crate) fn dialect(&self) -> Option<Dialect> {
+        match &self.ast {
+            SourceAst::None => None,
+            SourceAst::Pg(_) => Some(Dialect::Postgres),
+            SourceAst::Sql { dialect, .. } => Some(*dialect),
+            SourceAst::Classified { .. } => Some(Dialect::Snowflake),
+        }
+    }
 }
 
 /// The other statements MySQL may execute for the client's text.
@@ -258,11 +321,19 @@ pub(crate) enum SourceAst {
     Sql {
         statements: std::sync::Arc<Vec<sqlparser::ast::Statement>>,
         dialect: Dialect,
-        /// The client's text, kept for MySQL only: the sensitive-column analysis
-        /// re-reads it the way MySQL does (comments, `?` order, string literals
-        /// verbatim), which the tree alone cannot tell. One copy of the query,
-        /// only walked when the policy carries tags.
+        /// The client's text, kept for MySQL and Snowflake only: the
+        /// sensitive-column analysis re-reads it the way MySQL does (comments,
+        /// `?` order, string literals verbatim), which the tree alone cannot
+        /// tell; on Snowflake it is the reference a mask rewrite must print
+        /// back to, and the access analysis folds its identifiers. One copy of
+        /// the query, only walked when the policy carries tags or an allowlist.
         sql: Option<std::sync::Arc<str>>,
+    },
+    /// Snowflake text sqlparser rejects but the pre-classifier recognised by
+    /// its keywords (`UNDROP`, `CREATE TASK`, `ALTER WAREHOUSE`, …): no tree.
+    /// `what` names the statement (`CREATE TASK`); an allowlist denies it.
+    Classified {
+        what: String,
     },
 }
 
@@ -341,6 +412,7 @@ pub fn parser_for(dialect: Dialect) -> Box<dyn SqlParser> {
         Dialect::Mysql => Box::new(mysql::MySqlParser::new()),
         Dialect::Oracle => Box::new(oracle::OracleParser::new()),
         Dialect::MsSql => Box::new(mssql::MsSqlParser::new()),
+        Dialect::Snowflake => Box::new(snowflake::SnowflakeParser::new()),
     }
 }
 
@@ -352,9 +424,12 @@ pub fn parser_for(dialect: Dialect) -> Box<dyn SqlParser> {
 /// convention already failed: the sqlparser walker was missing
 /// `pg_sleep_until`, so the rule fired on PostgreSQL but not on MySQL, Oracle,
 /// or MS SQL. One definition makes that drift impossible.
+///
+/// `system$wait` is Snowflake's: it suspends the statement for up to an hour
+/// while the warehouse keeps running (and billing).
 pub(crate) fn is_sleep_function(name: &str) -> bool {
     matches!(
         name,
-        "sleep" | "pg_sleep" | "pg_sleep_for" | "pg_sleep_until"
+        "sleep" | "pg_sleep" | "pg_sleep_for" | "pg_sleep_until" | "system$wait"
     )
 }

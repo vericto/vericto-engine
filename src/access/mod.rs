@@ -173,13 +173,13 @@ impl<'de> Deserialize<'de> for AccessColumns {
 }
 
 impl AccessColumns {
-    fn covers(&self, dialect: Dialect, column: &str) -> bool {
-        let case = column_case(dialect);
+    fn covers(&self, names: Names, column: &str) -> bool {
+        let case = column_case(names.dialect);
         match self {
             AccessColumns::AllColumns => true,
-            AccessColumns::List(cols) => cols
-                .iter()
-                .any(|c| case.eq(&entry_ident(dialect, c), column)),
+            AccessColumns::List(cols) => {
+                cols.iter().any(|c| case.eq(&entry_ident(names, c), column))
+            }
         }
     }
 }
@@ -194,8 +194,18 @@ impl AccessColumns {
 /// compared the way the dialect compares them; on Postgres they fold to lower
 /// case unless written in double quotes (`"Customers"`). `schema_name` /
 /// `table_name` are accepted as aliases.
+///
+/// Snowflake names are three-part: `database` (alias `database_name`) is the
+/// database the table is in; null, empty or absent is the host's
+/// [`AccessPolicy::default_database`]. Ignored on every other dialect.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AccessEntry {
+    #[serde(
+        default,
+        alias = "database_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub database: Option<String>,
     #[serde(default, alias = "schema_name")]
     pub schema: Option<String>,
     #[serde(alias = "table_name")]
@@ -229,6 +239,21 @@ pub struct AccessPolicy {
     /// only). Ignored on Oracle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_schema: Option<String>,
+    /// Snowflake only: the database unqualified and two-part names resolve
+    /// to, **set by the host** from the connection (its current database).
+    /// As stored, unquoted. `None` (or empty): unknown, so a schema-less or
+    /// database-less entry only matches names that are not qualified with a
+    /// database. Ignored on every other dialect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_database: Option<String>,
+    /// Snowflake only: the account or session value of
+    /// `QUOTED_IDENTIFIERS_IGNORE_CASE`, **set by the host**. `Some(true)`:
+    /// quoted names fold to upper case like unquoted ones; `Some(false)`:
+    /// quoted names are case-sensitive (Snowflake's default). `None`: unknown,
+    /// so both readings are checked and a reference either denies is denied.
+    /// Ignored on every other dialect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted_identifiers_ignore_case: Option<bool>,
 }
 
 /// The policies of a database, keyed by database user, as the TCP proxy
@@ -329,8 +354,33 @@ fn default_schema(dialect: Dialect, host: Option<&str>) -> Option<&str> {
     match dialect {
         Dialect::Postgres => host.or(Some("public")),
         Dialect::MsSql => host.or(Some("dbo")),
-        Dialect::Mysql => host,
+        // Snowflake's is the connection's current schema, like MySQL's
+        // current database: unknown unless the host names it.
+        Dialect::Mysql | Dialect::Snowflake => host,
         Dialect::Oracle => None,
+    }
+}
+
+/// How names are read: the dialect, and on Snowflake whether quoted names
+/// fold too (`QUOTED_IDENTIFIERS_IGNORE_CASE`, one reading of it).
+#[derive(Clone, Copy)]
+struct Names {
+    dialect: Dialect,
+    fold_quoted: bool,
+}
+
+/// The separator the Snowflake access walk puts between the database and
+/// the schema of a three-part name (`db.schema.table` → schema
+/// `DB\u{1f}SCHEMA`). A control character no identifier the engine folds
+/// can hold, so a two-part name can never be mistaken for a three-part one.
+pub(crate) const DB_SEP: char = '\u{1f}';
+
+/// `(database, schema)` of a Snowflake reference's schema as the access walk
+/// records it (see [`DB_SEP`]).
+fn split_db(schema: &str) -> (Option<&str>, &str) {
+    match schema.split_once(DB_SEP) {
+        Some((db, s)) => (Some(db), s),
+        None => (None, schema),
     }
 }
 
@@ -364,20 +414,23 @@ impl Case {
 ///   Server's default collations are case-insensitive; Oracle folds unquoted
 ///   names to upper case, so only a quoted mixed-case name is compared more
 ///   loosely than Oracle does).
+/// - Snowflake: exact. Both sides are folded the way Snowflake stores them
+///   (unquoted → upper case; quoted as written, or upper case too under
+///   `QUOTED_IDENTIFIERS_IGNORE_CASE`).
 fn relation_case(dialect: Dialect, schema: Option<&str>) -> Case {
     match dialect {
-        Dialect::Postgres => Case::Exact,
+        Dialect::Postgres | Dialect::Snowflake => Case::Exact,
         Dialect::Mysql if schema.is_some_and(|s| ieq(s, "information_schema")) => Case::Insensitive,
         Dialect::Mysql => Case::Exact,
         Dialect::MsSql | Dialect::Oracle => Case::Insensitive,
     }
 }
 
-/// Column names: exact on Postgres (folded as above); case-insensitive on
-/// MySQL (as MySQL compares them), SQL Server and Oracle.
+/// Column names: exact on Postgres and Snowflake (folded as above);
+/// case-insensitive on MySQL (as MySQL compares them), SQL Server and Oracle.
 fn column_case(dialect: Dialect) -> Case {
     match dialect {
-        Dialect::Postgres => Case::Exact,
+        Dialect::Postgres | Dialect::Snowflake => Case::Exact,
         Dialect::Mysql | Dialect::MsSql | Dialect::Oracle => Case::Insensitive,
     }
 }
@@ -388,9 +441,12 @@ fn column_case(dialect: Dialect) -> Case {
 /// in double quotes (`"Customers"`, with `""` for an embedded quote) is taken
 /// as written. That is how a case-sensitive Postgres name is granted. MySQL
 /// also accepts backticks; elsewhere quotes are stripped and the name compares
-/// as the dialect compares names.
-fn entry_ident(dialect: Dialect, raw: &str) -> std::borrow::Cow<'_, str> {
+/// as the dialect compares names. On Snowflake, the mirror image of Postgres:
+/// unquoted entries fold to upper case, quoted ones are taken as written
+/// (upper-cased too under `QUOTED_IDENTIFIERS_IGNORE_CASE`).
+fn entry_ident(names: Names, raw: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
+    let dialect = names.dialect;
     let unquote = |q: char| -> Option<String> {
         let inner = raw.strip_prefix(q)?.strip_suffix(q)?;
         let doubled: String = [q, q].iter().collect();
@@ -398,6 +454,9 @@ fn entry_ident(dialect: Dialect, raw: &str) -> std::borrow::Cow<'_, str> {
     };
     if raw.len() >= 2 {
         if let Some(s) = unquote('"') {
+            if dialect == Dialect::Snowflake && names.fold_quoted {
+                return Cow::Owned(s.to_ascii_uppercase());
+            }
             return Cow::Owned(s);
         }
         if dialect == Dialect::Mysql {
@@ -410,6 +469,11 @@ fn entry_ident(dialect: Dialect, raw: &str) -> std::borrow::Cow<'_, str> {
         // PostgreSQL folds ASCII letters only (`downcase_identifier`).
         Dialect::Postgres if raw.bytes().any(|b| b.is_ascii_uppercase()) => {
             Cow::Owned(raw.to_ascii_lowercase())
+        }
+        // Snowflake folds unquoted names to upper case (ASCII: an unquoted
+        // Snowflake identifier is ASCII).
+        Dialect::Snowflake if raw.bytes().any(|b| b.is_ascii_lowercase()) => {
+            Cow::Owned(raw.to_ascii_uppercase())
         }
         _ => Cow::Borrowed(raw),
     }
@@ -426,21 +490,54 @@ fn entry_ident(dialect: Dialect, raw: &str) -> std::borrow::Cow<'_, str> {
 /// and the unqualified name where the default schema is known to be it.
 fn entry_matches(
     e: &AccessEntry,
-    dialect: Dialect,
-    host_default: Option<&str>,
+    names: Names,
+    policy: &AccessPolicy,
     schema: Option<&str>,
     table: &str,
 ) -> bool {
+    let dialect = names.dialect;
+    let host_default = policy.default_schema.as_deref();
     let case = relation_case(dialect, schema);
-    if !case.eq(&entry_ident(dialect, &e.table), table) {
+    if !case.eq(&entry_ident(names, &e.table), table) {
         return false;
     }
+    // Snowflake: the database first. The reference's is the one its name
+    // spells (three-part) or the host's current database; the entry's is the
+    // one it names or, again, the host's. Either unknown: only both unknown
+    // match. The shared `SNOWFLAKE` database (ACCOUNT_USAGE, …) is the
+    // account's catalogue: only an entry naming it reaches it.
+    let schema = if dialect == Dialect::Snowflake {
+        let fold = |s: &str| entry_ident(names, s).into_owned();
+        // The host's value is as stored (`CURRENT_DATABASE()`): not folded.
+        let host_db = policy
+            .default_database
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let (ref_db, ref_schema) = match schema.map(split_db) {
+            Some((db, s)) => (db.map(str::to_string).or_else(|| host_db.clone()), Some(s)),
+            None => (host_db.clone(), None),
+        };
+        let named_db = e.database.as_deref().filter(|s| !s.is_empty()).map(fold);
+        if ref_db.as_deref() == Some("SNOWFLAKE") && named_db.is_none() {
+            return false;
+        }
+        match (named_db.or(host_db), ref_db) {
+            (Some(a), Some(b)) if a == b => {}
+            (None, None) => {}
+            _ => return false,
+        }
+        // `db..t`: the schema is PUBLIC.
+        ref_schema.map(|s| if s.is_empty() { "PUBLIC" } else { s })
+    } else {
+        schema
+    };
     // An empty schema is no schema (a blank field in the dashboard).
     let entry_schema = e
         .schema
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(|s| entry_ident(dialect, s));
+        .map(|s| entry_ident(names, s));
     let default = default_schema(dialect, host_default);
     match (entry_schema.as_deref().or(default), schema.or(default)) {
         (Some(es), Some(qs)) => {
@@ -483,30 +580,88 @@ const LIST_COLUMNS: &str = "List the columns explicitly: `*`, `t.*` and whole-ro
 pub(crate) fn evaluate(parsed: &ParsedQuery, policy: &AccessPolicy) -> Option<AccessVerdict> {
     #[cfg(test)]
     ANALYSES.with(|n| n.set(n.get() + 1));
-    let collector = Collector::default();
-    let tags = Tags::collecting(&collector);
-    let (dialect, walked) = match &parsed.ast {
-        SourceAst::Pg(tree) => (Dialect::Postgres, pg::collect(tree, &tags)),
+    let unanalysable = |e: &dyn std::fmt::Display| AccessVerdict {
+        mode: policy.mode,
+        ast_node_path: format!("AccessPolicy > query could not be analysed for access ({e})"),
+        suggested_safe_query: None,
+        denied: Vec::new(),
+    };
+    let one = |dialect: Dialect, walk: &dyn Fn(&Tags) -> crate::error::Result<()>, fold_quoted| {
+        let collector = Collector::default();
+        let tags = Tags::collecting(&collector);
+        walk(&tags).map(|()| {
+            let (refs, ambiguous) = collector.finish();
+            let names = Names {
+                dialect,
+                fold_quoted,
+            };
+            (check(&refs, policy, names), ambiguous)
+        })
+    };
+    let result = match &parsed.ast {
+        SourceAst::Pg(tree) => one(Dialect::Postgres, &|t| pg::collect(tree, t), false),
+        // Snowflake: identifiers fold to upper case unless quoted, so the
+        // query is read again with its names folded, once per reading of
+        // `QUOTED_IDENTIFIERS_IGNORE_CASE` the host leaves open; a reference
+        // either reading denies is denied.
+        SourceAst::Sql {
+            dialect: Dialect::Snowflake,
+            sql,
+            ..
+        } => {
+            let readings: &[bool] = match policy.quoted_identifiers_ignore_case {
+                Some(true) => &[true],
+                Some(false) => &[false],
+                None => &[false, true],
+            };
+            let mut denied: BTreeSet<DeniedRef> = BTreeSet::new();
+            let mut ambiguous = BTreeSet::new();
+            for &fold_quoted in readings {
+                let Some(folded) = sql
+                    .as_deref()
+                    .and_then(|t| sql::fold_snowflake(t, fold_quoted))
+                else {
+                    return Some(unanalysable(&"the folded Snowflake text does not parse"));
+                };
+                match one(
+                    Dialect::Snowflake,
+                    &|t| sql::collect(&folded, t, Dialect::Snowflake),
+                    fold_quoted,
+                ) {
+                    Ok((d, a)) => {
+                        denied.extend(d);
+                        ambiguous.extend(a);
+                    }
+                    Err(e) => return Some(unanalysable(&e)),
+                }
+            }
+            Ok((denied.into_iter().collect(), ambiguous))
+        }
         SourceAst::Sql {
             statements,
             dialect,
             ..
-        } => (*dialect, sql::collect(statements, &tags, *dialect)),
+        } => one(*dialect, &|t| sql::collect(statements, t, *dialect), false),
+        // Snowflake text only the pre-classifier recognised: a statement kind
+        // denied outright (DDL, transfers, role switches).
+        SourceAst::Classified { what } => Ok((
+            vec![DeniedRef {
+                schema: None,
+                table: what.clone(),
+                column: None,
+                needed: Needed::Ddl,
+            }],
+            BTreeSet::new(),
+        )),
         // MySQL text that cannot be read with certainty: VERICTO-086 blocks it
         // before this runs.
         SourceAst::None => return None,
     };
-    if let Err(e) = walked {
+    let (denied, ambiguous) = match result {
+        Ok(found) => found,
         // Nesting past MAX_AST_DEPTH: the statement may reference anything.
-        return Some(AccessVerdict {
-            mode: policy.mode,
-            ast_node_path: format!("AccessPolicy > query could not be analysed for access ({e})"),
-            suggested_safe_query: None,
-            denied: Vec::new(),
-        });
-    }
-    let (refs, ambiguous) = collector.finish();
-    let denied = check(&refs, policy, dialect);
+        Err(e) => return Some(unanalysable(&e)),
+    };
     if denied.is_empty() {
         return None;
     }
@@ -552,11 +707,13 @@ fn display(d: &DeniedRef) -> String {
 }
 
 /// Every reference the policy does not allow, deduplicated and sorted.
-fn check(refs: &[Ref], policy: &AccessPolicy, dialect: Dialect) -> Vec<DeniedRef> {
+fn check(refs: &[Ref], policy: &AccessPolicy, names: Names) -> Vec<DeniedRef> {
+    let dialect = names.dialect;
     let mut denied: BTreeSet<DeniedRef> = BTreeSet::new();
+    // A Snowflake three-part name reports its schema as `database.schema`.
     let deny =
         |schema: Option<String>, table: &str, column: Option<&str>, needed: Needed| DeniedRef {
-            schema,
+            schema: schema.map(|s| s.replace(DB_SEP, ".")),
             table: table.to_string(),
             column: column.map(str::to_string),
             needed,
@@ -574,15 +731,7 @@ fn check(refs: &[Ref], policy: &AccessPolicy, dialect: Dialect) -> Vec<DeniedRef
                 let entries: Vec<&AccessEntry> = policy
                     .entries
                     .iter()
-                    .filter(|e| {
-                        entry_matches(
-                            e,
-                            dialect,
-                            policy.default_schema.as_deref(),
-                            schema.as_deref(),
-                            table,
-                        )
-                    })
+                    .filter(|e| entry_matches(e, names, policy, schema.as_deref(), table))
                     .collect();
                 let (needed, column) = match r {
                     Ref::Write { column, .. } => (Needed::Write, column.as_deref()),
@@ -609,7 +758,7 @@ fn check(refs: &[Ref], policy: &AccessPolicy, dialect: Dialect) -> Vec<DeniedRef
                     Some("*") => candidates
                         .iter()
                         .any(|e| e.columns == AccessColumns::AllColumns),
-                    Some(c) => candidates.iter().any(|e| e.columns.covers(dialect, c)),
+                    Some(c) => candidates.iter().any(|e| e.columns.covers(names, c)),
                 };
                 if !ok {
                     denied.insert(deny(schema, table, column, needed));

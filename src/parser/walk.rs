@@ -7,7 +7,8 @@
 
 use crate::error::{MAX_AST_DEPTH, ProxyError, Result, guard_nesting_depth};
 use crate::parser::{
-    AlterTableKind, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, WherePresence,
+    AlterTableKind, Dialect, DropObjectKind, ParsedQuery, SnowflakeRisk, StatementInfo,
+    StatementKind, WherePresence,
 };
 
 use sqlparser::ast::{
@@ -48,26 +49,71 @@ pub(crate) fn parse_text<D: SqlDialect>(
         SqlAstParser::parse_sql(dialect, sql).map_err(|e| ProxyError::ParseError(e.to_string()))?;
     // A statement kind sqlparser 0.52 rejected still resolves as the parse
     // error it was (see `not_analysed`).
-    if let Some(kind) = statements.iter().find_map(not_analysed) {
+    if let Some(kind) = statements.iter().find_map(|s| not_analysed(s, which)) {
         return Err(ProxyError::ParseError(format!(
             "{kind}: statement not supported by the engine"
         )));
     }
 
+    let cx = Cx {
+        snowflake: which == Dialect::Snowflake,
+    };
     let mut collected: Vec<StatementInfo> = Vec::new();
     for stmt in &statements {
-        walk_statement(stmt, false, 0, &mut collected)?;
+        walk_statement(stmt, false, 0, cx, &mut collected)?;
     }
+    let unread = if cx.snowflake {
+        statements
+            .iter()
+            .find_map(snowflake_unread)
+            .map(str::to_string)
+    } else {
+        None
+    };
 
     Ok(ParsedQuery {
         statements: collected,
         ast: crate::parser::SourceAst::Sql {
             statements: std::sync::Arc::new(statements),
             dialect: which,
-            sql: (which == crate::parser::Dialect::Mysql).then(|| std::sync::Arc::from(original)),
+            sql: matches!(which, Dialect::Mysql | Dialect::Snowflake)
+                .then(|| std::sync::Arc::from(original)),
         },
         mysql: None,
+        unread,
     })
+}
+
+/// What the walk needs to know about the dialect. Only Snowflake changes
+/// what is recorded; every other dialect walks exactly as before.
+#[derive(Clone, Copy)]
+struct Cx {
+    snowflake: bool,
+}
+
+/// Snowflake code the engine does not read: a scripting block (`BEGIN … END`,
+/// with or without `EXCEPTION`) or `EXECUTE IMMEDIATE`. The statements of a
+/// block are walked, but not its control flow (variables, loops, `RETURN`),
+/// and an `EXECUTE IMMEDIATE` string is never parsed: the rule engine keeps
+/// the stricter of the rules' outcome and the parse-error one (see
+/// `ParsedQuery::unread`).
+fn snowflake_unread(stmt: &Statement) -> Option<&'static str> {
+    match stmt {
+        Statement::StartTransaction {
+            statements,
+            exception,
+            ..
+        } if !statements.is_empty() || exception.is_some() => {
+            Some("Snowflake scripting block (BEGIN … END): its control flow is not analysed")
+        }
+        Statement::Execute {
+            immediate: true, ..
+        } => Some("EXECUTE IMMEDIATE: the statement text it runs is not analysed"),
+        Statement::Execute {
+            immediate: false, ..
+        } => Some("EXECUTE: the stored code it runs is not analysed"),
+        _ => None,
+    }
 }
 
 /// The statement kind a parsed statement has when the engine must treat it
@@ -89,12 +135,54 @@ pub(crate) fn parse_text<D: SqlDialect>(
 /// `BEGIN … END`) are treated like a new kind. Inside `SET`, which became one statement kind, the forms 0.52
 /// rejected are the server-wide `SET GLOBAL …`, `SET SESSION AUTHORIZATION`
 /// and SQL Server's session options (`SET NOCOUNT ON`, …).
-pub(crate) fn not_analysed(stmt: &Statement) -> Option<&'static str> {
+///
+/// On Snowflake (a dialect 0.52 never served) the kinds the Snowflake walker
+/// models are analysed: `CREATE WAREHOUSE`, `ALTER SESSION`, `PUT`, `LIST`
+/// and scripting blocks (whose statements are classified here in turn).
+/// Everything else Snowflake-only stays a parse error, which fails closed on
+/// Snowflake.
+pub(crate) fn not_analysed(stmt: &Statement, dialect: Dialect) -> Option<&'static str> {
     use sqlparser::ast::{ContextModifier, Set};
     match stmt {
         // The statement inside is what runs.
         Statement::Explain { statement, .. } | Statement::Prepare { statement, .. } => {
-            not_analysed(statement)
+            not_analysed(statement, dialect)
+        }
+        // `SHOW OBJECTS` (dbt sends it on every run) and `CREATE FILE FORMAT`
+        // read or define metadata only.
+        Statement::CreateWarehouse { .. }
+        | Statement::AlterSession { .. }
+        | Statement::Put { .. }
+        | Statement::List { .. }
+        | Statement::ShowObjects { .. }
+        | Statement::CreateFileFormat { .. }
+            if dialect == Dialect::Snowflake =>
+        {
+            None
+        }
+        // A Snowflake scripting block: walked, and read as unread code (see
+        // `snowflake_unread`). Its control flow (`IF`, `CASE`, loops,
+        // `RETURN`, `RAISE`) is what the unread floor covers; every other
+        // statement in it must be analysable.
+        Statement::StartTransaction {
+            statements,
+            exception,
+            ..
+        } if dialect == Dialect::Snowflake && (!statements.is_empty() || exception.is_some()) => {
+            statements
+                .iter()
+                .chain(exception.iter().flatten().flat_map(|w| w.statements.iter()))
+                .filter(|s| {
+                    !matches!(
+                        s,
+                        Statement::If { .. }
+                            | Statement::Case { .. }
+                            | Statement::While { .. }
+                            | Statement::Return { .. }
+                            | Statement::Raise { .. }
+                    )
+                })
+                .find_map(|s| not_analysed(s, dialect))
         }
         Statement::Set(set) => match set {
             Set::SingleAssignment {
@@ -332,6 +420,7 @@ fn walk_statement(
     stmt: &Statement,
     is_nested: bool,
     depth: usize,
+    cx: Cx,
     out: &mut Vec<StatementInfo>,
 ) -> Result<()> {
     if depth > MAX_AST_DEPTH {
@@ -363,9 +452,9 @@ fn walk_statement(
 
             // Recurse into WHERE subqueries
             if let Some(expr) = delete.selection.as_ref() {
-                walk_expr(expr, depth + 1, out)?;
+                walk_expr(expr, depth + 1, cx, out)?;
             }
-            walk_with_from_ctes(&delete.from, depth + 1, out)?;
+            walk_with_from_ctes(&delete.from, depth + 1, cx, out)?;
         }
 
         // ── UPDATE ─────────────────────────────────────────────────────────
@@ -385,7 +474,7 @@ fn walk_statement(
                 ..Default::default()
             });
             if let Some(expr) = selection.as_ref() {
-                walk_expr(expr, depth + 1, out)?;
+                walk_expr(expr, depth + 1, cx, out)?;
             }
         }
 
@@ -470,6 +559,11 @@ fn walk_statement(
                     AlterTableOperation::RenameTable { .. }
                     | AlterTableOperation::RenameColumn { .. } => {
                         (AlterTableKind::Rename, "AlterTableStmt > Rename")
+                    }
+                    // Snowflake's `ALTER TABLE a SWAP WITH b` exchanges the
+                    // two names: a rename of both tables.
+                    AlterTableOperation::SwapWith { .. } if cx.snowflake => {
+                        (AlterTableKind::Rename, "AlterTableStmt > SwapWith")
                     }
                     // MySQL's `DROP FOREIGN KEY fk` is its spelling of
                     // dropping a constraint (sqlparser reads it since 0.56;
@@ -561,9 +655,22 @@ fn walk_statement(
                 ..Default::default()
             });
 
+            // Snowflake's `INSERT OVERWRITE` empties the target before it
+            // inserts: its current rows survive only in Time Travel.
+            if cx.snowflake && insert.overwrite {
+                out.push(StatementInfo {
+                    relation: Some(insert.table.to_string()),
+                    is_nested,
+                    ast_node_path: "InsertStmt > OVERWRITE (replaces every row of the target)"
+                        .to_string(),
+                    snowflake: Some(SnowflakeRisk::RecoveryReduced),
+                    ..Default::default()
+                });
+            }
+
             // Recurse into source SELECT
             if let Some(source) = insert.source.as_ref() {
-                walk_query(source.as_ref(), true, depth + 1, out)?;
+                walk_query(source.as_ref(), true, depth + 1, cx, out)?;
             }
         }
 
@@ -583,6 +690,30 @@ fn walk_statement(
                 },
                 copy_is_program: matches!(target, CopyTarget::Program { .. }),
                 copy_from_file: !*to && matches!(target, CopyTarget::File { .. }),
+                ..Default::default()
+            });
+        }
+
+        // ── GRANT … TO SHARE (Snowflake, VERICTO-093 and VERICTO-082) ─────────
+        // Still a GRANT, so VERICTO-082 keeps reporting it; the share is
+        // recorded on its own, because the data then leaves the account.
+        Statement::Grant(grant)
+            if cx.snowflake
+                && grant
+                    .grantees
+                    .iter()
+                    .any(|g| matches!(g.grantee_type, sqlparser::ast::GranteesType::Share)) =>
+        {
+            out.push(StatementInfo {
+                kind: StatementKind::Grant,
+                is_nested,
+                ast_node_path: "GrantStmt".to_string(),
+                ..Default::default()
+            });
+            out.push(StatementInfo {
+                is_nested,
+                ast_node_path: "GrantStmt > TO SHARE".to_string(),
+                snowflake: Some(SnowflakeRisk::Share),
                 ..Default::default()
             });
         }
@@ -610,18 +741,386 @@ fn walk_statement(
 
         // ── SELECT ─────────────────────────────────────────────────────────
         Statement::Query(query) => {
-            walk_query(query.as_ref(), is_nested, depth + 1, out)?;
+            walk_query(query.as_ref(), is_nested, depth + 1, cx, out)?;
         }
 
-        _ => {
+        other => {
             // Other statement types are not (yet) modelled. CREATE TABLE AS is
             // handled on the PostgreSQL (pg_query) path; sqlparser models it as
             // a CreateTable with a `query`, which the non-PG dialects we target
             // do not commonly emit, so it is intentionally left unflagged here.
+            // Snowflake records it, and its own statement kinds, here:
+            if cx.snowflake {
+                walk_snowflake(other, is_nested, depth, cx, out)?;
+            }
         }
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Snowflake statements
+// ---------------------------------------------------------------------------
+
+/// The Snowflake-only statement kinds, and the Snowflake readings of shared
+/// ones (`CREATE TABLE … AS | CLONE`, `CREATE OR REPLACE`). `Ok(false)` when
+/// `stmt` is none of them. Only called on Snowflake.
+fn walk_snowflake(
+    stmt: &Statement,
+    is_nested: bool,
+    depth: usize,
+    cx: Cx,
+    out: &mut Vec<StatementInfo>,
+) -> Result<bool> {
+    use sqlparser::ast::{CopyIntoSnowflakeKind, SecondaryRoles, Use};
+    let risk = |what: SnowflakeRisk, relation: Option<String>, path: String| StatementInfo {
+        relation,
+        is_nested,
+        ast_node_path: path,
+        snowflake: Some(what),
+        ..Default::default()
+    };
+    match stmt {
+        // `COPY INTO @stage | 's3://…' FROM …` unloads rows to files a stage
+        // or an external location holds (VERICTO-091); `COPY INTO t FROM
+        // @stage` loads them, recorded as a COPY with no finding.
+        Statement::CopyIntoSnowflake {
+            kind,
+            into,
+            from_obj,
+            from_query,
+            ..
+        } => {
+            match kind {
+                CopyIntoSnowflakeKind::Location => {
+                    let mut info = risk(
+                        SnowflakeRisk::StageTransfer,
+                        Some(into.to_string()),
+                        format!(
+                            "CopyIntoStmt > INTO {into} (unload{})",
+                            from_obj
+                                .as_ref()
+                                .map_or_else(String::new, |t| format!(" of {t}"))
+                        ),
+                    );
+                    info.kind = StatementKind::Copy;
+                    out.push(info);
+                }
+                CopyIntoSnowflakeKind::Table => out.push(StatementInfo {
+                    kind: StatementKind::Copy,
+                    relation: Some(into.to_string()),
+                    is_nested,
+                    ast_node_path: "CopyIntoStmt > FROM stage (load)".to_string(),
+                    ..Default::default()
+                }),
+            }
+            if let Some(q) = from_query {
+                walk_query(q, true, depth + 1, cx, out)?;
+            }
+        }
+        // `PUT file://… @stage`: files from the client's machine into a stage.
+        Statement::Put { stage, .. } => out.push(risk(
+            SnowflakeRisk::StageTransfer,
+            Some(stage.to_string()),
+            format!("PutStmt > file upload to {stage}"),
+        )),
+        // An external stage: `URL =` (S3, Azure, GCS) or inline credentials.
+        // An internal stage (no URL) is recorded with no finding.
+        Statement::CreateStage {
+            name, stage_params, ..
+        } => {
+            let external =
+                stage_params.url.is_some() || !stage_params.credentials.options.is_empty();
+            out.push(StatementInfo {
+                relation: Some(name.to_string()),
+                is_nested,
+                ast_node_path: if external {
+                    "CreateStageStmt > external location (URL / CREDENTIALS)".to_string()
+                } else {
+                    "CreateStageStmt".to_string()
+                },
+                snowflake: external.then_some(SnowflakeRisk::ExternalAccess),
+                ..Default::default()
+            });
+        }
+        Statement::CreateWarehouse(cw) => {
+            if let Some(why) = warehouse_cost(&cw.options) {
+                out.push(risk(
+                    SnowflakeRisk::WarehouseCost,
+                    Some(cw.name.to_string()),
+                    format!("CreateWarehouseStmt > {why}"),
+                ));
+            }
+        }
+        // `USE ROLE r` changes every privilege the session holds; `USE
+        // SECONDARY ROLES ALL | r, …` adds the privileges of other roles.
+        // `USE SECONDARY ROLES NONE` only narrows them.
+        Statement::Use(u) => match u {
+            Use::Role(name) => {
+                let admin = PRIVILEGED_ROLES
+                    .iter()
+                    .any(|r| name.to_string().eq_ignore_ascii_case(r));
+                out.push(risk(
+                    SnowflakeRisk::RoleSwitch,
+                    None,
+                    format!(
+                        "UseStmt > ROLE {name}{}",
+                        if admin { " (administrative role)" } else { "" }
+                    ),
+                ));
+            }
+            Use::SecondaryRoles(SecondaryRoles::All | SecondaryRoles::List(_)) => out.push(risk(
+                SnowflakeRisk::RoleSwitch,
+                None,
+                format!("UseStmt > {u}").replace("UseStmt > USE ", "UseStmt > "),
+            )),
+            Use::SecondaryRoles(SecondaryRoles::None)
+            | Use::Catalog(_)
+            | Use::Schema(_)
+            | Use::Database(_)
+            | Use::Warehouse(_)
+            | Use::Object(_)
+            | Use::Default => {}
+        },
+        // `EXECUTE IMMEDIATE '…'` runs text the engine never parses: like a
+        // DO block (VERICTO-081), and unread (fail-closed).
+        Statement::Execute {
+            immediate: true, ..
+        } => out.push(StatementInfo {
+            kind: StatementKind::DoBlock,
+            is_nested,
+            ast_node_path: "ExecuteImmediateStmt".to_string(),
+            ..Default::default()
+        }),
+        // `EXECUTE TASK | ALERT | NOTEBOOK … name` runs a stored object's
+        // code now (sqlparser reads the kind as the name): VERICTO-096, and
+        // unread.
+        Statement::Execute {
+            immediate: false,
+            name,
+            parameters,
+            ..
+        } => out.push(risk(
+            SnowflakeRisk::Persistence,
+            parameters.first().map(ToString::to_string),
+            format!(
+                "ExecuteStmt > runs stored code ({}{})",
+                name.as_ref().map_or_else(String::new, ToString::to_string),
+                parameters
+                    .first()
+                    .map_or_else(String::new, |p| format!(" {p}"))
+            ),
+        )),
+        // A scripting block: like a DO block (VERICTO-081), and every
+        // statement inside is walked (they run), as nested (none of them is
+        // what the client receives).
+        Statement::StartTransaction {
+            statements,
+            exception,
+            ..
+        } if !statements.is_empty() || exception.is_some() => {
+            out.push(StatementInfo {
+                kind: StatementKind::DoBlock,
+                is_nested,
+                ast_node_path: "ScriptingBlock (BEGIN … END)".to_string(),
+                ..Default::default()
+            });
+            for s in statements
+                .iter()
+                .chain(exception.iter().flatten().flat_map(|w| w.statements.iter()))
+            {
+                walk_statement(s, true, depth + 1, cx, out)?;
+            }
+        }
+        Statement::CreateTable(ct) => {
+            let name = ct.name.to_string();
+            if let Some(q) = ct.query.as_deref() {
+                out.push(StatementInfo {
+                    kind: StatementKind::CreateTableAs,
+                    relation: Some(name.clone()),
+                    is_nested,
+                    ast_node_path: "CreateTableAsStmt".to_string(),
+                    ..Default::default()
+                });
+                walk_query(q, true, depth + 1, cx, out)?;
+            } else if let Some(src) = &ct.clone {
+                // Zero-copy, but a full copy of the data as far as access goes.
+                out.push(StatementInfo {
+                    kind: StatementKind::CreateTableAs,
+                    relation: Some(name.clone()),
+                    is_nested,
+                    ast_node_path: format!("CreateTableStmt > CLONE {src}"),
+                    ..Default::default()
+                });
+            }
+            if ct.or_replace {
+                out.push(risk(
+                    SnowflakeRisk::RecoveryReduced,
+                    Some(name.clone()),
+                    "CreateTableStmt > OR REPLACE (drops an existing table of that name)"
+                        .to_string(),
+                ));
+            }
+            if ct.data_retention_time_in_days == Some(0) {
+                out.push(risk(
+                    SnowflakeRisk::RecoveryReduced,
+                    Some(name),
+                    "CreateTableStmt > DATA_RETENTION_TIME_IN_DAYS = 0".to_string(),
+                ));
+            }
+        }
+        Statement::CreateDatabase {
+            db_name,
+            or_replace,
+            clone,
+            data_retention_time_in_days,
+            ..
+        } => {
+            let name = db_name.to_string();
+            if let Some(src) = clone {
+                out.push(StatementInfo {
+                    kind: StatementKind::CreateTableAs,
+                    relation: Some(name.clone()),
+                    is_nested,
+                    ast_node_path: format!("CreateDatabaseStmt > CLONE {src}"),
+                    ..Default::default()
+                });
+            }
+            if *or_replace {
+                out.push(risk(
+                    SnowflakeRisk::RecoveryReduced,
+                    Some(name.clone()),
+                    "CreateDatabaseStmt > OR REPLACE (drops an existing database of that name)"
+                        .to_string(),
+                ));
+            }
+            if *data_retention_time_in_days == Some(0) {
+                out.push(risk(
+                    SnowflakeRisk::RecoveryReduced,
+                    Some(name),
+                    "CreateDatabaseStmt > DATA_RETENTION_TIME_IN_DAYS = 0".to_string(),
+                ));
+            }
+        }
+        Statement::CreateSchema {
+            schema_name,
+            or_replace,
+            clone,
+            ..
+        } => {
+            let name = schema_name.to_string();
+            if let Some(src) = clone {
+                out.push(StatementInfo {
+                    kind: StatementKind::CreateTableAs,
+                    relation: Some(name.clone()),
+                    is_nested,
+                    ast_node_path: format!("CreateSchemaStmt > CLONE {src}"),
+                    ..Default::default()
+                });
+            }
+            if *or_replace {
+                out.push(risk(
+                    SnowflakeRisk::RecoveryReduced,
+                    Some(name),
+                    "CreateSchemaStmt > OR REPLACE (drops an existing schema of that name)"
+                        .to_string(),
+                ));
+            }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// A Snowflake `SELECT` whose only source is bounded: a fixed-size sample
+/// (`FROM t SAMPLE (100 ROWS)`, at most that many rows, whatever the filter)
+/// or `TABLE(RESULT_SCAN(…))`, a result already computed and returned once.
+/// A join, or a percentage sample, bounds nothing.
+fn snowflake_bounded(select: &sqlparser::ast::Select) -> bool {
+    use sqlparser::ast::{TableSampleKind, TableSampleUnit};
+    let [only] = select.from.as_slice() else {
+        return false;
+    };
+    if !only.joins.is_empty() {
+        return false;
+    }
+    match &only.relation {
+        TableFactor::Table {
+            sample: Some(TableSampleKind::BeforeTableAlias(t) | TableSampleKind::AfterTableAlias(t)),
+            ..
+        } => {
+            t.bucket.is_none()
+                && t.quantity
+                    .as_ref()
+                    .is_some_and(|q| matches!(q.unit, Some(TableSampleUnit::Rows)))
+        }
+        TableFactor::TableFunction {
+            expr: Expr::Function(f),
+            ..
+        } => f
+            .name
+            .0
+            .last()
+            .and_then(|p| p.as_ident())
+            .is_some_and(|i| i.value.eq_ignore_ascii_case("result_scan")),
+        _ => false,
+    }
+}
+
+/// The roles that administer a Snowflake account, named in the evidence of
+/// VERICTO-097.
+const PRIVILEGED_ROLES: &[&str] = &[
+    "ACCOUNTADMIN",
+    "SECURITYADMIN",
+    "SYSADMIN",
+    "USERADMIN",
+    "ORGADMIN",
+    "GLOBALORGADMIN",
+];
+
+/// Why a `CREATE WAREHOUSE`'s options can run up cost (VERICTO-095): a size,
+/// a cluster count, a type, a scaling policy, or an `AUTO_SUSPEND` that
+/// never suspends (`0` or `NULL`). `None` for a warehouse created with the
+/// defaults (X-Small, one cluster, suspends after 10 minutes).
+pub(crate) fn warehouse_cost(
+    options: &sqlparser::ast::helpers::key_value_options::KeyValueOptions,
+) -> Option<String> {
+    use sqlparser::ast::helpers::key_value_options::KeyValueOptionKind;
+    for o in &options.options {
+        let name = o.option_name.to_ascii_uppercase();
+        match name.as_str() {
+            "WAREHOUSE_SIZE"
+            | "MAX_CLUSTER_COUNT"
+            | "MIN_CLUSTER_COUNT"
+            | "SCALING_POLICY"
+            | "WAREHOUSE_TYPE"
+            | "RESOURCE_CONSTRAINT"
+            | "QUERY_ACCELERATION_MAX_SCALE_FACTOR"
+            | "ENABLE_QUERY_ACCELERATION" => {
+                return Some(format!("{name} = {}", option_text(&o.option_value)));
+            }
+            "AUTO_SUSPEND" => {
+                let v = option_text(&o.option_value);
+                if v == "0" || v.eq_ignore_ascii_case("NULL") {
+                    return Some(format!("AUTO_SUSPEND = {v} (never suspends)"));
+                }
+            }
+            _ => {}
+        }
+    }
+    fn option_text(v: &KeyValueOptionKind) -> String {
+        let one = |v: &ValueWithSpan| match &v.value {
+            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => s.clone(),
+            other => other.to_string(),
+        };
+        match v {
+            KeyValueOptionKind::Single(v) => one(v),
+            KeyValueOptionKind::Multi(vs) => vs.iter().map(one).collect::<Vec<_>>().join(", "),
+            KeyValueOptionKind::KeyValueOptions(o) => format!("({o})"),
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -632,6 +1131,7 @@ fn walk_query(
     query: &Query,
     is_nested: bool,
     depth: usize,
+    cx: Cx,
     out: &mut Vec<StatementInfo>,
 ) -> Result<()> {
     if depth > MAX_AST_DEPTH {
@@ -650,7 +1150,7 @@ fn walk_query(
     // CTEs (WITH … AS (…))
     if let Some(with) = query.with.as_ref() {
         for cte in &with.cte_tables {
-            walk_query(cte.query.as_ref(), true, depth + 1, out)?;
+            walk_query(cte.query.as_ref(), true, depth + 1, cx, out)?;
         }
     }
 
@@ -661,7 +1161,14 @@ fn walk_query(
     // VERICTO-050 because `select_has_limit` was hard-coded to `false`).
     let has_limit = has_row_limit(query) || query.fetch.is_some();
 
-    walk_set_expr(query.body.as_ref(), is_nested, has_limit, depth + 1, out)?;
+    walk_set_expr(
+        query.body.as_ref(),
+        is_nested,
+        has_limit,
+        depth + 1,
+        cx,
+        out,
+    )?;
     Ok(())
 }
 
@@ -683,6 +1190,7 @@ fn walk_set_expr(
     is_nested: bool,
     has_limit: bool,
     depth: usize,
+    cx: Cx,
     out: &mut Vec<StatementInfo>,
 ) -> Result<()> {
     if depth > MAX_AST_DEPTH {
@@ -697,8 +1205,10 @@ fn walk_set_expr(
                 .iter()
                 .any(|item| matches!(item, SelectItem::Wildcard(_)));
 
-            // A `TOP n` clause (MSSQL) also bounds the result set.
-            let has_limit = has_limit || select.top.is_some();
+            // A `TOP n` clause (MSSQL, Snowflake) also bounds the result set,
+            // as does a Snowflake `SAMPLE (n ROWS)` or `RESULT_SCAN` source.
+            let has_limit =
+                has_limit || select.top.is_some() || (cx.snowflake && snowflake_bounded(select));
 
             // Tautological OR detection in WHERE
             let tautology = select
@@ -709,7 +1219,13 @@ fn walk_set_expr(
 
             // WHERE recursion (subqueries and sleep-family calls)
             if let Some(expr) = select.selection.as_ref() {
-                walk_expr(expr, depth + 1, out)?;
+                walk_expr(expr, depth + 1, cx, out)?;
+            }
+            // Snowflake's QUALIFY filters on window results; it runs too.
+            if cx.snowflake {
+                if let Some(expr) = select.qualify.as_ref() {
+                    walk_expr(expr, depth + 1, cx, out)?;
+                }
             }
 
             // Projection recursion — `SELECT sleep(5)` lives here, not in WHERE
@@ -717,9 +1233,11 @@ fn walk_set_expr(
             // were not inside the WHERE clause.
             for item in &select.projection {
                 match item {
-                    SelectItem::UnnamedExpr(e) => walk_expr(e, depth + 1, out)?,
+                    SelectItem::UnnamedExpr(e) => walk_expr(e, depth + 1, cx, out)?,
                     SelectItem::ExprWithAlias { expr, .. }
-                    | SelectItem::ExprWithAliases { expr, .. } => walk_expr(expr, depth + 1, out)?,
+                    | SelectItem::ExprWithAliases { expr, .. } => {
+                        walk_expr(expr, depth + 1, cx, out)?
+                    }
                     SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {}
                 }
             }
@@ -750,20 +1268,20 @@ fn walk_set_expr(
 
             // Recurse into FROM subqueries
             for twj in &select.from {
-                walk_table_factor(&twj.relation, depth + 1, out)?;
+                walk_table_factor(&twj.relation, depth + 1, cx, out)?;
                 for join in &twj.joins {
-                    walk_table_factor(&join.relation, depth + 1, out)?;
+                    walk_table_factor(&join.relation, depth + 1, cx, out)?;
                 }
             }
         }
 
         SetExpr::Query(query) => {
-            walk_query(query.as_ref(), true, depth + 1, out)?;
+            walk_query(query.as_ref(), true, depth + 1, cx, out)?;
         }
         SetExpr::SetOperation { left, right, .. } => {
             // A LIMIT on the outer query bounds the whole set-operation result.
-            walk_set_expr(left.as_ref(), is_nested, has_limit, depth + 1, out)?;
-            walk_set_expr(right.as_ref(), is_nested, has_limit, depth + 1, out)?;
+            walk_set_expr(left.as_ref(), is_nested, has_limit, depth + 1, cx, out)?;
+            walk_set_expr(right.as_ref(), is_nested, has_limit, depth + 1, cx, out)?;
         }
         // A data-modifying statement used as a query body: a CTE such as
         // `WITH d AS (DELETE FROM t RETURNING id) SELECT …`, which sqlparser
@@ -773,7 +1291,7 @@ fn walk_set_expr(
         | SetExpr::Update(stmt)
         | SetExpr::Delete(stmt)
         | SetExpr::Merge(stmt) => {
-            walk_statement(stmt, true, depth + 1, out)?;
+            walk_statement(stmt, true, depth + 1, cx, out)?;
         }
         // VALUES and TABLE t: no statement, no call.
         SetExpr::Values(_) | SetExpr::Table(_) => {}
@@ -785,13 +1303,14 @@ fn walk_set_expr(
 fn walk_table_factor(
     factor: &TableFactor,
     depth: usize,
+    cx: Cx,
     out: &mut Vec<StatementInfo>,
 ) -> Result<()> {
     if depth > MAX_AST_DEPTH {
         return Err(ProxyError::AstTooDeep);
     }
     if let TableFactor::Derived { subquery, .. } = factor {
-        walk_query(subquery.as_ref(), true, depth + 1, out)?;
+        walk_query(subquery.as_ref(), true, depth + 1, cx, out)?;
     }
     Ok(())
 }
@@ -800,14 +1319,14 @@ fn walk_table_factor(
 // Expression walker — subqueries and function calls
 // ---------------------------------------------------------------------------
 
-fn walk_expr(expr: &Expr, depth: usize, out: &mut Vec<StatementInfo>) -> Result<()> {
+fn walk_expr(expr: &Expr, depth: usize, cx: Cx, out: &mut Vec<StatementInfo>) -> Result<()> {
     if depth > MAX_AST_DEPTH {
         return Err(ProxyError::AstTooDeep);
     }
 
     match expr {
         Expr::Subquery(query) => {
-            walk_query(query.as_ref(), true, depth + 1, out)?;
+            walk_query(query.as_ref(), true, depth + 1, cx, out)?;
         }
 
         // Function call — check for the sleep family (VERICTO-070)
@@ -840,19 +1359,19 @@ fn walk_expr(expr: &Expr, depth: usize, out: &mut Vec<StatementInfo>) -> Result<
                         sqlparser::ast::FunctionArgExpr::Expr(e),
                     ) = arg
                     {
-                        walk_expr(e, depth + 1, out)?;
+                        walk_expr(e, depth + 1, cx, out)?;
                     }
                 }
             }
         }
 
         Expr::BinaryOp { left, right, .. } => {
-            walk_expr(left.as_ref(), depth + 1, out)?;
-            walk_expr(right.as_ref(), depth + 1, out)?;
+            walk_expr(left.as_ref(), depth + 1, cx, out)?;
+            walk_expr(right.as_ref(), depth + 1, cx, out)?;
         }
 
         Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
-            walk_expr(expr.as_ref(), depth + 1, out)?;
+            walk_expr(expr.as_ref(), depth + 1, cx, out)?;
         }
 
         _ => {}
@@ -865,11 +1384,16 @@ fn walk_expr(expr: &Expr, depth: usize, out: &mut Vec<StatementInfo>) -> Result<
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn walk_with_from_ctes(from: &FromTable, depth: usize, out: &mut Vec<StatementInfo>) -> Result<()> {
+fn walk_with_from_ctes(
+    from: &FromTable,
+    depth: usize,
+    cx: Cx,
+    out: &mut Vec<StatementInfo>,
+) -> Result<()> {
     match from {
         FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
             for twj in tables {
-                walk_table_factor(&twj.relation, depth, out)?;
+                walk_table_factor(&twj.relation, depth, cx, out)?;
             }
         }
     }

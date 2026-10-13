@@ -51,6 +51,7 @@ enum Pol {
 
 fn orders_entry(columns: AccessColumns, access: AccessLevel) -> AccessEntry {
     AccessEntry {
+        database: None,
         schema: None,
         table: "orders".into(),
         columns,
@@ -104,6 +105,7 @@ fn access_policy(p: Pol) -> AccessPolicy {
         entries,
         ddl: DdlPolicy::Deny,
         default_schema,
+        ..AccessPolicy::default()
     }
 }
 

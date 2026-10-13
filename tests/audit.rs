@@ -350,12 +350,14 @@ fn vericto_070_detects_every_sleep_variant_on_every_dialect() {
         "SELECT pg_sleep(5)",
         "SELECT pg_sleep_for('5 seconds')",
         "SELECT pg_sleep_until('tomorrow')",
+        "SELECT system$wait(10)",
     ] {
         for dialect in [
             Dialect::Postgres,
             Dialect::Mysql,
             Dialect::Oracle,
             Dialect::MsSql,
+            Dialect::Snowflake,
         ] {
             let m = matching_codes(sql, dialect, &ruleset(), &EnforcementPolicy::default());
             assert!(

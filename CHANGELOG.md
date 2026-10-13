@@ -7,6 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.10.0] — 2026-10-13
+
+Snowflake becomes a dialect: `Dialect::Snowflake` (`"snowflake"`), parsed with
+sqlparser's `SnowflakeDialect`, with seven Snowflake rules, Snowflake identifier
+semantics for agent allowlists, a Snowflake mask rewrite and a fail-closed
+default for text the engine cannot read. **Nothing changes for the other
+dialects**: every verdict of the SQL in the test suites and fixtures of the
+engine, the proxy and the sidecar was compared with 3.9.0 on PostgreSQL, MySQL,
+Oracle and SQL Server under seven policies (41,216 verdicts) and none differs.
+No sqlparser type is part of the public API.
+
+### Added
+
+- **`Dialect::Snowflake`** and `parser::snowflake::SnowflakeParser`. The shared
+  sqlparser walker records the Snowflake statement kinds the rules need: `COPY
+  INTO` (a load from a stage, or an unload to a stage or an external location),
+  `CREATE`/`DROP STAGE`, `PUT`, `LIST`, `USE ROLE | SECONDARY ROLES`, `EXECUTE
+  IMMEDIATE`, scripting blocks (`BEGIN … END`, whose statements are walked),
+  `QUALIFY`, `GRANT … TO SHARE`, `CREATE WAREHOUSE`, `CREATE TABLE … CLONE`,
+  `CREATE OR REPLACE`, `INSERT OVERWRITE`, `ALTER TABLE … SWAP WITH`, time travel,
+  semi-structured paths and `FLATTEN`, three-part names and `IDENTIFIER()`.
+  `parser::walk::not_analysed` stays exhaustive: on Snowflake it also analyses
+  `CREATE WAREHOUSE`, `ALTER SESSION`, `PUT`, `LIST`, `SHOW OBJECTS`, `CREATE
+  FILE FORMAT` and scripting blocks; every other kind sqlparser added since 0.52
+  is still a parse error.
+- **A pre-classifier** for the Snowflake statements sqlparser 0.63 rejects that a
+  rule covers (`UNDROP`, `GET`, `PUT file://…`, `CREATE TASK | STREAM | PIPE |
+  PROCEDURE | FUNCTION | ALERT | SHARE | … INTEGRATION | NETWORK RULE`, `ALTER
+  WAREHOUSE | RESOURCE MONITOR | ACCOUNT | SHARE | STAGE | TASK`, `ALTER TABLE …
+  DROP ROW ACCESS POLICY | UNSET MASKING POLICY`, `DATA_RETENTION_TIME_IN_DAYS =
+  0`, `DROP DYNAMIC | ICEBERG | EXTERNAL TABLE`, `CLONE`, `DECLARE` blocks). It
+  runs only when the parse fails, on a single statement, matching leading
+  keywords outside strings and comments, and turns the statement into a finding
+  of the rule that names it. It never widens an outcome: a pre-classified
+  statement, a scripting block and `EXECUTE IMMEDIATE`/`EXECUTE TASK` are unread
+  code, whose outcome is the stricter of the findings and the parse-error one.
+- **Seven Snowflake rules** (design SF-1 to SF-7), which read only what the
+  Snowflake walker and pre-classifier record and so never fire on another
+  dialect. Proposed catalogue severities and classes:
+  - **VERICTO-091** stage unload or file transfer: `COPY INTO @stage | 's3://…' |
+    'azure://…' | 'gcs://…'`, `GET`, `PUT`. Critical, Security (block).
+  - **VERICTO-092** external stage or integration: `CREATE|ALTER STAGE` with `URL
+    =` or inline `CREDENTIALS`, `CREATE STORAGE | EXTERNAL ACCESS | API
+    INTEGRATION`, `CREATE EXTERNAL FUNCTION`, an egress network rule. Critical,
+    Security (block).
+  - **VERICTO-093** share to another account: `GRANT … TO SHARE` (also
+    VERICTO-082), `CREATE SHARE`, `ALTER SHARE … ADD|SET ACCOUNTS`, `CREATE
+    LISTING`. Critical, Security (block).
+  - **VERICTO-094** recovery reduced: `DATA_RETENTION_TIME_IN_DAYS = 0`, `ALTER
+    ACCOUNT`, `CREATE OR REPLACE TABLE | SCHEMA | DATABASE`, `INSERT OVERWRITE`,
+    `UNDROP`. High, **SchemaMigration** (block at runtime; a CI channel's
+    `schema_migration_cap` softens it like DROP TABLE).
+  - **VERICTO-095** warehouse cost: `CREATE|ALTER WAREHOUSE` setting a size, a
+    cluster count, a type, a scaling policy, query acceleration or a
+    never-suspend `AUTO_SUSPEND`; `ALTER RESOURCE MONITOR`. High, Performance
+    (block). The design's unbounded `SELECT` on a host-tagged large table needs
+    table-size metadata the host does not send yet and is not part of it.
+  - **VERICTO-096** code that runs later: `CREATE TASK | STREAM | PIPE |
+    PROCEDURE | FUNCTION | ALERT`, `ALTER TASK … RESUME | MODIFY AS`, `EXECUTE
+    TASK …`. High, Security (block).
+  - **VERICTO-097** role switch: `USE ROLE`, `USE SECONDARY ROLES ALL | <roles>`
+    (administrative roles are named in the evidence). High, Security (block).
+  The host's catalogue drives these like any code: until it lists them, they do
+  not fire.
+- **VERICTO-087 on Snowflake.** Unquoted identifiers fold to upper case, quoted
+  ones compare exactly, in the query (read again with its names folded) and in
+  the entry alike. `AccessPolicy::quoted_identifiers_ignore_case` (host-set)
+  says whether quoted names fold too; when it is unknown both readings are
+  checked and a reference either one denies is denied. Names are three-part:
+  `AccessEntry::database` (alias `database_name`) and
+  `AccessPolicy::default_database` (host-set, with `default_schema`) resolve
+  them; `INFORMATION_SCHEMA` and the shared `SNOWFLAKE` database are the
+  catalogue; a stage is data and needs an entry; dynamic names and table
+  functions that may read anything are denied; `ALTER SESSION SET` is allowed
+  for formatting, tagging and timeouts only. A denied three-part reference
+  reports its schema as `database.schema`. All three fields are optional and
+  not serialized when unset, so existing policies are unchanged.
+- **VERICTO-085 mask rewrite on Snowflake** (`full`, `last4`, `email`, `hash`),
+  printed back from the sqlparser tree and forwarded only when the unmodified
+  statement prints back to the client's tokens, the rewrite parses back to
+  itself and the bind parameters are the client's, in order. The masks return
+  what the Postgres masks return for the same text: `full` over a computed value
+  is `CONCAT('[redacted]', COALESCE(LEFT(TO_VARCHAR(x), 0), ''))` (Snowflake's
+  `CONCAT` is NULL if any argument is), and `email` is a `CASE` over `CHARINDEX`
+  rather than `REGEXP_REPLACE`, which returns the value unmasked when it fails to
+  match. Output names are kept (a bare column is aliased with its own
+  identifier); an unaliased expression, and `ORDER BY` / `GROUP BY` / `HAVING` /
+  `QUALIFY` naming a masked output, block. Pinned by golden outputs only:
+  there is no Snowflake emulator, and an equivalence run against a real account
+  is not part of this repository's CI.
+- `system$wait` joins the sleep-family functions of VERICTO-070 (shared by both
+  walkers, so it is detected on every dialect).
+- `tests/snowflake.rs` (walker cases, the rules × Snowflake matrix, every
+  Snowflake rule's positive and negative cases, fail-closed, VERICTO-087,
+  VERICTO-085) and `tests/snowflake_corpus.rs`: 1,165 statements of public
+  Snowflake SQL (rendered dbt models of `dbt-labs/jaffle_shop` and
+  `get-select/dbt-snowflake-monitoring` with the DDL dbt-snowflake wraps them in,
+  the statements dbt-snowflake sends, and the Snowflake tests of sqlglot; the
+  sources and licences are in the fixture's header and `.LICENSES` file) with a
+  golden file of how each is read and its verdict. The engine reads the dbt
+  models 100%, the dbt-snowflake statements 89.1% and sqlglot's 91.5% (sqlparser
+  alone: 100%, 84.8%, 87.7%).
+
+### Changed
+
+- **Snowflake parse errors fail closed by default**: unparseable Snowflake text
+  is blocked whatever `parse_error` says (the other dialects keep the
+  fail-open default). `monitor_mode` lets the host's `parse_error` apply, and a
+  `schema_migration_cap` of `Flag`/`Monitor` (the CI channel) caps it at the
+  host's `parse_error`; a `block`/`mask` tag or an enforced allowlist still
+  forces the block. `EnforcementPolicy::effective_parse_error_for(sql,
+  Dialect::Snowflake)` returns it, for hosts that branch on it themselves.
+- **Additive API changes**, as in earlier minor releases: the `Dialect::Snowflake`
+  variant, `parser::SnowflakeRisk` and `StatementInfo::snowflake`, and the new
+  public fields `AccessEntry::database`, `AccessPolicy::default_database` and
+  `AccessPolicy::quoted_identifiers_ignore_case`. A host that matches
+  exhaustively on `Dialect` needs a `Snowflake` arm, and one that builds an
+  `AccessEntry` or `AccessPolicy` with a struct literal needs the new fields
+  (`..AccessPolicy::default()` for the policy); building them from JSON is
+  unchanged.
+
 ## [3.9.0] — 2026-10-12
 
 Dependency release: `serde_yaml` is replaced (RUSTSEC-2024-0449, which fails
@@ -1367,7 +1488,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.9.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.10.0...HEAD
+[3.10.0]: https://github.com/vericto/vericto-engine/compare/v3.9.0...v3.10.0
 [3.9.0]: https://github.com/vericto/vericto-engine/compare/v3.8.1...v3.9.0
 [3.8.1]: https://github.com/vericto/vericto-engine/compare/v3.8.0...v3.8.1
 [3.8.0]: https://github.com/vericto/vericto-engine/compare/v3.7.0...v3.8.0

@@ -6,8 +6,8 @@
 use serde::Deserialize;
 
 use crate::parser::{
-    AlterTableKind, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, WherePresence,
-    is_sleep_function,
+    AlterTableKind, Dialect, DropObjectKind, ParsedQuery, SnowflakeRisk, StatementInfo,
+    StatementKind, WherePresence, is_sleep_function,
 };
 use crate::rules::engine::{Rule, RuleType};
 
@@ -28,8 +28,34 @@ pub fn evaluate_rule(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
     }
 }
 
+/// Built-in codes whose construct does not exist on `dialect`: the rule stays
+/// in the host's catalogue and never fires there (design §4.2, "n/a").
+///
+/// Snowflake:
+/// - VERICTO-002: Snowflake's `DELETE` has no `LIMIT`.
+/// - VERICTO-031 / VERICTO-033: Snowflake has no data-modifying CTEs
+///   (`WITH x AS (UPDATE | DELETE …)`); sqlparser reads them on every
+///   dialect, but Snowflake rejects them, so they never run.
+/// - VERICTO-086: MySQL's lexical ambiguity; Snowflake text is read with
+///   Snowflake's own tokenizer.
+///
+/// VERICTO-080 (`COPY … PROGRAM`) needs no entry: Snowflake has no `PROGRAM`
+/// form, and its exfiltration analogue, `COPY INTO @stage`, is VERICTO-091.
+fn not_applicable(code: &str, dialect: Option<Dialect>) -> bool {
+    match dialect {
+        Some(Dialect::Snowflake) => matches!(
+            code,
+            "VERICTO-002" | "VERICTO-031" | "VERICTO-033" | "VERICTO-086"
+        ),
+        Some(Dialect::Postgres | Dialect::Mysql | Dialect::Oracle | Dialect::MsSql) | None => false,
+    }
+}
+
 /// Dispatches the built-in rule code to its predicate.
 fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
+    if not_applicable(&rule.code, parsed.dialect()) {
+        return None;
+    }
     let stmts = &parsed.statements;
     match rule.code.as_str() {
 
@@ -478,9 +504,92 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             v
         }),
 
+        // ── Snowflake (design §4.3, SF-1 … SF-7) ──────────────────────────
+        // Read only the `snowflake` field, which only the Snowflake walker
+        // and pre-classifier set: these codes never fire on another dialect.
+
+        // VERICTO-091: data or files leave through a stage — `COPY INTO
+        // @stage | 's3://…' | 'azure://…' | 'gcs://…'` (unload), `GET`, `PUT`.
+        "VERICTO-091" => snowflake(stmts, SnowflakeRisk::StageTransfer).map(|s| {
+            violation(
+                rule,
+                s,
+                Some("Return rows to the client with a bounded SELECT; unload and file transfer belong in a reviewed pipeline".to_string()),
+            )
+        }),
+
+        // VERICTO-092: an external stage or integration — `CREATE|ALTER STAGE`
+        // with `URL =` or inline `CREDENTIALS`, `CREATE STORAGE | EXTERNAL
+        // ACCESS | API INTEGRATION`, an egress `NETWORK RULE`.
+        "VERICTO-092" => snowflake(stmts, SnowflakeRisk::ExternalAccess).map(|s| {
+            violation(
+                rule,
+                s,
+                Some("Create stages and integrations through infrastructure-as-code, never with inline credentials".to_string()),
+            )
+        }),
+
+        // VERICTO-093: data leaves the account — `GRANT … TO SHARE`, `CREATE
+        // SHARE`, `ALTER SHARE … ADD|SET ACCOUNTS`, listings.
+        "VERICTO-093" => snowflake(stmts, SnowflakeRisk::Share).map(|s| {
+            violation(
+                rule,
+                s,
+                Some("Manage shares and the accounts they reach through a reviewed data-sharing process".to_string()),
+            )
+        }),
+
+        // VERICTO-094: recovery reduced — `DATA_RETENTION_TIME_IN_DAYS = 0`,
+        // `ALTER ACCOUNT`, `CREATE OR REPLACE` on a table/schema/database,
+        // `INSERT OVERWRITE`, `UNDROP` (it can shadow a newer object).
+        "VERICTO-094" => snowflake(stmts, SnowflakeRisk::RecoveryReduced).map(|s| {
+            violation(
+                rule,
+                s,
+                Some("Keep Time Travel retention; use CREATE … IF NOT EXISTS or a versioned migration".to_string()),
+            )
+        }),
+
+        // VERICTO-095: warehouse cost — `CREATE|ALTER WAREHOUSE` setting a
+        // size, cluster count, type or a never-suspend `AUTO_SUSPEND`, and
+        // `ALTER RESOURCE MONITOR`.
+        "VERICTO-095" => snowflake(stmts, SnowflakeRisk::WarehouseCost).map(|s| {
+            violation(
+                rule,
+                s,
+                Some("Size warehouses and resource monitors through infrastructure-as-code".to_string()),
+            )
+        }),
+
+        // VERICTO-096: code that runs later, outside any check — `CREATE TASK
+        // | STREAM | PIPE | PROCEDURE | FUNCTION | ALERT`, `ALTER TASK …
+        // RESUME | MODIFY AS`, `EXECUTE TASK`.
+        "VERICTO-096" => snowflake(stmts, SnowflakeRisk::Persistence).map(|s| {
+            violation(
+                rule,
+                s,
+                Some("Deploy tasks, pipes and procedures through a reviewed migration; their bodies run unchecked".to_string()),
+            )
+        }),
+
+        // VERICTO-097: privilege context switch — `USE ROLE`, `USE SECONDARY
+        // ROLES ALL | <roles>`.
+        "VERICTO-097" => snowflake(stmts, SnowflakeRisk::RoleSwitch).map(|s| {
+            violation(
+                rule,
+                s,
+                Some("Set the role in the connection, scoped to what the caller needs".to_string()),
+            )
+        }),
+
         // Unknown or not-yet-implemented built-in codes: pass through.
         _ => None,
     }
+}
+
+/// The first entry recording the Snowflake risk `what`.
+fn snowflake(stmts: &[StatementInfo], what: SnowflakeRisk) -> Option<&StatementInfo> {
+    find(stmts, |s| s.snowflake == Some(what))
 }
 
 // ---------------------------------------------------------------------------

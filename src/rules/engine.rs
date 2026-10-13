@@ -102,11 +102,25 @@ impl RuleClass {
             | "VERICTO-033" | "VERICTO-040" | "VERICTO-042" | "VERICTO-083" | "VERICTO-084" => {
                 RuleClass::DataMutation
             }
+            // Snowflake: recovery reduced (retention 0, CREATE OR REPLACE,
+            // INSERT OVERWRITE, UNDROP, ALTER ACCOUNT) is schema DDL, which a
+            // CI channel may soften like DROP TABLE.
+            "VERICTO-094" => RuleClass::SchemaMigration,
             // Security
             "VERICTO-070" | "VERICTO-080" | "VERICTO-081" | "VERICTO-082" | "VERICTO-085"
             | "VERICTO-086" | "VERICTO-087" | "VERICTO-090" => RuleClass::Security,
+            // Snowflake: stage unload and file transfer, external stages and
+            // integrations, shares, persistent code, role switches. DDL in
+            // form for some, but each moves data out of the account or runs
+            // code no check sees, so a CI channel never softens them (as
+            // GRANT, VERICTO-082).
+            "VERICTO-091" | "VERICTO-092" | "VERICTO-093" | "VERICTO-096" | "VERICTO-097" => {
+                RuleClass::Security
+            }
             // Performance / best-practice
             "VERICTO-050" | "VERICTO-051" | "VERICTO-060" | "VERICTO-061" => RuleClass::Performance,
+            // Snowflake warehouse cost.
+            "VERICTO-095" => RuleClass::Performance,
             // Custom rules / unknown codes: conservative default.
             _ => RuleClass::DataMutation,
         }
@@ -263,11 +277,23 @@ impl EnforcementPolicy {
     ///
     /// Hosts that parse themselves and branch on the parse-error action must
     /// call this (with the client's text) instead of `effective_parse_error`.
+    ///
+    /// **Snowflake fails closed by default**: text the engine cannot read is
+    /// blocked whatever `parse_error` says, because the Snowflake statements
+    /// sqlparser rejects are disproportionately the dangerous ones (tasks,
+    /// shares, stage transfers, account changes). Two levers soften it, both
+    /// the host's: `monitor_mode` (dry-run: the host's `parse_error` applies,
+    /// as on every dialect) and `schema_migration_cap` (a CI channel that
+    /// reports migration DDL instead of blocking it reports this at most
+    /// that strongly too).
     pub fn effective_parse_error_for(
         &self,
         sql: &str,
         dialect: crate::parser::Dialect,
     ) -> ParseErrorAction {
+        if dialect == crate::parser::Dialect::Snowflake {
+            return self.snowflake_parse_error();
+        }
         let forced = self.effective_parse_error();
         // The session list is only consulted when a protection would force
         // the block: with neither, this is exactly `effective_parse_error`.
@@ -275,6 +301,22 @@ impl EnforcementPolicy {
             self.parse_error
         } else {
             forced
+        }
+    }
+
+    /// The parse-error action on Snowflake (see
+    /// [`effective_parse_error_for`](Self::effective_parse_error_for)).
+    pub(crate) fn snowflake_parse_error(&self) -> ParseErrorAction {
+        if self.monitor_mode {
+            return self.effective_parse_error();
+        }
+        match self.schema_migration_cap {
+            Some(EnforcementAction::Block) | None => ParseErrorAction::Block,
+            // A protective tag or an enforced allowlist still forces the
+            // block: the cap softens DDL, not data protection.
+            Some(EnforcementAction::Flag | EnforcementAction::Monitor) => {
+                self.effective_parse_error()
+            }
         }
     }
 
@@ -530,7 +572,44 @@ impl RuleEngine {
                 outcome = apply_sensitive(outcome, verdict, policy);
             }
         }
-        Self::with_access(outcome, parsed, policy)
+        let outcome = Self::with_access(outcome, parsed, policy);
+        Self::with_unread(outcome, parsed, policy)
+    }
+
+    /// Snowflake code the engine did not read (a scripting block, `EXECUTE
+    /// IMMEDIATE`, a statement only the pre-classifier recognised): the
+    /// parse-error outcome is a floor. The findings keep the flat fields
+    /// unless the parse-error outcome is strictly stricter (a rule the host
+    /// set to flag, or none at all), so what cannot be read still fails
+    /// closed and what was recognised is still named in the report.
+    fn with_unread(
+        outcome: EvaluationOutcome,
+        parsed: &ParsedQuery,
+        policy: &EnforcementPolicy,
+    ) -> EvaluationOutcome {
+        let Some(why) = parsed.unread.as_deref() else {
+            return outcome;
+        };
+        let floor = parse_error_outcome_as(why, policy.snowflake_parse_error());
+        if strictness(&floor) > strictness(&outcome) {
+            let mut floor = floor;
+            // Keep the audit trail (the decision comes from the floor alone).
+            floor.sensitive_columns = outcome.sensitive_columns;
+            floor.access_denied = outcome.access_denied;
+            if !outcome.violations.is_empty() {
+                let codes: Vec<&str> = outcome
+                    .violations
+                    .iter()
+                    .map(|v| v.rule_code.as_str())
+                    .collect();
+                floor.ast_node_path = floor
+                    .ast_node_path
+                    .map(|p| format!("{p} (also reported: {})", codes.join(", ")));
+            }
+            floor
+        } else {
+            outcome
+        }
     }
 
     /// Folds the identity's allowlist (VERICTO-087) into `outcome`. The only

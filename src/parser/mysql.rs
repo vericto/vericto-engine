@@ -53,6 +53,7 @@ impl SqlParser for MySqlParser {
                 statements: Vec::new(),
                 ast: SourceAst::None,
                 mysql: Some(Arc::new(MysqlReadings::Ambiguous(why))),
+                unread: None,
             }),
             Readings::Normalized { base, alternatives } => {
                 let mut parsed = parse_text(&self.dialect, Dialect::Mysql, &base, sql)?;

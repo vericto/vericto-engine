@@ -29,6 +29,32 @@ pub(crate) enum Failure {
     Unreadable(String),
 }
 
+/// Snowflake: derivation, and the mask rewrite when `any_mask`, rendered
+/// and checked by [`super::snowflake::render`] against the client's text.
+pub(crate) fn analyze_snowflake(
+    statements: &[Statement],
+    sql: &str,
+    tags: &Tags,
+    any_mask: bool,
+) -> Result<(Touches, super::pg::Rewrite)> {
+    let mut statements = statements.to_vec();
+    let original = any_mask.then(|| statements.clone());
+    let mut w = Walker::new(tags, any_mask, None);
+    w.snowflake = true;
+    for s in statements.iter_mut() {
+        w.stmt(s, 0)?;
+    }
+    let (touches, rewrote, refused) = (w.touches, w.rewrote, w.refused);
+    if !rewrote {
+        return Ok((touches, None));
+    }
+    let rewrite = match refused {
+        Some(why) => Err(why),
+        None => super::snowflake::render(sql, original.as_deref().unwrap_or_default(), &statements),
+    };
+    Ok((touches, Some(rewrite)))
+}
+
 /// Oracle / MS SQL: derivation only.
 pub(crate) fn analyze(statements: &[Statement], tags: &Tags) -> Result<Touches> {
     let mut statements = statements.to_vec();
@@ -91,6 +117,7 @@ pub(crate) fn access_walk(
     w.all = true;
     w.ansi_quotes = dialect == crate::parser::Dialect::Mysql;
     w.oracle = dialect == crate::parser::Dialect::Oracle;
+    w.snowflake = dialect == crate::parser::Dialect::Snowflake;
     w.stmt(stmt, 0)
 }
 
@@ -139,6 +166,10 @@ struct Walker<'a, 't, 'p, 's> {
     ansi_quotes: bool,
     /// Oracle: `ROWNUM`, `LEVEL`, … are pseudo-columns (access analysis).
     oracle: bool,
+    /// Snowflake: three-part names and stages (access analysis), dynamic
+    /// table functions denied (access analysis), and the Snowflake mask
+    /// rewrite (see [`super::snowflake`]).
+    snowflake: bool,
     /// The access analysis: every clause counts (WHERE, JOIN, GROUP BY, …),
     /// not only what is projected, and tables and write targets are recorded.
     all: bool,
@@ -146,11 +177,6 @@ struct Walker<'a, 't, 'p, 's> {
     /// whose simple `SELECT` is walked next — `(no OF, the OF names)`. Taken by
     /// that `SELECT`, so nested queries never inherit it.
     lock: Option<(bool, Vec<ObjectName>)>,
-}
-
-/// `[db.]schema.table` of a write target, for [`Tags::write`].
-fn target_of(name: &ObjectName) -> (Option<String>, String) {
-    split_name(name)
 }
 
 fn too_deep(depth: usize) -> Result<()> {
@@ -176,6 +202,27 @@ fn split_name(name: &ObjectName) -> (Option<String>, String) {
         None
     };
     (schema, table)
+}
+
+/// Snowflake's `db.schema.table` → (`DB\u{1f}SCHEMA`, table) for the access
+/// analysis, which must tell databases apart (see `access::DB_SEP`); two-
+/// and one-part names as [`split_name`]. A stage reference (`@stage/path`,
+/// `@db.schema.stage`, `@~`, `@%t`) is the stage, as a relation: reading
+/// staged files needs an entry naming it.
+pub(crate) fn split_name_snowflake(name: &ObjectName) -> (Option<String>, String) {
+    let parts = name_parts(name);
+    if parts.first().is_some_and(|p| p.starts_with('@')) {
+        let full = parts.join(".");
+        let stage = full.split('/').next().unwrap_or(&full);
+        return (None, stage.to_string());
+    }
+    match parts.as_slice() {
+        [.., db, schema, table] => (
+            Some(format!("{db}{}{schema}", crate::access::DB_SEP)),
+            table.to_string(),
+        ),
+        _ => split_name(name),
+    }
 }
 
 /// The column a column list names. Since sqlparser 0.62 an `INSERT`/`MERGE`
@@ -249,6 +296,39 @@ fn position(e: &Expr) -> Option<usize> {
 }
 
 impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
+    /// `[db.]schema.table` → (schema, table); on Snowflake's access analysis
+    /// the database is kept (see [`split_name_snowflake`]).
+    fn split(&self, name: &ObjectName) -> (Option<String>, String) {
+        if self.snowflake && self.all {
+            split_name_snowflake(name)
+        } else {
+            split_name(name)
+        }
+    }
+
+    /// Snowflake's access analysis: a table function whose rows are computed
+    /// from its arguments only (`FLATTEN`, `SPLIT_TO_TABLE`, `GENERATOR`, …)
+    /// reads nothing else. Any other one may read anything (`RESULT_SCAN` of
+    /// another query, `INFORMATION_SCHEMA.QUERY_HISTORY()`, a UDTF, `TABLE($t)`
+    /// naming a table at run time): denied outright.
+    fn snowflake_table_function(&self, name: Option<&ObjectName>) {
+        const PURE: &[&str] = &[
+            "FLATTEN",
+            "SPLIT_TO_TABLE",
+            "STRTOK_SPLIT_TO_TABLE",
+            "GENERATOR",
+        ];
+        if !(self.snowflake && self.all) {
+            return;
+        }
+        let pure =
+            name.is_some_and(|n| n.0.len() == 1 && PURE.iter().any(|p| ieq(p, name_part(&n.0[0]))));
+        if !pure {
+            let what = name.map_or_else(|| "TABLE(…)".to_string(), |n| format!("TABLE({n}(…))"));
+            self.tags.statement(&what);
+        }
+    }
+
     fn new(tags: &'a Tags<'t>, rewrite: bool, mysql: Option<&'p Prepared<'s>>) -> Self {
         Walker {
             tags,
@@ -261,6 +341,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             mysql,
             ansi_quotes: mysql.is_some(),
             oracle: false,
+            snowflake: false,
             all: false,
             lock: None,
         }
@@ -319,7 +400,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             }
             Statement::Insert(ins) => {
                 let (schema, table) = match &ins.table {
-                    TableObject::TableName(name) => split_name(name),
+                    TableObject::TableName(name) => self.split(name),
                     // `INSERT INTO TABLE FUNCTION f(…)` / `INSERT INTO (SELECT …)`
                     // (ClickHouse, Oracle): no table name the engine can
                     // resolve. Recorded under the statement's own text, which
@@ -497,7 +578,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                         if self.all && del.tables.is_empty() {
                             for twj in from.iter() {
                                 if let TableFactor::Table { name, .. } = &twj.relation {
-                                    targets.push(target_of(name));
+                                    targets.push(self.split(name));
                                 }
                             }
                         }
@@ -511,7 +592,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                                 let parts = name_parts(n);
                                 let found = self.scopes.base_tables(&parts);
                                 if found.is_empty() {
-                                    targets.push(target_of(n));
+                                    targets.push(self.split(n));
                                 } else {
                                     targets.extend(found);
                                 }
@@ -540,7 +621,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                             let mut bases: Vec<Item> = Vec::new();
                             for twj in from.iter() {
                                 if let TableFactor::Table { name, .. } = &twj.relation {
-                                    let (schema, table) = split_name(name);
+                                    let (schema, table) = self.split(name);
                                     bases.push(Item::Base {
                                         refname: table.clone(),
                                         schema,
@@ -575,7 +656,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                     table_name,
                     columns,
                 } => {
-                    let (schema, table) = split_name(table_name);
+                    let (schema, table) = self.split(table_name);
                     self.tags.relation(schema.as_deref(), &table);
                     let lin = if columns.is_empty() {
                         starred(self.tags.of_table(schema.as_deref(), &table))
@@ -602,7 +683,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 ..
             } => {
                 // Access analysis: `COPY t [(cols)] FROM` writes them.
-                let (schema, table) = split_name(table_name);
+                let (schema, table) = self.split(table_name);
                 self.tags.write(schema.as_deref(), &table, None);
                 if columns.is_empty() {
                     self.tags.write(schema.as_deref(), &table, Some("*"));
@@ -892,7 +973,17 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             let order = if all { q.order_by.as_mut() } else { None };
             self.select(sel, sink, order, depth + 1)
                 .map(|(outs, rw, star, distinct)| {
-                    if !rw.is_empty() && !distinct {
+                    if !rw.is_empty() && self.snowflake {
+                        // Snowflake resolves ORDER BY names to the select
+                        // aliases first: ordering by a masked output would
+                        // order by the masked value. Refused, as is a
+                        // position naming one.
+                        if let Some(ob) = q.order_by.as_ref() {
+                            if let Some(why) = snowflake_order_refusal(ob, &rw) {
+                                self.refuse(why);
+                            }
+                        }
+                    } else if !rw.is_empty() && !distinct {
                         if let Some(ob) = q.order_by.as_mut() {
                             if let Err(why) = fix_order_by(ob, &rw, star) {
                                 self.refuse(why);
@@ -1048,7 +1139,11 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                             self.touches.record(&lin, sink);
                             if let Sink::Projected { rewrite: true } = sink {
                                 if let Some(style) = mask_style_for(self.tags, &lin) {
-                                    *e = mysql::mask_expr(style, e);
+                                    *e = if self.snowflake {
+                                        super::snowflake::mask_expr(style, e)
+                                    } else {
+                                        mysql::mask_expr(style, e)
+                                    };
                                     self.rewrote = true;
                                 }
                             }
@@ -1136,7 +1231,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 if bases.is_empty() {
                     // Not a base table in scope: taken as a table name,
                     // denied unless granted for writing (conservative).
-                    let (schema, table) = target_of(n);
+                    let (schema, table) = self.split(n);
                     tags.write(schema.as_deref(), &table, None);
                 }
                 for (schema, table) in &bases {
@@ -1151,7 +1246,9 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         })();
         self.scopes.pop();
         let (outs, rw, star) = r?;
-        if !rw.is_empty() {
+        if !rw.is_empty() && self.snowflake {
+            self.snowflake_clause_refusals(sel, &rw);
+        } else if !rw.is_empty() {
             self.fix_group_and_having(sel, &rw, star);
         }
         Ok((outs, rw, star, sel.distinct.is_some()))
@@ -1281,6 +1378,36 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         }
     }
 
+    /// Snowflake: after masking, `GROUP BY`, `HAVING` and `QUALIFY` naming a
+    /// masked output (or `GROUP BY` a position of one) may see the masked
+    /// value, depending on name resolution the engine cannot check without
+    /// a schema: the rewrite is refused (the query blocks).
+    fn snowflake_clause_refusals(&mut self, sel: &Select, rw: &[Rewritten]) {
+        let names: Vec<&str> = rw.iter().map(|(_, n, _)| n.as_str()).collect();
+        if let GroupByExpr::Expressions(exprs, _) = &sel.group_by {
+            for e in exprs {
+                let masked_position =
+                    position(e).is_some_and(|p| rw.iter().any(|(i, _, _)| *i == p));
+                if masked_position || super::snowflake::mentions(e, &names) {
+                    self.refuse(format!(
+                        "GROUP BY uses the masked output(s) {}; group by the expression itself, unaliased",
+                        names.join(", ")
+                    ));
+                }
+            }
+        }
+        for (clause, e) in [("HAVING", &sel.having), ("QUALIFY", &sel.qualify)] {
+            if e.as_ref()
+                .is_some_and(|e| super::snowflake::mentions(e, &names))
+            {
+                self.refuse(format!(
+                    "{clause} uses the masked output name(s) {}; Snowflake would compare the masked value",
+                    names.join(", ")
+                ));
+            }
+        }
+    }
+
     fn combine(&self, l: Vec<OutCol>, r: Vec<OutCol>) -> Vec<OutCol> {
         let all_named = |v: &[OutCol]| v.iter().all(|c| matches!(c, OutCol::Named { .. }));
         if l.len() == r.len() && all_named(&l) && all_named(&r) {
@@ -1396,7 +1523,45 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             };
             if let Some(sink) = sink {
                 self.touches.record(&lin, sink);
-                if let Sink::Projected { rewrite: true } = sink {
+                if let (Sink::Projected { rewrite: true }, true) = (sink, self.snowflake) {
+                    if let Some(style) = mask_style_for(self.tags, &lin) {
+                        // Snowflake names an unaliased column after the column
+                        // (folded unless quoted): the alias is the column's
+                        // own identifier, quote style included. Any other
+                        // unaliased expression gets a name Snowflake derives
+                        // from its text, which the rewrite cannot reproduce.
+                        let alias = match item {
+                            SelectItem::ExprWithAlias { alias, .. } => Some(alias.clone()),
+                            SelectItem::UnnamedExpr(Expr::Identifier(i)) => Some(i.clone()),
+                            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(ids)) => {
+                                ids.last().cloned()
+                            }
+                            _ => None,
+                        };
+                        match (alias, &*item) {
+                            (
+                                Some(alias),
+                                SelectItem::UnnamedExpr(e)
+                                | SelectItem::ExprWithAlias { expr: e, .. },
+                            ) => {
+                                let orig = e.clone();
+                                *item = SelectItem::ExprWithAlias {
+                                    expr: super::snowflake::mask_expr(style, &orig),
+                                    alias,
+                                };
+                                rewritten.push((idx, name.clone(), orig));
+                                self.rewrote = true;
+                            }
+                            _ => {
+                                self.rewrote = true;
+                                self.refuse(
+                                    "an unaliased expression over a masked column has a name Snowflake derives from its text; alias it (`AS name`)"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                } else if let Sink::Projected { rewrite: true } = sink {
                     if let Some(style) = mask_style_for(self.tags, &lin) {
                         let (orig, name) = match item {
                             SelectItem::UnnamedExpr(e) => (e.clone(), self.output_name(e)),
@@ -1513,10 +1678,11 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             TableFactor::Table {
                 name, alias, args, ..
             } => {
-                let (schema, table) = split_name(name);
+                let (schema, table) = self.split(name);
                 let refname = alias_name(alias).unwrap_or_else(|| table.clone());
                 if let Some(args) = args {
                     // A table-valued function call.
+                    self.snowflake_table_function(Some(name));
                     let mut lin = Lineage::new();
                     for a in args.args.iter_mut() {
                         merge(&mut lin, self.function_arg(a, d)?);
@@ -1570,11 +1736,20 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                     cols: rename(cols, alias.as_ref()),
                 }]
             }
-            TableFactor::TableFunction { expr, alias } => vec![Item::Opaque {
-                refname: alias_name(alias),
-                lin: indirect(self.expr(expr, d)?),
-            }],
-            TableFactor::Function { args, alias, .. } => {
+            TableFactor::TableFunction { expr, alias } => {
+                self.snowflake_table_function(match &*expr {
+                    Expr::Function(f) => Some(&f.name),
+                    _ => None,
+                });
+                vec![Item::Opaque {
+                    refname: alias_name(alias),
+                    lin: indirect(self.expr(expr, d)?),
+                }]
+            }
+            TableFactor::Function {
+                name, args, alias, ..
+            } => {
+                self.snowflake_table_function(Some(name));
                 let mut lin = Lineage::new();
                 for a in args.iter_mut() {
                     merge(&mut lin, self.function_arg(a, d)?);
@@ -1637,7 +1812,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             }],
             // Snowflake's `SEMANTIC_VIEW(v …)`: reads the view, whole.
             TableFactor::SemanticView { name, alias, .. } => {
-                let (schema, table) = split_name(name);
+                let (schema, table) = self.split(name);
                 self.tags.relation(schema.as_deref(), &table);
                 vec![Item::Opaque {
                     refname: alias_name(alias),
@@ -2048,6 +2223,28 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
 /// first (measured on 5.7 and 8.0), so the alias can no longer capture it.
 /// An expression over the name of a masked alias that is not itself a column
 /// (`ORDER BY LENGTH(le)`) would sort by the masked value: refused.
+/// Snowflake: why an `ORDER BY` cannot stay as it is over masked outputs
+/// (see the caller), or `None`.
+fn snowflake_order_refusal(ob: &OrderBy, rw: &[Rewritten]) -> Option<String> {
+    let names: Vec<&str> = rw.iter().map(|(_, n, _)| n.as_str()).collect();
+    let OrderByKind::Expressions(items) = &ob.kind else {
+        // `ORDER BY ALL` orders by every output, the masked ones included.
+        return Some("ORDER BY ALL orders by the masked output".to_string());
+    };
+    items
+        .iter()
+        .any(|o| {
+            position(&o.expr).is_some_and(|p| rw.iter().any(|(i, _, _)| *i == p))
+                || super::snowflake::mentions(&o.expr, &names)
+        })
+        .then(|| {
+            format!(
+                "ORDER BY uses the masked output(s) {}; Snowflake would order by the masked value",
+                names.join(", ")
+            )
+        })
+}
+
 fn fix_order_by(ob: &mut OrderBy, rw: &[Rewritten], star: bool) -> std::result::Result<(), String> {
     let captured: Vec<&str> = rw
         .iter()

@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.9.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.10.0" }
 ```
 
 ### Quick example
@@ -115,12 +115,16 @@ already ran every rule and simply discarded the rest.
 
 ## Supported dialects
 
-| Dialect    | Parser backend                       |
-|------------|--------------------------------------|
-| PostgreSQL | `pg_query` 6.2 (libpg_query, PG 17)  |
-| MySQL      | `sqlparser-rs` 0.52                  |
-| SQL Server | `sqlparser-rs` 0.52                  |
-| Oracle     | `sqlparser-rs` 0.52                  |
+| Dialect    | Parser backend                       | Parse errors (default) |
+|------------|--------------------------------------|------------------------|
+| PostgreSQL | `pg_query` 6.2 (libpg_query, PG 17)  | host's `parse_error` (fail-open: flag) |
+| MySQL      | `sqlparser-rs` 0.63                  | host's `parse_error` (fail-open: flag) |
+| SQL Server | `sqlparser-rs` 0.63                  | host's `parse_error` (fail-open: flag) |
+| Oracle     | `sqlparser-rs` 0.63                  | host's `parse_error` (fail-open: flag) |
+| Snowflake  | `sqlparser-rs` 0.63 (`SnowflakeDialect`) + keyword pre-classifier | **block** (fail-closed); see [Snowflake](#snowflake) |
+
+`Dialect::parse_dialect` accepts `postgres`/`postgresql`, `mysql`, `oracle`,
+`mssql`/`sqlserver`/`tsql` and `snowflake`.
 
 ---
 
@@ -133,8 +137,9 @@ is a deterministic predicate over the parsed AST in
 enforcement action via the policy (Critical/High → Block, Medium → Flag,
 Low/Informational → Monitor).
 
-> Dialect notes: PostgreSQL is parsed with `libpg_query`; MySQL/Oracle/MSSQL
-> with `sqlparser-rs`. Differences are called out per rule.
+> Dialect notes: PostgreSQL is parsed with `libpg_query`; MySQL/Oracle/MSSQL/
+> Snowflake with `sqlparser-rs`. Differences are called out per rule; how each
+> rule applies on Snowflake is in [Snowflake](#snowflake).
 
 ### Critical
 
@@ -151,6 +156,9 @@ Low/Informational → Monitor).
 | VERICTO-081 | DO anonymous code block | `DO $$ … $$` runs an arbitrary PL/pgSQL body that can hide any DML/DDL; opaque to the SQL parser. (PostgreSQL.) |
 | VERICTO-086 | SQL text MySQL and the engine would read differently | MySQL text the engine cannot resolve to one statement with certainty, because of differences between MySQL's and the engine's reading of comments and string escapes. Every rule is evaluated on the statement MySQL executes (comments read by MySQL's rules, string literals under both string-escape modes, the strictest outcome kept); this blocks what that cannot settle. Not enabled through the rules slice, not a parse error: always blocks (flags under `monitor_mode`). (MySQL.) |
 | VERICTO-090 | OR tautology in WHERE (SQL injection) | A `WHERE` with a trivially-true `OR` branch (`… OR 1=1`) — the canonical injection bypass. Covers SELECT/DELETE/UPDATE at any depth. |
+| VERICTO-091 | Stage unload or file transfer | `COPY INTO @stage \| @~ \| 's3://…' \| 'azure://…' \| 'gcs://…'` (an unload), `GET @stage`, `PUT … @stage` — data or files leave through a stage or an external location. Security; never softened by a channel cap. (Snowflake.) |
+| VERICTO-092 | External stage or integration | `CREATE`/`ALTER STAGE` with `URL =` or inline `CREDENTIALS`, `CREATE STORAGE \| EXTERNAL ACCESS \| API INTEGRATION`, `CREATE EXTERNAL FUNCTION`, an egress `CREATE NETWORK RULE` — a path out of the account. Security. (Snowflake.) |
+| VERICTO-093 | Share to another account | `GRANT … TO SHARE`, `CREATE SHARE`, `ALTER SHARE … ADD \| SET ACCOUNTS`, `CREATE LISTING` — data leaves the account. `GRANT … TO SHARE` is also a GRANT (VERICTO-082). Security. (Snowflake.) |
 
 ### High
 
@@ -166,11 +174,15 @@ Low/Informational → Monitor).
 | VERICTO-031 | UPDATE in CTE without WHERE | A data-modifying CTE (`WITH x AS (UPDATE … )`) whose `UPDATE` has no WHERE. |
 | VERICTO-033 | DELETE in subquery/CTE without WHERE | A nested `DELETE` with no WHERE inside a subquery or CTE. |
 | VERICTO-040 | INSERT INTO … SELECT without filter | `INSERT … SELECT` whose source has no filter — copies every source row. |
-| VERICTO-070 | SLEEP() / PG_SLEEP() | A sleep-family call (`sleep`, `pg_sleep`, `pg_sleep_for`, `pg_sleep_until`) anywhere in the query — DoS / time-based blind injection probing. |
+| VERICTO-070 | SLEEP() / PG_SLEEP() | A sleep-family call (`sleep`, `pg_sleep`, `pg_sleep_for`, `pg_sleep_until`, Snowflake's `system$wait`) anywhere in the query — DoS / time-based blind injection probing. |
 | VERICTO-082 | GRANT / REVOKE | A `GRANT` or `REVOKE` — privilege escalation or accidental lockout. |
 | VERICTO-083 | MERGE | `MERGE INTO …` — can mass-mutate the target like an UPDATE/DELETE with no effective WHERE. |
 | VERICTO-084 | CREATE TABLE AS SELECT | `CREATE TABLE … AS SELECT …` / `SELECT … INTO` — bulk data copy that can duplicate a whole table. |
 | VERICTO-085 | Read of a sensitive column | A query projects (or copies elsewhere) a column the host tagged as sensitive. Driven by `EnforcementPolicy::sensitive_columns`, not by the rules slice; High for `block`/`mask`, Medium for `flag`. See [Sensitive columns](#sensitive-columns-vericto-085). |
+| VERICTO-094 | Recovery reduced | `DATA_RETENTION_TIME_IN_DAYS = 0` (table, schema, database, account), `ALTER ACCOUNT`, `CREATE OR REPLACE TABLE \| SCHEMA \| DATABASE` (drops an existing object of that name), `INSERT OVERWRITE` (replaces every row), `UNDROP` (can shadow a newer object). SchemaMigration: a CI channel's `schema_migration_cap` softens it like DROP TABLE. (Snowflake.) |
+| VERICTO-095 | Warehouse cost | `CREATE`/`ALTER WAREHOUSE` setting `WAREHOUSE_SIZE`, a cluster count, a type, a scaling policy, query acceleration or a never-suspend `AUTO_SUSPEND` (`0`/`NULL`); `ALTER RESOURCE MONITOR`. A warehouse created with the defaults is not reported. Performance. (Snowflake.) |
+| VERICTO-096 | Code that runs later | `CREATE TASK \| STREAM \| PIPE \| PROCEDURE \| FUNCTION \| ALERT` (`OR REPLACE`/`OR ALTER` too), `ALTER TASK … RESUME \| MODIFY AS`, `EXECUTE TASK \| ALERT …` — embedded statements run later, outside any check. Security. (Snowflake.) |
+| VERICTO-097 | Role switch | `USE ROLE r` (the evidence names an administrative role: `ACCOUNTADMIN`, `SECURITYADMIN`, `SYSADMIN`, `USERADMIN`, `ORGADMIN`), `USE SECONDARY ROLES ALL \| <roles>`. `USE SECONDARY ROLES NONE` only narrows privileges and is not reported. Security. (Snowflake.) |
 | VERICTO-087 | Access outside the agent's allowlist | The identity making the call (an API key, or the database user of a proxy session) references a table, column or write target its allowlist does not grant, or runs DDL. Every reference counts, predicates included. Driven by `EnforcementPolicy::access_policy`, not by the rules slice; blocks under `mode = enforce`, flags under `observe`. See [Agent access allowlists](#agent-access-allowlists-vericto-087). |
 
 ### Medium
@@ -446,6 +458,41 @@ utf8mb4 tables with a non-default collation and a latin1 table, and compares the
 masked values with the Postgres ones (set `VERICTO_EQUIV_MYSQL` to a JSON
 connection object or array, with the `mysql2` Node driver on `NODE_PATH`).
 
+### Mask rewrite (Snowflake)
+
+Printed back from the sqlparser tree, as on MySQL, with the same three checks:
+the unmodified statement must print back to the client's own tokens (keyword and
+unquoted-identifier case, and an inserted `AS`, are the only differences
+allowed; string literals and quoted names compare verbatim), the rewrite must
+parse back to itself, and its bind parameters (`?`, `:1`, `:name`) must be the
+client's, in the client's order. Any failure **blocks**. The masks return what
+the Postgres masks return for the same text (NULL stays NULL except under
+`full`):
+
+| Style | Expression (`x` = `TO_VARCHAR(col)`) |
+|---|---|
+| `full` | `'[redacted]'` (a computed value or one holding a bind parameter: `CONCAT('[redacted]', COALESCE(LEFT(x, 0), ''))`) |
+| `last4` | `CONCAT('****', RIGHT(x, 4))` |
+| `email` | `CASE WHEN LENGTH(x) = 0 THEN x WHEN CHARINDEX('@', x, 2) > 0 THEN CONCAT(LEFT(x, 1), '***', SUBSTR(x, CHARINDEX('@', x, 2))) ELSE CONCAT(LEFT(x, 1), '***') END` |
+| `hash` | `SHA2(x, 256)` |
+
+`email` is written without `REGEXP_REPLACE`: a regular expression that fails to
+match (a newline, an escape read differently) returns the value unmasked, and
+this form cannot. A masked projection keeps the client's column name: an alias
+is kept as written, and a bare column is aliased with its own identifier (`email`
+is still `EMAIL`, `"Email"` still `Email`). An unaliased expression over a masked
+column has a name Snowflake derives from its text, so it **blocks**: alias it.
+A `VARIANT` path (`v:email`) masks the whole projected value, and `FLATTEN`
+output derived from a masked column is masked `full`. Also blocked: `ORDER BY`,
+`GROUP BY`, `HAVING` or `QUALIFY` naming a masked output (or its position).
+When a Snowflake masking policy already protects the column, the rewrite runs on
+top of it: harmless, but the client sees the engine's mask of the policy's
+output.
+
+The rewrites are pinned by golden outputs (`tests/snowflake.rs`); there is no
+Snowflake emulator, so an equivalence run against a real account, like the
+Postgres and MySQL ones, is not part of this repository's CI.
+
 ## Agent access allowlists (VERICTO-087)
 
 Sensitive-column tags are a denylist that applies to every caller. An agent
@@ -538,7 +585,32 @@ because a predicate lets an agent probe a value it may not read. Every table in
   An entry naming a schema matches that schema, and the unqualified name where
   the default schema is known to be it (`public`, `dbo`). An empty `schema` is no
   schema.
-- **Identifier case follows the dialect.** Postgres: unquoted names fold to lower
+- **Snowflake names are three-part** (`database.schema.table`). An entry may
+  name its `database` (alias `database_name`); the host names the connection's
+  current database and schema in `AccessPolicy::default_database` and
+  `default_schema`, as stored (`CURRENT_DATABASE()`, `CURRENT_SCHEMA()`). An
+  entry without a database is the table in the default database; with neither
+  known, only names written without a database match it. `db..t` is
+  `db.PUBLIC.t`. `INFORMATION_SCHEMA` (in every database) and the shared
+  `SNOWFLAKE` database (`ACCOUNT_USAGE`, …) are the catalogue: denied unless an
+  entry names them. A stage (`@stage`, `@~`, `@%t`) is data: reading staged
+  files needs an entry whose `table` is the stage (`"@raw_stage"`). Dynamic
+  names (`IDENTIFIER(…)`, `TABLE($var)`) and table functions that may read
+  anything (`RESULT_SCAN`, `INFORMATION_SCHEMA.QUERY_HISTORY()`, user table
+  functions) are denied; `FLATTEN`, `SPLIT_TO_TABLE`, `STRTOK_SPLIT_TO_TABLE`
+  and `GENERATOR` read only their arguments. `COPY INTO`, `PUT`, `LIST`,
+  `CREATE STAGE`, `CREATE WAREHOUSE`, scripting blocks and every statement only
+  the pre-classifier recognised are denied outright; `ALTER SESSION SET` is
+  allowed for formatting, tagging and timeout parameters only
+  (`QUOTED_IDENTIFIERS_IGNORE_CASE`, which changes how names resolve, is denied).
+- **Identifier case follows the dialect.** Snowflake is Postgres's mirror image:
+  unquoted names fold to **upper** case and quoted names compare exactly, in the
+  query and in the entry alike (an entry `orders` is `ORDERS`; `"orders"` is a
+  different table). Under `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` quoted names
+  fold too: the host says which in `AccessPolicy::quoted_identifiers_ignore_case`
+  (`true`/`false`); when it does not, both readings are checked and a reference
+  either one denies is denied.
+  Postgres: unquoted names fold to lower
   case and quoted names compare exactly, in the query and in the entry alike —
   an entry `Customers` is `customers`; a case-sensitive name is sent quoted,
   `"Customers"` (an embedded `"` doubled), in `schema`, `table` or a column.
@@ -608,6 +680,65 @@ into a flag. `EvaluationOutcome::access_denied` lists every denied reference
 (`{"schema", "table", "column", "needed": "read" | "write" | "ddl"}`), also in
 `observe` mode.
 
+## Snowflake
+
+Snowflake is parsed with sqlparser's `SnowflakeDialect` and walked by the same
+sqlparser walker as MySQL, Oracle and SQL Server, which records the Snowflake
+statement kinds for the rules: `COPY INTO` (table ← stage is a load, stage ←
+query an unload), `CREATE`/`DROP STAGE`, `PUT`, `LIST`, `USE`, `EXECUTE
+IMMEDIATE`, scripting blocks (`BEGIN … END`), time travel (`AT`/`BEFORE`),
+semi-structured paths (`:`, `[]`, `FLATTEN`), `QUALIFY`, `MERGE`, `GRANT … TO
+SHARE`, warehouses, three-part names and `IDENTIFIER()`.
+
+**What the engine cannot read fails closed.** On Snowflake a parse error is
+**blocked** whatever `parse_error` says, because the statements sqlparser does
+not read are disproportionately the dangerous ones (tasks, shares, stage
+transfers, account changes). Two host levers soften it: `monitor_mode` (the
+host's `parse_error` applies, as everywhere) and `schema_migration_cap` (a CI
+channel that reports migration DDL instead of blocking it reports this at most
+that strongly too). A `block`/`mask` tag or an enforced allowlist still forces
+the block. Hosts that branch on the parse-error action themselves get this from
+`EnforcementPolicy::effective_parse_error_for(sql, Dialect::Snowflake)`.
+
+**The pre-classifier.** When (and only when) sqlparser rejects a single
+statement, its leading keywords are matched against the known-dangerous kinds:
+`UNDROP`, `GET`/`PUT`, `CREATE [OR REPLACE | OR ALTER] TASK | STREAM | PIPE |
+PROCEDURE | FUNCTION | ALERT | SHARE | LISTING | … INTEGRATION | NETWORK RULE |
+STAGE | WAREHOUSE`, `ALTER WAREHOUSE | RESOURCE MONITOR | ACCOUNT | SHARE | STAGE
+| TASK`, `ALTER TABLE … DROP ROW ACCESS POLICY | UNSET MASKING POLICY`,
+`DATA_RETENTION_TIME_IN_DAYS = 0`, `DROP DYNAMIC | ICEBERG | EXTERNAL TABLE`,
+`CLONE`, `DECLARE … BEGIN … END`. A match becomes a finding of the rule that
+names it, so the report says what the statement is; anything else stays a parse
+error. A pre-classified statement, a scripting block and `EXECUTE IMMEDIATE` are
+**unread code**: the outcome is the stricter of the findings and the parse-error
+outcome, so a finding the host set to flag (or no rule at all) cannot let one
+through.
+
+**The standard rules on Snowflake** (design §4.2; `tests/snowflake.rs` holds the
+matrix):
+
+- **Direct** (same predicate): 001, 003, 010, 011, 012, 013, 015, 016 (`ALTER
+  TABLE … SWAP WITH` counts as a rename), 017, 018, 030, 040, 042, 051, 060, 061,
+  083, 090.
+- **Variants**: 019 (`DROP ROW ACCESS POLICY`, `UNSET MASKING POLICY`), 050
+  (`TOP n`, a fixed-size `SAMPLE (n ROWS)` and `RESULT_SCAN` bound a read; a
+  percentage sample does not), 070 (`system$wait`), 080 (no `PROGRAM` form; the
+  exfiltration path is the unload, VERICTO-091), 081 (`EXECUTE IMMEDIATE`,
+  scripting blocks), 082 (`GRANT ROLE`, `GRANT OWNERSHIP`, `GRANT … TO SHARE`),
+  084 (CTAS, and `CLONE` of a table, schema or database; `CREATE TABLE … LIKE`
+  copies no rows and is not reported), 085 (the Snowflake mask rewrite above),
+  087 (Snowflake identifier semantics above).
+- **Not applicable** (the construct does not exist; the rule stays in the
+  catalogue and never fires on Snowflake): 002 (no `DELETE … LIMIT`), 031 and
+  033 (no data-modifying CTEs), 086 (MySQL's lexical ambiguity).
+
+The Snowflake rules VERICTO-091 to VERICTO-097 are in the tables above; they read
+only what the Snowflake walker and pre-classifier record, so they never fire on
+another dialect. `tests/snowflake_corpus.rs` pins how the engine reads a corpus
+of public Snowflake SQL (rendered dbt models and the DDL around them, the
+statements dbt-snowflake sends, sqlglot's Snowflake tests) and prints its parse
+rate.
+
 ## Custom rules (YAML)
 
 You can define domain-specific rules using YAML AST conditions. A rule has a
@@ -659,16 +790,18 @@ vericto-engine/
 │   ├── lib.rs          ← public API + evaluate() convenience fn
 │   ├── error.rs        ← ProxyError, Result
 │   ├── access/         ← VERICTO-087: agent allowlists — policy types, statement classes, verdict (runs the sensitive/ walkers in access mode)
-│   ├── sensitive/      ← VERICTO-085: sensitive-column derivation + mask rewrite (pg.rs, sql.rs, mysql.rs)
+│   ├── sensitive/      ← VERICTO-085: sensitive-column derivation + mask rewrite (pg.rs, sql.rs, mysql.rs, snowflake.rs)
 │   │   ├── mod.rs      ← tags, scopes, lineage, verdict
 │   │   ├── pg.rs       ← pg_query walker + rewrite
-│   │   └── sql.rs      ← sqlparser walker (MySQL/Oracle/MSSQL)
+│   │   ├── sql.rs      ← sqlparser walker (MySQL/Oracle/MSSQL/Snowflake)
+│   │   └── snowflake.rs ← Snowflake mask expressions + print-back checks
 │   ├── parser/
 │   │   ├── mod.rs      ← SqlParser trait, parser_for(), Dialect enum
 │   │   ├── postgres.rs ← pg_query backend
 │   │   ├── mysql.rs    ← sqlparser-rs backend
 │   │   ├── oracle.rs   ← sqlparser-rs backend
 │   │   ├── mssql.rs    ← sqlparser-rs backend
+│   │   ├── snowflake.rs ← sqlparser-rs backend + keyword pre-classifier
 │   │   ├── pg_ast.rs   ← pg_query AST normalization
 │   │   └── walk.rs     ← AST traversal helpers
 │   └── rules/

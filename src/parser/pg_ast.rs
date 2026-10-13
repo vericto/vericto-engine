@@ -40,6 +40,7 @@ pub fn parse_postgres(sql: &str) -> Result<ParsedQuery> {
         statements: out,
         ast: crate::parser::SourceAst::Pg(std::sync::Arc::new(result.protobuf)),
         mysql: None,
+        unread: None,
     })
 }
 

@@ -18,6 +18,7 @@ use Dialect::*;
 
 fn entry(table: &str, cols: &[&str], access: AccessLevel) -> AccessEntry {
     AccessEntry {
+        database: None,
         schema: None,
         table: table.into(),
         columns: if cols == ["*"] {
@@ -42,6 +43,8 @@ fn allow(entries: Vec<AccessEntry>) -> AccessPolicy {
         entries,
         ddl: DdlPolicy::Deny,
         default_schema: None,
+        default_database: None,
+        quoted_identifiers_ignore_case: None,
     }
 }
 
