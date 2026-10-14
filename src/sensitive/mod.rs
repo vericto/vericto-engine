@@ -960,8 +960,9 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, cols: &[SensitiveColumn]) -> Option
         SourceAst::Pg(_) => Dialect::Postgres,
         SourceAst::Sql { dialect, .. } => *dialect,
         // Snowflake text only the pre-classifier recognised has no tree: it
-        // is unread code, whose parse-error floor fails closed under a
-        // protective tag (see `ParsedQuery::unread`).
+        // is unread code, whose parse-error floor blocks under a protective
+        // tag (see `ParsedQuery::unread`); an allowlisted one reads no
+        // column.
         SourceAst::None | SourceAst::Classified { .. } => return None,
     };
     let analysis = match &parsed.ast {
@@ -1178,13 +1179,7 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, cols: &[SensitiveColumn]) -> Option
 }
 
 fn dialect_name(d: Dialect) -> &'static str {
-    match d {
-        Dialect::Postgres => "postgres",
-        Dialect::Mysql => "mysql",
-        Dialect::Oracle => "oracle",
-        Dialect::MsSql => "mssql",
-        Dialect::Snowflake => "snowflake",
-    }
+    d.as_str()
 }
 
 #[cfg(test)]

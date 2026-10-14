@@ -198,7 +198,12 @@ impl AccessColumns {
 /// Snowflake names are three-part: `database` (alias `database_name`) is the
 /// database the table is in; null, empty or absent is the host's
 /// [`AccessPolicy::default_database`]. Ignored on every other dialect.
+///
+/// `#[non_exhaustive]` since 4.0.0: build one with [`AccessEntry::new`] (and
+/// [`in_schema`](AccessEntry::in_schema) / [`in_database`](AccessEntry::in_database)),
+/// or from JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AccessEntry {
     #[serde(
         default,
@@ -221,7 +226,11 @@ pub struct AccessEntry {
 ///
 /// JSON: `{"mode":"enforce","ddl":"deny","entries":[…]}`; every field is
 /// optional (`enforce`, `deny`, `[]`).
+///
+/// `#[non_exhaustive]` since 4.0.0: build one with [`AccessPolicy::new`] or
+/// `AccessPolicy::default()` and set the fields, or from JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AccessPolicy {
     #[serde(default)]
     pub mode: AccessMode,
@@ -254,6 +263,44 @@ pub struct AccessPolicy {
     /// Ignored on every other dialect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quoted_identifiers_ignore_case: Option<bool>,
+}
+
+impl AccessEntry {
+    /// An entry for `table` in the default schema (and, on Snowflake, the
+    /// default database).
+    pub fn new(table: impl Into<String>, columns: AccessColumns, access: AccessLevel) -> Self {
+        Self {
+            database: None,
+            schema: None,
+            table: table.into(),
+            columns,
+            access,
+        }
+    }
+
+    /// The same entry in `schema`.
+    pub fn in_schema(mut self, schema: impl Into<String>) -> Self {
+        self.schema = Some(schema.into());
+        self
+    }
+
+    /// The same entry in `database` (Snowflake).
+    pub fn in_database(mut self, database: impl Into<String>) -> Self {
+        self.database = Some(database.into());
+        self
+    }
+}
+
+impl AccessPolicy {
+    /// A policy with `mode` and `entries`; every other field at its default
+    /// (DDL denied, no host defaults).
+    pub fn new(mode: AccessMode, entries: Vec<AccessEntry>) -> Self {
+        Self {
+            mode,
+            entries,
+            ..Self::default()
+        }
+    }
 }
 
 /// The policies of a database, keyed by database user, as the TCP proxy

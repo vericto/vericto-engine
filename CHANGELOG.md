@@ -7,16 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [3.10.0] — 2026-10-13
+## [4.0.0] — 2026-10-13
 
-Snowflake becomes a dialect: `Dialect::Snowflake` (`"snowflake"`), parsed with
-sqlparser's `SnowflakeDialect`, with seven Snowflake rules, Snowflake identifier
-semantics for agent allowlists, a Snowflake mask rewrite and a fail-closed
-default for text the engine cannot read. **Nothing changes for the other
-dialects**: every verdict of the SQL in the test suites and fixtures of the
-engine, the proxy and the sidecar was compared with 3.9.0 on PostgreSQL, MySQL,
-Oracle and SQL Server under seven policies (41,216 verdicts) and none differs.
-No sqlparser type is part of the public API.
+A major release: Snowflake becomes a dialect, and the public types that grow
+release after release become `#[non_exhaustive]`, so a future dialect, statement
+kind or policy field is no longer a breaking change (see **Migrating from 3.x**
+below). 3.10.0 was never tagged; its changes are this release.
+
+Snowflake: `Dialect::Snowflake` (`"snowflake"`), parsed with sqlparser's
+`SnowflakeDialect`, with seven Snowflake rules, Snowflake identifier semantics for
+agent allowlists, a Snowflake mask rewrite, and, for the statements sqlparser
+0.63 does not read, a keyword pre-classifier (dangerous kinds become findings)
+and an allowlist (legitimate forms are analysed with no finding). **Nothing
+changes for the other dialects**: every verdict of the SQL in the test suites
+and fixtures of the engine, the proxy and the sidecar was compared with 3.9.0
+on PostgreSQL, MySQL, Oracle and SQL Server under seven policies (41,216
+verdicts) and none differs. No sqlparser type is part of the public API.
 
 ### Added
 
@@ -40,9 +46,27 @@ No sqlparser type is part of the public API.
   0`, `DROP DYNAMIC | ICEBERG | EXTERNAL TABLE`, `CLONE`, `DECLARE` blocks). It
   runs only when the parse fails, on a single statement, matching leading
   keywords outside strings and comments, and turns the statement into a finding
-  of the rule that names it. It never widens an outcome: a pre-classified
-  statement, a scripting block and `EXECUTE IMMEDIATE`/`EXECUTE TASK` are unread
-  code, whose outcome is the stricter of the findings and the parse-error one.
+  of the rule that names it (GRANT/REVOKE forms sqlparser does not read stay
+  VERICTO-082). It never widens an outcome: a pre-classified statement, a
+  scripting block and `EXECUTE IMMEDIATE`/`EXECUTE TASK` are unread code, whose
+  outcome is the stricter of the findings and the parse-error one.
+- **An allowlist** of legitimate Snowflake statements sqlparser 0.63 rejects,
+  analysed with no finding (no parse error, no SchemaMigration flag: on the
+  dialects whose parser reads the same DDL, no rule reports it either).
+  Each entry is an anchored pattern over the whole statement (head keywords,
+  names, literal values), so anything more, a second statement or a `$$` body
+  anywhere but a comment value is not on it: `COMMENT ON … IS '…'|$$…$$`,
+  `ALTER [MATERIALIZED] VIEW … SET|UNSET SECURE / COMMENT`, `ALTER DYNAMIC TABLE
+  … SET TARGET_LAG|WAREHOUSE|COMMENT / REFRESH / SUSPEND / RESUME`, column and
+  table comments, `SET CHANGE_TRACKING | DEFAULT_DDL_COLLATION`, additive `ADD
+  COLUMN` (types only), `ADD ROW ACCESS POLICY`, `SET MASKING POLICY` (not
+  `FORCE`), `ALTER WAREHOUSE … SUSPEND|RESUME|ABORT ALL QUERIES`, `ALTER TASK …
+  SUSPEND`, `ALTER STAGE … REFRESH`, `CREATE TABLE (columns only)`, `CREATE
+  SEQUENCE`, `CREATE TAG`, internal `CREATE STAGE`, `DESCRIBE <object>`, `SHOW …`
+  (words and literals only), `UNSET <var>`, and `COPY INTO <table>` from its own
+  stage. Each entry is documented with an example and the reason on
+  `parser::snowflake::allowlisted`. Under an agent allowlist they are denied as
+  DDL, like every statement the parser does not read.
 - **Seven Snowflake rules** (design SF-1 to SF-7), which read only what the
   Snowflake walker and pre-classifier record and so never fire on another
   dialect. Proposed catalogue severities and classes:
@@ -100,33 +124,68 @@ No sqlparser type is part of the public API.
 - `system$wait` joins the sleep-family functions of VERICTO-070 (shared by both
   walkers, so it is detected on every dialect).
 - `tests/snowflake.rs` (walker cases, the rules × Snowflake matrix, every
-  Snowflake rule's positive and negative cases, fail-closed, VERICTO-087,
+  Snowflake rule's positive and negative cases, parse errors, the allowlist and
+  its near misses, VERICTO-087,
   VERICTO-085) and `tests/snowflake_corpus.rs`: 1,165 statements of public
   Snowflake SQL (rendered dbt models of `dbt-labs/jaffle_shop` and
   `get-select/dbt-snowflake-monitoring` with the DDL dbt-snowflake wraps them in,
   the statements dbt-snowflake sends, and the Snowflake tests of sqlglot; the
   sources and licences are in the fixture's header and `.LICENSES` file) with a
-  golden file of how each is read and its verdict. The engine reads the dbt
-  models 100%, the dbt-snowflake statements 89.1% and sqlglot's 91.5% (sqlparser
-  alone: 100%, 84.8%, 87.7%).
+  golden file of how each is read and its verdict. The engine recognises
+  (parses, pre-classifies or allowlists) the dbt models 100%, the dbt-snowflake
+  statements 100% and sqlglot's 94.1%, 94.7% overall (sqlparser alone: 100%,
+  84.8%, 87.7%; 88.3%).
+- `Dialect::as_str()`: the canonical lowercase name, accepted back by
+  `Dialect::parse_dialect`.
+- `AccessEntry::new`, `AccessEntry::in_schema`, `AccessEntry::in_database` and
+  `AccessPolicy::new`, to build what can no longer be built with a struct
+  literal outside the crate.
 
 ### Changed
 
-- **Snowflake parse errors fail closed by default**: unparseable Snowflake text
-  is blocked whatever `parse_error` says (the other dialects keep the
-  fail-open default). `monitor_mode` lets the host's `parse_error` apply, and a
-  `schema_migration_cap` of `Flag`/`Monitor` (the CI channel) caps it at the
-  host's `parse_error`; a `block`/`mask` tag or an enforced allowlist still
-  forces the block. `EnforcementPolicy::effective_parse_error_for(sql,
-  Dialect::Snowflake)` returns it, for hosts that branch on it themselves.
-- **Additive API changes**, as in earlier minor releases: the `Dialect::Snowflake`
-  variant, `parser::SnowflakeRisk` and `StatementInfo::snowflake`, and the new
-  public fields `AccessEntry::database`, `AccessPolicy::default_database` and
-  `AccessPolicy::quoted_identifiers_ignore_case`. A host that matches
-  exhaustively on `Dialect` needs a `Snowflake` arm, and one that builds an
-  `AccessEntry` or `AccessPolicy` with a struct literal needs the new fields
-  (`..AccessPolicy::default()` for the policy); building them from JSON is
-  unchanged.
+- **Snowflake parse errors resolve like on every dialect**: flagged by default
+  (`parse_error: allow_report`), blocked under `parse_error: block`, and
+  always blocked under a `block`/`mask` tag or an enforced agent allowlist.
+  `EnforcementPolicy::effective_parse_error_for(sql, Dialect::Snowflake)`
+  returns it, as for the other dialects. Unread code (above) keeps that
+  outcome as a floor under its findings.
+- **Breaking: `#[non_exhaustive]`** on `Dialect`, `parser::StatementKind`,
+  `parser::DropObjectKind`, `parser::AlterTableKind`, `parser::SnowflakeRisk`,
+  `parser::StatementInfo`, `AccessPolicy` and `AccessEntry`. Outside this crate
+  a `match` on one of the enums needs a wildcard arm, and the structs are built
+  with their constructors, `Default` or JSON instead of a struct literal (their
+  fields stay public, to read and to assign). Also new: the `Dialect::Snowflake`
+  variant, `StatementInfo::snowflake`, `AccessEntry::database`,
+  `AccessPolicy::default_database` and `AccessPolicy::quoted_identifiers_ignore_case`.
+  JSON shapes are unchanged: every new field is optional and not serialized
+  when unset.
+
+### Migrating from 3.x
+
+Hosts that build policies from JSON and do not `match` on `Dialect` need no
+change. Measured on the two first-party consumers:
+
+- **vericto-proxy** (does not compile as it is):
+  - `src/tcp/postgres.rs`, `fn dialect_name`: replace the `match` with
+    `dialect.as_str()` (its four names are the engine's).
+  - `src/tcp/query_limit.rs`, `fn dialect_cap`: replace the arm
+    `Dialect::Oracle | Dialect::MsSql => MYSQL_MAX_PACKET_LEN,` with
+    `_ => MYSQL_MAX_PACKET_LEN,` (every dialect it does not serve gets the
+    stricter cap, as the comment there intends).
+  - Its test `default_ruleset_has_the_engine_catalogue` then reports
+    VERICTO-091 to VERICTO-097 missing from the built-in fallback catalogue: add
+    them (Critical: 091, 092, 093; High: 094 to 097), or exclude the
+    Snowflake-only codes from that comparison, since the proxy serves no
+    Snowflake wire protocol.
+- **vericto-eval**: compiles and passes unchanged against 4.0.0. One of its
+  tests, `unparseable_session_boilerplate_keeps_the_hosts_parse_error`,
+  already fails against 3.9.0 (MySQL's `SET SESSION TRANSACTION …` parses since
+  3.9.0 and is allowed; see 3.9.0 below): update its expectation to `ALLOWED`.
+- Code outside this crate that builds an `AccessEntry` or `AccessPolicy`
+  literal: `AccessEntry::new("orders", AccessColumns::AllColumns,
+  AccessLevel::Read).in_schema("public")`, `AccessPolicy::new(AccessMode::Enforce,
+  entries)` then assign `default_schema` etc.; a `match` on `StatementKind`,
+  `DropObjectKind` or `AlterTableKind` gains a `_ => …` arm.
 
 ## [3.9.0] — 2026-10-12
 
@@ -1488,8 +1547,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v3.10.0...HEAD
-[3.10.0]: https://github.com/vericto/vericto-engine/compare/v3.9.0...v3.10.0
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.0.0...HEAD
+[4.0.0]: https://github.com/vericto/vericto-engine/compare/v3.9.0...v4.0.0
 [3.9.0]: https://github.com/vericto/vericto-engine/compare/v3.8.1...v3.9.0
 [3.8.1]: https://github.com/vericto/vericto-engine/compare/v3.8.0...v3.8.1
 [3.8.0]: https://github.com/vericto/vericto-engine/compare/v3.7.0...v3.8.0

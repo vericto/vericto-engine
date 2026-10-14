@@ -17,19 +17,36 @@ pub(crate) mod walk;
 use crate::error::{ProxyError, Result};
 
 /// Supported SQL dialect.
+///
+/// `#[non_exhaustive]` since 4.0.0: a dialect added later is not a breaking
+/// change, so a `match` outside this crate needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Dialect {
     Postgres,
     Mysql,
     Oracle,
     MsSql,
-    /// Snowflake (sqlparser's `SnowflakeDialect`). Unlike the other dialects,
-    /// text the engine cannot read fails closed by default (see
-    /// [`crate::EnforcementPolicy::effective_parse_error_for`]).
+    /// Snowflake (sqlparser's `SnowflakeDialect`, with a keyword
+    /// pre-classifier and an allowlist for the statements it does not read;
+    /// see [`snowflake`]).
     Snowflake,
 }
 
 impl Dialect {
+    /// The canonical lowercase name (`postgres`, `mysql`, `oracle`, `mssql`,
+    /// `snowflake`), accepted back by [`Dialect::parse_dialect`]. Since 4.0.0,
+    /// so a host reporting the dialect does not need its own `match`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Dialect::Postgres => "postgres",
+            Dialect::Mysql => "mysql",
+            Dialect::Oracle => "oracle",
+            Dialect::MsSql => "mssql",
+            Dialect::Snowflake => "snowflake",
+        }
+    }
+
     pub fn parse_dialect(s: &str) -> Result<Self> {
         match s.to_ascii_lowercase().as_str() {
             "postgres" | "postgresql" => Ok(Dialect::Postgres),
@@ -42,8 +59,9 @@ impl Dialect {
     }
 }
 
-/// Statement type detected in the AST.
+/// Statement type detected in the AST. `#[non_exhaustive]` since 4.0.0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StatementKind {
     Delete,
     Update,
@@ -74,6 +92,7 @@ pub enum StatementKind {
 /// and the Snowflake pre-classifier only, so these rules never fire on
 /// another dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SnowflakeRisk {
     /// Data or files leave through a stage: `COPY INTO @stage | 's3://…'`
     /// (unload), `GET`, `PUT` (VERICTO-091).
@@ -101,8 +120,9 @@ pub enum SnowflakeRisk {
     RoleSwitch,
 }
 
-/// Object type in a DROP statement.
+/// Object type in a DROP statement. `#[non_exhaustive]` since 4.0.0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DropObjectKind {
     Table,
     Database,
@@ -130,8 +150,9 @@ impl DropObjectKind {
     }
 }
 
-/// Subtype of an ALTER TABLE command.
+/// Subtype of an ALTER TABLE command. `#[non_exhaustive]` since 4.0.0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AlterTableKind {
     DropColumn,
     Rename,
@@ -171,8 +192,11 @@ pub enum WherePresence {
     AlwaysTrue,
 }
 
-/// Normalized information for a single AST statement.
+/// Normalized information for a single AST statement. `#[non_exhaustive]`
+/// since 4.0.0: built by the parsers; read its fields, or start from
+/// `StatementInfo::default()`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StatementInfo {
     pub kind: StatementKind,
     /// Name of the primary relation affected, if extractable.
@@ -283,7 +307,8 @@ pub struct ParsedQuery {
     /// scripting block, `EXECUTE IMMEDIATE`, a statement only the
     /// pre-classifier recognised). The rule engine then keeps the stricter of
     /// the rules' outcome and the parse-error outcome, so whatever the
-    /// engine cannot read still fails closed. `None` everywhere else.
+    /// engine cannot read is never treated more leniently than a parse
+    /// error. `None` everywhere else.
     pub(crate) unread: Option<String>,
 }
 

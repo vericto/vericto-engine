@@ -4,8 +4,8 @@
 //! the header of `tests/fixtures/snowflake_corpus.sql` and its `.LICENSES`).
 //!
 //! For every statement the golden file pins how the engine reads it
-//! (`parsed`, `preclassified` by its keywords, or `unread`: a parse error,
-//! which fails closed on Snowflake) and its verdict under the catalogue, so a
+//! (`parsed`, `preclassified` by its keywords, `allowlisted`, or `unread`: a
+//! parse error) and its verdict under the catalogue, so a
 //! sqlparser upgrade or a walker change that moves any of them is a reviewed
 //! diff. The rates are printed (`cargo test --test snowflake_corpus --
 //! --nocapture`) and pinned as floors.
@@ -89,8 +89,15 @@ fn entries() -> Vec<(String, String)> {
 
 /// How the engine reads `sql`.
 fn reading(sql: &str) -> &'static str {
-    if parser_for(Dialect::Snowflake).parse(sql).is_err() {
+    let Ok(parsed) = parser_for(Dialect::Snowflake).parse(sql) else {
         return "unread";
+    };
+    if parsed
+        .statements
+        .first()
+        .is_some_and(|s| s.ast_node_path.starts_with("Allowlisted >"))
+    {
+        return "allowlisted";
     }
     // A pre-classified statement is unread code: with no rule, its outcome is
     // the parse-error floor, which names the pre-classifier.
@@ -122,8 +129,8 @@ fn snowflake_corpus_parse_rate_and_verdicts() {
     let entries = entries();
     assert!(entries.len() > 1000, "corpus not read: {}", entries.len());
     let mut golden = String::new();
-    // (n, raw sqlparser, parsed, preclassified) per group.
-    let mut stats: std::collections::BTreeMap<&str, [usize; 4]> = Default::default();
+    // (n, raw sqlparser, parsed, preclassified, allowlisted) per group.
+    let mut stats: std::collections::BTreeMap<&str, [usize; 5]> = Default::default();
     for (i, (source, sql)) in entries.iter().enumerate() {
         let raw = sqlparser::parser::Parser::parse_sql(&SnowflakeDialect {}, sql).is_ok();
         let read = reading(sql);
@@ -132,6 +139,7 @@ fn snowflake_corpus_parse_rate_and_verdicts() {
         s[1] += raw as usize;
         s[2] += (read == "parsed") as usize;
         s[3] += (read == "preclassified") as usize;
+        s[4] += (read == "allowlisted") as usize;
         let o = evaluate(sql, Dialect::Snowflake, &rules, &policy);
         golden.push_str(&format!(
             "{i}\t{read}\t{:?}\t{}\n",
@@ -139,25 +147,36 @@ fn snowflake_corpus_parse_rate_and_verdicts() {
             o.rule_code.as_deref().unwrap_or("-")
         ));
     }
-    for (g, [n, raw, parsed, pre]) in &stats {
-        let pct = |x: usize| 100.0 * x as f64 / *n as f64;
+    let mut total = [0usize; 5];
+    for (g, s) in &stats {
+        let [n, raw, parsed, pre, allow] = *s;
+        for k in 0..5 {
+            total[k] += s[k];
+        }
+        let pct = |x: usize| 100.0 * x as f64 / n as f64;
         println!(
-            "{g}: {n} statements; sqlparser 0.63 parses {raw} ({:.1}%); the engine reads {parsed} ({:.1}%), pre-classifies {pre}, together {} ({:.1}%)",
-            pct(*raw),
-            pct(*parsed),
-            parsed + pre,
-            pct(parsed + pre)
+            "{g}: {n} statements; sqlparser 0.63 parses {raw} ({:.1}%); the engine recognises {} ({:.1}%): {parsed} parsed, {pre} pre-classified, {allow} allowlisted",
+            pct(raw),
+            parsed + pre + allow,
+            pct(parsed + pre + allow)
         );
     }
-    // Floors measured with 3.10.0: a change that reads less fails here even
-    // before the golden comparison.
+    let [n, raw, parsed, pre, allow] = total;
+    println!(
+        "all: {n} statements; sqlparser 0.63 parses {raw} ({:.1}%); recognised {} ({:.1}%)",
+        100.0 * raw as f64 / n as f64,
+        parsed + pre + allow,
+        100.0 * (parsed + pre + allow) as f64 / n as f64
+    );
+    // Floors measured with 4.0.0: a change that recognises less fails here
+    // even before the golden comparison.
     let rate = |g: &str| {
-        let [n, _, parsed, pre] = stats[g];
-        (parsed + pre) as f64 / n as f64
+        let [n, _, parsed, pre, allow] = stats[g];
+        (parsed + pre + allow) as f64 / n as f64
     };
     assert!(rate("dbt models") >= 1.0, "{stats:?}");
-    assert!(rate("dbt-snowflake") >= 0.89, "{stats:?}");
-    assert!(rate("sqlglot") >= 0.91, "{stats:?}");
+    assert!(rate("dbt-snowflake") >= 1.0, "{stats:?}");
+    assert!(rate("sqlglot") >= 0.94, "{stats:?}");
 
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(GOLDEN);
     if std::env::var_os("VERICTO_CORPUS_BLESS").is_some() {

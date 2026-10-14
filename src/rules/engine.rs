@@ -278,22 +278,17 @@ impl EnforcementPolicy {
     /// Hosts that parse themselves and branch on the parse-error action must
     /// call this (with the client's text) instead of `effective_parse_error`.
     ///
-    /// **Snowflake fails closed by default**: text the engine cannot read is
-    /// blocked whatever `parse_error` says, because the Snowflake statements
-    /// sqlparser rejects are disproportionately the dangerous ones (tasks,
-    /// shares, stage transfers, account changes). Two levers soften it, both
-    /// the host's: `monitor_mode` (dry-run: the host's `parse_error` applies,
-    /// as on every dialect) and `schema_migration_cap` (a CI channel that
-    /// reports migration DDL instead of blocking it reports this at most
-    /// that strongly too).
+    /// Snowflake follows the same rule as every dialect (fail-open flag by
+    /// default; block under `parse_error: block`, a `block`/`mask` tag or an
+    /// enforced allowlist). Its statements sqlparser does not read but the
+    /// engine knows are either findings (the pre-classifier) or, for a short
+    /// allowlist of legitimate forms, analysed with no finding (see
+    /// `parser::snowflake`).
     pub fn effective_parse_error_for(
         &self,
         sql: &str,
         dialect: crate::parser::Dialect,
     ) -> ParseErrorAction {
-        if dialect == crate::parser::Dialect::Snowflake {
-            return self.snowflake_parse_error();
-        }
         let forced = self.effective_parse_error();
         // The session list is only consulted when a protection would force
         // the block: with neither, this is exactly `effective_parse_error`.
@@ -301,22 +296,6 @@ impl EnforcementPolicy {
             self.parse_error
         } else {
             forced
-        }
-    }
-
-    /// The parse-error action on Snowflake (see
-    /// [`effective_parse_error_for`](Self::effective_parse_error_for)).
-    pub(crate) fn snowflake_parse_error(&self) -> ParseErrorAction {
-        if self.monitor_mode {
-            return self.effective_parse_error();
-        }
-        match self.schema_migration_cap {
-            Some(EnforcementAction::Block) | None => ParseErrorAction::Block,
-            // A protective tag or an enforced allowlist still forces the
-            // block: the cap softens DDL, not data protection.
-            Some(EnforcementAction::Flag | EnforcementAction::Monitor) => {
-                self.effective_parse_error()
-            }
         }
     }
 
@@ -578,10 +557,12 @@ impl RuleEngine {
 
     /// Snowflake code the engine did not read (a scripting block, `EXECUTE
     /// IMMEDIATE`, a statement only the pre-classifier recognised): the
-    /// parse-error outcome is a floor. The findings keep the flat fields
-    /// unless the parse-error outcome is strictly stricter (a rule the host
-    /// set to flag, or none at all), so what cannot be read still fails
-    /// closed and what was recognised is still named in the report.
+    /// parse-error outcome is a floor, resolved as for any parse error (a
+    /// flag by default, a block under `parse_error: block`, a protective tag
+    /// or an enforced allowlist). The findings keep the flat fields unless
+    /// the floor is strictly stricter, so what cannot be read is never
+    /// treated more leniently than a parse error, and what was recognised is
+    /// still named in the report.
     fn with_unread(
         outcome: EvaluationOutcome,
         parsed: &ParsedQuery,
@@ -590,7 +571,7 @@ impl RuleEngine {
         let Some(why) = parsed.unread.as_deref() else {
             return outcome;
         };
-        let floor = parse_error_outcome_as(why, policy.snowflake_parse_error());
+        let floor = parse_error_outcome(why, policy);
         if strictness(&floor) > strictness(&outcome) {
             let mut floor = floor;
             // Keep the audit trail (the decision comes from the floor alone).

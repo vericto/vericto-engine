@@ -139,8 +139,8 @@ fn snowflake_unread(stmt: &Statement) -> Option<&'static str> {
 /// On Snowflake (a dialect 0.52 never served) the kinds the Snowflake walker
 /// models are analysed: `CREATE WAREHOUSE`, `ALTER SESSION`, `PUT`, `LIST`
 /// and scripting blocks (whose statements are classified here in turn).
-/// Everything else Snowflake-only stays a parse error, which fails closed on
-/// Snowflake.
+/// Everything else Snowflake-only stays a parse error (the Snowflake parser
+/// then tries its pre-classifier and allowlist).
 pub(crate) fn not_analysed(stmt: &Statement, dialect: Dialect) -> Option<&'static str> {
     use sqlparser::ast::{ContextModifier, Set};
     match stmt {
@@ -884,7 +884,7 @@ fn walk_snowflake(
             | Use::Default => {}
         },
         // `EXECUTE IMMEDIATE '…'` runs text the engine never parses: like a
-        // DO block (VERICTO-081), and unread (fail-closed).
+        // DO block (VERICTO-081), and unread (the parse-error floor).
         Statement::Execute {
             immediate: true, ..
         } => out.push(StatementInfo {

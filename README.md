@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.10.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.0.0" }
 ```
 
 ### Quick example
@@ -121,7 +121,7 @@ already ran every rule and simply discarded the rest.
 | MySQL      | `sqlparser-rs` 0.63                  | host's `parse_error` (fail-open: flag) |
 | SQL Server | `sqlparser-rs` 0.63                  | host's `parse_error` (fail-open: flag) |
 | Oracle     | `sqlparser-rs` 0.63                  | host's `parse_error` (fail-open: flag) |
-| Snowflake  | `sqlparser-rs` 0.63 (`SnowflakeDialect`) + keyword pre-classifier | **block** (fail-closed); see [Snowflake](#snowflake) |
+| Snowflake  | `sqlparser-rs` 0.63 (`SnowflakeDialect`) + keyword pre-classifier and allowlist | host's `parse_error` (fail-open: flag); see [Snowflake](#snowflake) |
 
 `Dialect::parse_dialect` accepts `postgres`/`postgresql`, `mysql`, `oracle`,
 `mssql`/`sqlserver`/`tsql` and `snowflake`.
@@ -690,29 +690,55 @@ IMMEDIATE`, scripting blocks (`BEGIN … END`), time travel (`AT`/`BEFORE`),
 semi-structured paths (`:`, `[]`, `FLATTEN`), `QUALIFY`, `MERGE`, `GRANT … TO
 SHARE`, warehouses, three-part names and `IDENTIFIER()`.
 
-**What the engine cannot read fails closed.** On Snowflake a parse error is
-**blocked** whatever `parse_error` says, because the statements sqlparser does
-not read are disproportionately the dangerous ones (tasks, shares, stage
-transfers, account changes). Two host levers soften it: `monitor_mode` (the
-host's `parse_error` applies, as everywhere) and `schema_migration_cap` (a CI
-channel that reports migration DDL instead of blocking it reports this at most
-that strongly too). A `block`/`mask` tag or an enforced allowlist still forces
-the block. Hosts that branch on the parse-error action themselves get this from
-`EnforcementPolicy::effective_parse_error_for(sql, Dialect::Snowflake)`.
+**Parse errors.** A Snowflake statement the engine cannot read resolves like
+on every dialect: flagged by default (`parse_error: allow_report`), blocked
+under `parse_error: block`, and **always blocked under a `block`/`mask` tag or
+an enforced agent allowlist** (VERICTO-087). `monitor_mode` and
+`schema_migration_cap` do not change a parse error, as everywhere.
 
 **The pre-classifier.** When (and only when) sqlparser rejects a single
 statement, its leading keywords are matched against the known-dangerous kinds:
-`UNDROP`, `GET`/`PUT`, `CREATE [OR REPLACE | OR ALTER] TASK | STREAM | PIPE |
-PROCEDURE | FUNCTION | ALERT | SHARE | LISTING | … INTEGRATION | NETWORK RULE |
-STAGE | WAREHOUSE`, `ALTER WAREHOUSE | RESOURCE MONITOR | ACCOUNT | SHARE | STAGE
-| TASK`, `ALTER TABLE … DROP ROW ACCESS POLICY | UNSET MASKING POLICY`,
-`DATA_RETENTION_TIME_IN_DAYS = 0`, `DROP DYNAMIC | ICEBERG | EXTERNAL TABLE`,
-`CLONE`, `DECLARE … BEGIN … END`. A match becomes a finding of the rule that
-names it, so the report says what the statement is; anything else stays a parse
-error. A pre-classified statement, a scripting block and `EXECUTE IMMEDIATE` are
-**unread code**: the outcome is the stricter of the findings and the parse-error
-outcome, so a finding the host set to flag (or no rule at all) cannot let one
-through.
+`UNDROP`, `GET`/`PUT`, `GRANT`/`REVOKE` forms sqlparser does not read, `CREATE
+[OR REPLACE | OR ALTER] TASK | STREAM | PIPE | PROCEDURE | FUNCTION | ALERT |
+SHARE | LISTING | … INTEGRATION | NETWORK RULE | STAGE | WAREHOUSE`, `ALTER
+WAREHOUSE | RESOURCE MONITOR | ACCOUNT | SHARE | STAGE | TASK`, `ALTER TABLE …
+DROP ROW ACCESS POLICY | UNSET MASKING POLICY`, `DATA_RETENTION_TIME_IN_DAYS =
+0`, `DROP DYNAMIC | ICEBERG | EXTERNAL TABLE`, `CLONE`, `DECLARE … BEGIN … END`.
+A match becomes a finding of the rule that names it, so the report says what
+the statement is. A pre-classified statement, a scripting block and `EXECUTE
+IMMEDIATE` are **unread code**: the outcome is the stricter of the findings and
+the parse-error outcome, so recognising one never makes it more lenient than a
+parse error (under a protective tag or an enforced allowlist: a block).
+
+**The allowlist.** A short list of legitimate Snowflake statements sqlparser
+0.63 rejects is analysed with **no finding**, as the same statements are on the
+dialects whose parser reads them (`COMMENT ON`, `ALTER VIEW`, `DESCRIBE` match
+no rule on PostgreSQL), so no SchemaMigration-class flag either: that class
+belongs to the rules that report specific DDL (DROP, TRUNCATE, ALTER … DROP
+COLUMN, …), none of which these are. Each entry is an anchored pattern over the
+whole statement: its head keywords, names and literal values, nothing more; a
+statement with anything else, a second statement, or a `$$` body anywhere but
+a comment value is not on it. Under an agent allowlist they are still denied as
+DDL. The entries, with an example each, are documented on
+`parser::snowflake::allowlisted`:
+
+| Entry | Example |
+|---|---|
+| `COMMENT [IF EXISTS] ON <object> <name> IS '…' \| $$…$$` | `COMMENT ON TABLE orders IS $$One row per order$$` |
+| `ALTER [MATERIALIZED] VIEW <name> SET\|UNSET SECURE`, `SET COMMENT = '…'`, `UNSET COMMENT` | `ALTER VIEW v SET SECURE` |
+| `ALTER DYNAMIC TABLE <name> SET TARGET_LAG\|WAREHOUSE\|COMMENT = …`, `REFRESH`, `SUSPEND`, `RESUME` | `ALTER DYNAMIC TABLE dt SET TARGET_LAG = '2 hours'` |
+| `ALTER TABLE <name> ALTER\|MODIFY [COLUMN] <col> COMMENT …` / `UNSET COMMENT` | `ALTER TABLE orders ALTER "STATUS" COMMENT $$Order status$$` |
+| `ALTER TABLE <name> SET COMMENT\|CHANGE_TRACKING\|DEFAULT_DDL_COLLATION = …`, `UNSET COMMENT` | `ALTER TABLE t SET CHANGE_TRACKING = TRUE` |
+| `ALTER TABLE <name> ADD [COLUMN] [IF NOT EXISTS] <col> <type> [, …]` (types only) | `ALTER TABLE t ADD COLUMN IF NOT EXISTS a2 NUMBER(38, 2)` |
+| `ALTER TABLE <name> ADD ROW ACCESS POLICY <p> ON (<cols>)` | `ALTER TABLE t ADD ROW ACCESS POLICY rap ON (region)` |
+| `ALTER TABLE <name> ALTER\|MODIFY [COLUMN] <col> SET MASKING POLICY <p> [USING (…)]` (no `FORCE`) | `ALTER TABLE t MODIFY COLUMN email SET MASKING POLICY m` |
+| `ALTER WAREHOUSE <name> SUSPEND \| RESUME [IF SUSPENDED] \| ABORT ALL QUERIES` | `ALTER WAREHOUSE wh RESUME IF SUSPENDED` |
+| `ALTER TASK <name> SUSPEND`; `ALTER STAGE <name> REFRESH [SUBPATH = '…']` | `ALTER TASK t SUSPEND` |
+| `CREATE [TRANSIENT\|TEMPORARY] TABLE <name> (<columns>)` (names, types, `AUTOINCREMENT`, `NOT NULL`) | `CREATE TABLE x (y INT AUTOINCREMENT START 10)` |
+| `CREATE SEQUENCE …`, `CREATE TAG …`, `CREATE STAGE <name>` with format/copy options only (no `OR REPLACE`) | `CREATE STAGE s FILE_FORMAT = f` |
+| `DESC[RIBE] <object> <name>` (not users, shares, integrations, secrets), `DESCRIBE TABLE <name> TYPE = …` | `DESC EXTERNAL TABLE ext` |
+| `SHOW …` (words, names and `'…'` only), `UNSET <var>` | `SHOW TERSE TABLES IN ACCOUNT LIKE 'ORD%'` |
+| `COPY INTO <table> [<option> = <value>]…` (the table's own stage) | `COPY INTO orders FILE_FORMAT = (TYPE = CSV)` |
 
 **The standard rules on Snowflake** (design §4.2; `tests/snowflake.rs` holds the
 matrix):
@@ -737,7 +763,7 @@ only what the Snowflake walker and pre-classifier record, so they never fire on
 another dialect. `tests/snowflake_corpus.rs` pins how the engine reads a corpus
 of public Snowflake SQL (rendered dbt models and the DDL around them, the
 statements dbt-snowflake sends, sqlglot's Snowflake tests) and prints its parse
-rate.
+and recognition rates (parsed, pre-classified or allowlisted).
 
 ## Custom rules (YAML)
 

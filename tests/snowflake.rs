@@ -151,6 +151,17 @@ fn snowflake_is_a_dialect() {
         Dialect::Snowflake
     );
     assert_eq!(parser_for(Dialect::Snowflake).dialect_name(), "snowflake");
+    // `as_str` is the canonical name, accepted back by `parse_dialect`.
+    for d in [
+        Dialect::Postgres,
+        Dialect::Mysql,
+        Dialect::Oracle,
+        Dialect::MsSql,
+        Dialect::Snowflake,
+    ] {
+        assert_eq!(Dialect::parse_dialect(d.as_str()).unwrap(), d);
+        assert_eq!(parser_for(d).dialect_name(), d.as_str());
+    }
 }
 
 /// The walker cases of the design, each read (not a parse error) and
@@ -378,15 +389,19 @@ fn preclassified_statements_are_findings() {
         assert_eq!(o.rule_code.as_deref(), Some(*code), "{sql}: {o:?}");
         assert_eq!(o.decision, Decision::Block, "{sql}");
     }
-    // An ingress network rule and a non-retention ALTER have nothing to
-    // report: they stay parse errors, which fail closed.
+    // An ingress network rule has nothing to report and is not on the
+    // allowlist: it stays a parse error, flagged by default.
+    let o = sf("CREATE NETWORK RULE r MODE = INGRESS TYPE = IPV4 VALUE_LIST = ('10.0.0.0/8')");
+    assert!(is_parse_error(&o), "{o:?}");
+    assert_eq!(o.decision, Decision::Flag);
+    // GRANT and REVOKE forms sqlparser does not read are still VERICTO-082.
     for sql in [
-        "CREATE NETWORK RULE r MODE = INGRESS TYPE = IPV4 VALUE_LIST = ('10.0.0.0/8')",
-        "ALTER WAREHOUSE wh RESUME",
-        "ALTER TASK t1 SUSPEND",
+        "GRANT CREATE TABLE ON SCHEMA analytics.public TO ROLE dev",
+        "GRANT SELECT ON FUTURE TABLES IN SCHEMA analytics.public TO ROLE reader",
+        "REVOKE USAGE ON FUTURE SCHEMAS IN DATABASE analytics FROM ROLE reader",
     ] {
         let o = sf(sql);
-        assert!(is_parse_error(&o), "{sql}: {o:?}");
+        assert_eq!(o.rule_code.as_deref(), Some("VERICTO-082"), "{sql}: {o:?}");
         assert_eq!(o.decision, Decision::Block, "{sql}");
     }
 }
@@ -397,7 +412,7 @@ fn preclassified_statements_are_findings() {
 fn preclassifier_reads_one_statement_only() {
     let o = sf("UNDROP TABLE orders; DROP TABLE customers");
     assert!(is_parse_error(&o), "{o:?}");
-    assert_eq!(o.decision, Decision::Block);
+    assert_eq!(o.decision, Decision::Flag);
     // Keywords inside a string or a comment are not the statement's.
     let o = sf("SELECT 'UNDROP TABLE x' AS s FROM orders WHERE id = 1 LIMIT 1");
     assert_eq!(o.decision, Decision::Allow, "{o:?}");
@@ -895,86 +910,134 @@ fn snowflake_rule_classes() {
 
 const UNPARSEABLE: &str = "CREATE MASKING POLICY m AS (v STRING) RETURNS STRING -> '***'";
 
-#[test]
-fn snowflake_parse_errors_fail_closed_by_default() {
-    let o = sf(UNPARSEABLE);
-    assert!(is_parse_error(&o), "{o:?}");
-    assert_eq!(o.decision, Decision::Block);
-    assert_eq!(o.action, Some(EnforcementAction::Block));
-    // Whatever the host's parse_error says.
-    let open = EnforcementPolicy {
-        parse_error: ParseErrorAction::AllowReport,
-        ..EnforcementPolicy::default()
-    };
-    assert_eq!(sf_with(UNPARSEABLE, &open).decision, Decision::Block);
-    assert_eq!(
-        open.effective_parse_error_for(UNPARSEABLE, Dialect::Snowflake),
-        ParseErrorAction::Block
-    );
-    // The other dialects keep the fail-open default.
-    for d in [Dialect::Mysql, Dialect::Oracle, Dialect::MsSql] {
-        let o = evaluate("SELEC 1", d, &catalogue(), &EnforcementPolicy::default());
-        assert_eq!(o.decision, Decision::Flag, "{d:?}");
-    }
-}
-
-#[test]
-fn monitor_mode_and_ci_cap_soften_snowflake_parse_errors() {
-    let monitor = EnforcementPolicy {
-        monitor_mode: true,
-        ..EnforcementPolicy::default()
-    };
-    assert_eq!(sf_with(UNPARSEABLE, &monitor).decision, Decision::Flag);
-    let ci = EnforcementPolicy {
-        schema_migration_cap: Some(EnforcementAction::Flag),
-        ..EnforcementPolicy::default()
-    };
-    assert_eq!(sf_with(UNPARSEABLE, &ci).decision, Decision::Flag);
-    // A host that asked for fail-closed keeps it on CI.
-    let ci_closed = EnforcementPolicy {
-        parse_error: ParseErrorAction::Block,
-        ..ci.clone()
-    };
-    assert_eq!(sf_with(UNPARSEABLE, &ci_closed).decision, Decision::Block);
-    // A protective tag or an enforced allowlist still forces the block.
-    let tagged = EnforcementPolicy {
+fn tagged(policy: EnforcementPolicy) -> EnforcementPolicy {
+    EnforcementPolicy {
         sensitive_columns: serde_json::from_str(
             r#"[{"table":"customers","column":"email","policy":"mask"}]"#,
         )
         .unwrap(),
-        ..ci.clone()
-    };
-    assert_eq!(sf_with(UNPARSEABLE, &tagged).decision, Decision::Block);
-    let agent = EnforcementPolicy {
+        ..policy
+    }
+}
+
+fn enforced_agent(policy: EnforcementPolicy) -> EnforcementPolicy {
+    EnforcementPolicy {
         access_policy: Some(serde_json::from_str(r#"{"mode":"enforce","entries":[]}"#).unwrap()),
-        ..ci
+        ..policy
+    }
+}
+
+/// Unparseable Snowflake text resolves like on every dialect: flagged by
+/// default, blocked when the host asks for it or a protection forces it.
+#[test]
+fn snowflake_parse_errors_follow_the_host_policy() {
+    let o = sf(UNPARSEABLE);
+    assert!(is_parse_error(&o), "{o:?}");
+    assert_eq!(o.decision, Decision::Flag);
+    assert_eq!(o.action, Some(EnforcementAction::Flag));
+    let closed = EnforcementPolicy {
+        parse_error: ParseErrorAction::Block,
+        ..EnforcementPolicy::default()
     };
-    assert_eq!(sf_with(UNPARSEABLE, &agent).decision, Decision::Block);
+    assert_eq!(sf_with(UNPARSEABLE, &closed).decision, Decision::Block);
+    // The same text, and the same answer, on every sqlparser dialect.
+    for d in [Dialect::Mysql, Dialect::Oracle, Dialect::MsSql] {
+        let o = evaluate("SELEC 1", d, &catalogue(), &EnforcementPolicy::default());
+        assert_eq!(o.decision, Decision::Flag, "{d:?}");
+    }
+    assert_eq!(
+        EnforcementPolicy::default().effective_parse_error_for(UNPARSEABLE, Dialect::Snowflake),
+        ParseErrorAction::AllowReport
+    );
+}
+
+/// The behaviour table: default, monitor mode, CI cap, protective tag,
+/// enforced allowlist.
+#[test]
+fn snowflake_parse_error_behaviour_table() {
+    let monitor = EnforcementPolicy {
+        monitor_mode: true,
+        ..EnforcementPolicy::default()
+    };
+    let ci = EnforcementPolicy {
+        schema_migration_cap: Some(EnforcementAction::Flag),
+        ..EnforcementPolicy::default()
+    };
+    let cases = [
+        ("default", EnforcementPolicy::default(), Decision::Flag),
+        ("monitor", monitor.clone(), Decision::Flag),
+        ("ci cap", ci.clone(), Decision::Flag),
+        (
+            "mask tag",
+            tagged(EnforcementPolicy::default()),
+            Decision::Block,
+        ),
+        ("mask tag + monitor", tagged(monitor), Decision::Block),
+        ("mask tag + ci cap", tagged(ci.clone()), Decision::Block),
+        (
+            "enforced allowlist",
+            enforced_agent(EnforcementPolicy::default()),
+            Decision::Block,
+        ),
+        (
+            "enforced allowlist + ci cap",
+            enforced_agent(ci),
+            Decision::Block,
+        ),
+    ];
+    for (label, policy, want) in cases {
+        for sql in [
+            UNPARSEABLE,
+            "REMOVE @raw_stage/old/",
+            "CREATE OR REPLACE ROLE developer",
+        ] {
+            assert_eq!(sf_with(sql, &policy).decision, want, "{label}: {sql}");
+        }
+    }
 }
 
 /// Unread code (a scripting block, EXECUTE IMMEDIATE, a pre-classified
-/// statement) keeps the parse-error outcome as a floor: a finding the host
-/// set to flag, or no rule at all, cannot let it through.
+/// statement) keeps the parse-error outcome as a floor under its findings.
 #[test]
 fn unread_code_keeps_the_parse_error_floor() {
-    // No rule enabled at all: blocked as unread.
+    // No rule enabled at all: the parse-error outcome.
     for sql in [
         "EXECUTE IMMEDIATE 'DROP TABLE orders'",
         "BEGIN\n  SELECT 1;\nEND",
         "UNDROP TABLE orders",
         "CREATE TASK t WAREHOUSE = wh AS DELETE FROM orders",
     ] {
-        let o = evaluate(sql, Dialect::Snowflake, &[], &EnforcementPolicy::default());
+        let none = evaluate(sql, Dialect::Snowflake, &[], &EnforcementPolicy::default());
+        assert_eq!(none.decision, Decision::Flag, "{sql}: {none:?}");
+        assert!(is_parse_error(&none), "{sql}: {none:?}");
+        // A protection lifts the floor to a block, whatever the rules say.
+        let o = evaluate(
+            sql,
+            Dialect::Snowflake,
+            &[],
+            &tagged(EnforcementPolicy::default()),
+        );
         assert_eq!(o.decision, Decision::Block, "{sql}: {o:?}");
-        assert!(is_parse_error(&o), "{sql}: {o:?}");
+        let o = evaluate(
+            sql,
+            Dialect::Snowflake,
+            &[],
+            &enforced_agent(EnforcementPolicy::default()),
+        );
+        assert_eq!(o.decision, Decision::Block, "{sql}: {o:?}");
     }
-    // The finding set to flag: the floor still blocks, and names it.
+    // A blocking finding keeps the flat fields.
+    let o = sf("UNDROP TABLE orders");
+    assert_eq!(o.rule_code.as_deref(), Some("VERICTO-094"));
+    assert_eq!(o.decision, Decision::Block);
+    // A flagged finding under a protective tag: the floor blocks, and names
+    // the finding.
     let flagged = vec![rule("VERICTO-094", Severity::Medium)];
     let o = evaluate(
         "UNDROP TABLE orders",
         Dialect::Snowflake,
         &flagged,
-        &EnforcementPolicy::default(),
+        &tagged(EnforcementPolicy::default()),
     );
     assert_eq!(o.decision, Decision::Block, "{o:?}");
     assert!(
@@ -984,34 +1047,157 @@ fn unread_code_keeps_the_parse_error_floor() {
             .contains("also reported: VERICTO-094"),
         "{o:?}"
     );
-    // A blocking finding keeps the flat fields.
-    let o = sf("UNDROP TABLE orders");
-    assert_eq!(o.rule_code.as_deref(), Some("VERICTO-094"));
-    // Monitor mode: never blocks.
-    let monitor = EnforcementPolicy {
-        monitor_mode: true,
-        ..EnforcementPolicy::default()
-    };
-    assert_eq!(
-        sf_with("EXECUTE IMMEDIATE 'DROP TABLE orders'", &monitor).decision,
-        Decision::Flag
-    );
 }
 
-/// Every statement kind the engine does not analyse on Snowflake stays a
-/// parse error (and blocks): the classification in `parser::walk::
-/// not_analysed` is exhaustive.
+/// Statement kinds the engine does not analyse on Snowflake stay parse
+/// errors: the classification in `parser::walk::not_analysed` is exhaustive.
 #[test]
-fn unmodelled_snowflake_statements_block() {
+fn unmodelled_snowflake_statements_are_parse_errors() {
     for sql in [
         "REMOVE @raw_stage/old/",
-        "UNSET my_variable",
         "CREATE OR REPLACE ROLE developer",
-        "COMMENT ON TABLE orders IS $$One row per order$$",
+        UNPARSEABLE,
     ] {
         let o = sf(sql);
         assert!(is_parse_error(&o), "{sql}: {o:?}");
-        assert_eq!(o.decision, Decision::Block, "{sql}");
+        assert_eq!(o.decision, Decision::Flag, "{sql}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The allowlist of legitimate statements sqlparser 0.63 does not read
+// ---------------------------------------------------------------------------
+
+const ALLOWLISTED: &[&str] = &[
+    "comment on table ANALYTICS.DBT_PROD.orders IS $$One row per order$$",
+    "COMMENT ON COLUMN analytics.public.orders.status IS $$Order status$$",
+    "COMMENT IF EXISTS ON VIEW v IS $$text with ; and DROP TABLE x inside$$",
+    "alter view ANALYTICS.DBT_PROD.stg_orders set secure",
+    "ALTER MATERIALIZED VIEW mv UNSET SECURE",
+    "ALTER VIEW v SET COMMENT = 'reporting view'",
+    "alter dynamic table ANALYTICS.DBT_PROD.orders_dt set target_lag = '2 hours' warehouse = TRANSFORMING_S",
+    "ALTER DYNAMIC TABLE dt SET TARGET_LAG = DOWNSTREAM",
+    "alter table ANALYTICS.DBT_PROD.orders alter \"STATUS\" comment $$Order status$$",
+    "ALTER TABLE orders MODIFY COLUMN status UNSET COMMENT",
+    "ALTER TABLE t1 ADD ROW ACCESS POLICY rap_t1 ON (empl_id)",
+    "ALTER TABLE t ADD ROW ACCESS POLICY rap ON (cost, item)",
+    "ALTER TABLE customers MODIFY COLUMN email SET MASKING POLICY email_mask",
+    "ALTER TABLE customers ALTER COLUMN email SET MASKING POLICY m USING (email, region)",
+    "ALTER TABLE t1 ADD COLUMN IF NOT EXISTS a2 NUMBER(38, 2)",
+    "ALTER WAREHOUSE my_wh RESUME IF SUSPENDED",
+    "ALTER WAREHOUSE IF EXISTS my_wh SUSPEND",
+    "ALTER WAREHOUSE my_wh ABORT ALL QUERIES",
+    "ALTER TASK mytask SUSPEND",
+    "ALTER STAGE mystage REFRESH SUBPATH = 'data'",
+    "DESC EXTERNAL TABLE exttable1",
+    "DESCRIBE DYNAMIC TABLE analytics.public.orders_dt",
+    "SHOW TERSE TABLES HISTORY IN ACCOUNT LIKE 'ORD%'",
+    "UNSET my_variable",
+    "UNSET (a, b)",
+    "COPY INTO mytable FILE_FORMAT = (TYPE = 'CSV') PATTERN = '.*sales.*[.]csv' PURGE = TRUE",
+    "COPY INTO mytable VALIDATION_MODE = 'RETURN_ERRORS'",
+    "ALTER TABLE foo SET COMMENT = 'bar'",
+    "ALTER TABLE foo SET CHANGE_TRACKING = FALSE",
+    "ALTER TABLE foo ADD col1 VARCHAR(512), col2 VARCHAR(512)",
+    "CREATE TABLE x (y INT AUTOINCREMENT START 10 NOORDER)",
+    "CREATE TABLE t (a ARRAY(INT), c OBJECT(x INT), d MAP(VARCHAR, INT))",
+    "CREATE SEQUENCE seq1 WITH START=1, INCREMENT=1 ORDER",
+    "CREATE TAG cost_center ALLOWED_VALUES 'a', 'b'",
+    "CREATE STAGE stage1 FILE_FORMAT = schema1.format1",
+    "CREATE STAGE stage1 FILE_FORMAT = (FORMAT_NAME = stage1.format1)",
+    "DESCRIBE TABLE analytics.public.orders TYPE = STAGE",
+];
+
+#[test]
+fn allowlisted_statements_pass() {
+    // Every entry here is text sqlparser 0.63 rejects: the allowlist is what
+    // reads it.
+    let parses: Vec<&&str> = ALLOWLISTED
+        .iter()
+        .filter(|sql| {
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SnowflakeDialect {}, sql)
+                .is_ok()
+        })
+        .collect();
+    assert!(
+        parses.is_empty(),
+        "parsed by sqlparser, not allowlist cases: {parses:?}"
+    );
+    for sql in ALLOWLISTED {
+        let o = sf(sql);
+        assert_eq!(o.decision, Decision::Allow, "{sql}: {o:?}");
+        assert!(o.violations.is_empty(), "{sql}: {o:?}");
+        // No parse-error finding, even with a tag: they read no column.
+        let o = sf_with(sql, &tagged(EnforcementPolicy::default()));
+        assert_eq!(o.decision, Decision::Allow, "{sql}: {o:?}");
+        // Still DDL to an agent allowlist.
+        let o = sf_with(sql, &enforced_agent(EnforcementPolicy::default()));
+        assert_eq!(o.decision, Decision::Block, "{sql}: {o:?}");
+    }
+}
+
+/// Near misses: a variant that adds anything to an allowlisted form (a body
+/// that could hold a statement, another option, a second statement) is not
+/// on the allowlist. It is a parse error (flagged), or a finding.
+#[test]
+fn near_misses_are_not_allowlisted() {
+    let flagged: &[&str] = &[
+        // A $$ body somewhere other than a comment value.
+        "ALTER VIEW v SET COMMENT = $$x$$",
+        "ALTER TABLE t ALTER c COMMENT $$x$$ SET DATA TYPE NUMBER",
+        // A second statement.
+        "COMMENT ON TABLE t IS 'x'; DROP TABLE t",
+        "ALTER VIEW v SET SECURE; DELETE FROM orders",
+        // Other options than the allowlisted ones.
+        "ALTER VIEW v SET SECURE RECURSIVE",
+        "ALTER DYNAMIC TABLE dt SET TARGET_LAG = '1 hour' REFRESH_MODE = FULL",
+        "ALTER TABLE customers MODIFY COLUMN email SET MASKING POLICY m FORCE",
+        "ALTER TABLE t1 ADD COLUMN IF NOT EXISTS a2 NUMBER AS (a1 * 2)",
+        "ALTER TABLE t1 ADD COLUMN IF NOT EXISTS a2 NUMBER DEFAULT 0",
+        "ALTER STAGE s RENAME TO s2",
+        "ALTER TASK t SET SCHEDULE = '1 MINUTE'",
+        "DESC USER jessicajones",
+        "SHOW TABLES IN (SELECT 1)",
+        "COMMENT ON TABLE t IS 'x' extra",
+        "COPY INTO @stage FILE_FORMAT = (TYPE = CSV)",
+        "COPY INTO mytable FILES = (SELECT 1)",
+        "CREATE OR REPLACE SEQUENCE seq1 START = 1",
+        "CREATE TABLE x (y INT AUTOINCREMENT START 10 DEFAULT 0)",
+        "CREATE TABLE x (y INT AUTOINCREMENT START 10) COPY GRANTS",
+        "CREATE STAGE s FILE_FORMAT = f STORAGE_INTEGRATION = si",
+        "ALTER TABLE t SET DATA_RETENTION_TIME_IN_DAYS = 1",
+        "ALTER TABLE t SET TAG cost_center = 'x'",
+        "ALTER TABLE t UNSET TAG cost_center",
+        "ALTER TABLE foo ADD col1 VARCHAR NOT NULL TAG (k = 'v'), col2 VARCHAR NOT NULL TAG (k = 'w')",
+        "DESCRIBE TABLE t TYPE = STAGE EXTRA",
+    ];
+    for sql in flagged {
+        let o = sf(sql);
+        assert_ne!(
+            o.decision,
+            Decision::Allow,
+            "{sql} must not be allowlisted: {o:?}"
+        );
+        assert!(
+            o.violations.is_empty() || o.decision == Decision::Block,
+            "{sql}: {o:?}"
+        );
+    }
+    // A dangerous neighbour of an allowlisted form keeps its finding.
+    for (sql, code) in [
+        ("ALTER TASK t RESUME", "VERICTO-096"),
+        (
+            "ALTER WAREHOUSE wh SET WAREHOUSE_SIZE = 'X6LARGE'",
+            "VERICTO-095",
+        ),
+        ("ALTER STAGE s SET URL = 's3://other/'", "VERICTO-092"),
+        ("ALTER TABLE t DROP ROW ACCESS POLICY rap", "VERICTO-019"),
+        (
+            "ALTER TABLE t SET DATA_RETENTION_TIME_IN_DAYS = 0",
+            "VERICTO-094",
+        ),
+    ] {
+        assert_eq!(sf(sql).rule_code.as_deref(), Some(code), "{sql}");
     }
 }
 
