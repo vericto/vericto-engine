@@ -889,7 +889,7 @@ fn templates() -> &'static [Expr; 6] {
     })
 }
 
-fn splice(e: &mut Expr, orig: &Expr) {
+pub(crate) fn splice(e: &mut Expr, orig: &Expr) {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
     match e {
         Expr::Identifier(i) if i.value == MASK_ARG => *e = orig.clone(),

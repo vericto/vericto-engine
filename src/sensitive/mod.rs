@@ -42,6 +42,7 @@
 
 pub(crate) mod mysql;
 pub(crate) mod pg;
+pub(crate) mod snowflake;
 pub(crate) mod sql;
 
 use std::collections::BTreeMap;
@@ -68,8 +69,8 @@ pub const SENSITIVE_RULE_CODE: &str = "VERICTO-085";
 pub enum SensitivePolicy {
     /// Allow the query, record and alert.
     Flag,
-    /// Rewrite the projection so the column's value is masked (Postgres and
-    /// MySQL; Oracle and SQL Server block).
+    /// Rewrite the projection so the column's value is masked (Postgres,
+    /// MySQL and Snowflake; Oracle and SQL Server block).
     Mask,
     /// Reject the query.
     Block,
@@ -588,8 +589,13 @@ impl Item {
                 [s, t],
             ) => {
                 // `s.t.col` only names an unaliased base table (an alias hides
-                // the qualified name), but be generous: refname or table.
-                (ieq(refname, t) || ieq(table, t)) && schema.as_deref().is_none_or(|sc| ieq(sc, s))
+                // the qualified name), but be generous: refname or table. A
+                // Snowflake three-part relation (`db.s.t`, access analysis)
+                // is named by its schema.
+                (ieq(refname, t) || ieq(table, t))
+                    && schema.as_deref().is_none_or(|sc| {
+                        ieq(sc.rsplit(crate::access::DB_SEP).next().unwrap_or(sc), s)
+                    })
             }
             _ => false,
         }
@@ -953,7 +959,11 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, cols: &[SensitiveColumn]) -> Option
     let dialect = match &parsed.ast {
         SourceAst::Pg(_) => Dialect::Postgres,
         SourceAst::Sql { dialect, .. } => *dialect,
-        SourceAst::None => return None,
+        // Snowflake text only the pre-classifier recognised has no tree: it
+        // is unread code, whose parse-error floor blocks under a protective
+        // tag (see `ParsedQuery::unread`); an allowlisted one reads no
+        // column.
+        SourceAst::None | SourceAst::Classified { .. } => return None,
     };
     let analysis = match &parsed.ast {
         SourceAst::Pg(tree) => pg::analyze(tree, &tags, any_mask),
@@ -985,8 +995,13 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, cols: &[SensitiveColumn]) -> Option
                 });
             }
         },
+        SourceAst::Sql {
+            statements,
+            sql: Some(sql),
+            dialect: Dialect::Snowflake,
+        } => sql::analyze_snowflake(statements, sql, &tags, any_mask),
         SourceAst::Sql { statements, .. } => sql::analyze(statements, &tags).map(|t| (t, None)),
-        SourceAst::None => return None,
+        SourceAst::None | SourceAst::Classified { .. } => return None,
     };
 
     let (touches, rewrite) = match analysis {
@@ -1109,7 +1124,10 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, cols: &[SensitiveColumn]) -> Option
                 rewritten_query: None,
                 touched: touched.clone(),
             };
-            if !matches!(dialect, Dialect::Postgres | Dialect::Mysql) {
+            if !matches!(
+                dialect,
+                Dialect::Postgres | Dialect::Mysql | Dialect::Snowflake
+            ) {
                 // Oracle and SQL Server have no rewrite. Forwarding the
                 // unmasked value (flag) would silently downgrade "never in
                 // clear" to "tell me afterwards"; block is the fail-safe
@@ -1161,12 +1179,7 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, cols: &[SensitiveColumn]) -> Option
 }
 
 fn dialect_name(d: Dialect) -> &'static str {
-    match d {
-        Dialect::Postgres => "postgres",
-        Dialect::Mysql => "mysql",
-        Dialect::Oracle => "oracle",
-        Dialect::MsSql => "mssql",
-    }
+    d.as_str()
 }
 
 #[cfg(test)]

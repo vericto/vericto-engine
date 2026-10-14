@@ -50,12 +50,7 @@ enum Pol {
 }
 
 fn orders_entry(columns: AccessColumns, access: AccessLevel) -> AccessEntry {
-    AccessEntry {
-        schema: None,
-        table: "orders".into(),
-        columns,
-        access,
-    }
+    AccessEntry::new("orders", columns, access)
 }
 
 fn granted() -> AccessColumns {
@@ -99,12 +94,10 @@ fn access_policy(p: Pol) -> AccessPolicy {
             Some(s.to_string()),
         ),
     };
-    AccessPolicy {
-        mode,
-        entries,
-        ddl: DdlPolicy::Deny,
-        default_schema,
-    }
+    let mut policy = AccessPolicy::new(mode, entries);
+    policy.ddl = DdlPolicy::Deny;
+    policy.default_schema = default_schema;
+    policy
 }
 
 fn tag(column: &str, policy: SensitivePolicy) -> SensitiveColumn {

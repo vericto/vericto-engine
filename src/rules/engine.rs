@@ -102,11 +102,25 @@ impl RuleClass {
             | "VERICTO-033" | "VERICTO-040" | "VERICTO-042" | "VERICTO-083" | "VERICTO-084" => {
                 RuleClass::DataMutation
             }
+            // Snowflake: recovery reduced (retention 0, CREATE OR REPLACE,
+            // INSERT OVERWRITE, UNDROP, ALTER ACCOUNT) is schema DDL, which a
+            // CI channel may soften like DROP TABLE.
+            "VERICTO-094" => RuleClass::SchemaMigration,
             // Security
             "VERICTO-070" | "VERICTO-080" | "VERICTO-081" | "VERICTO-082" | "VERICTO-085"
             | "VERICTO-086" | "VERICTO-087" | "VERICTO-090" => RuleClass::Security,
+            // Snowflake: stage unload and file transfer, external stages and
+            // integrations, shares, persistent code, role switches. DDL in
+            // form for some, but each moves data out of the account or runs
+            // code no check sees, so a CI channel never softens them (as
+            // GRANT, VERICTO-082).
+            "VERICTO-091" | "VERICTO-092" | "VERICTO-093" | "VERICTO-096" | "VERICTO-097" => {
+                RuleClass::Security
+            }
             // Performance / best-practice
             "VERICTO-050" | "VERICTO-051" | "VERICTO-060" | "VERICTO-061" => RuleClass::Performance,
+            // Snowflake warehouse cost.
+            "VERICTO-095" => RuleClass::Performance,
             // Custom rules / unknown codes: conservative default.
             _ => RuleClass::DataMutation,
         }
@@ -263,6 +277,13 @@ impl EnforcementPolicy {
     ///
     /// Hosts that parse themselves and branch on the parse-error action must
     /// call this (with the client's text) instead of `effective_parse_error`.
+    ///
+    /// Snowflake follows the same rule as every dialect (fail-open flag by
+    /// default; block under `parse_error: block`, a `block`/`mask` tag or an
+    /// enforced allowlist). Its statements sqlparser does not read but the
+    /// engine knows are either findings (the pre-classifier) or, for a short
+    /// allowlist of legitimate forms, analysed with no finding (see
+    /// `parser::snowflake`).
     pub fn effective_parse_error_for(
         &self,
         sql: &str,
@@ -530,7 +551,46 @@ impl RuleEngine {
                 outcome = apply_sensitive(outcome, verdict, policy);
             }
         }
-        Self::with_access(outcome, parsed, policy)
+        let outcome = Self::with_access(outcome, parsed, policy);
+        Self::with_unread(outcome, parsed, policy)
+    }
+
+    /// Snowflake code the engine did not read (a scripting block, `EXECUTE
+    /// IMMEDIATE`, a statement only the pre-classifier recognised): the
+    /// parse-error outcome is a floor, resolved as for any parse error (a
+    /// flag by default, a block under `parse_error: block`, a protective tag
+    /// or an enforced allowlist). The findings keep the flat fields unless
+    /// the floor is strictly stricter, so what cannot be read is never
+    /// treated more leniently than a parse error, and what was recognised is
+    /// still named in the report.
+    fn with_unread(
+        outcome: EvaluationOutcome,
+        parsed: &ParsedQuery,
+        policy: &EnforcementPolicy,
+    ) -> EvaluationOutcome {
+        let Some(why) = parsed.unread.as_deref() else {
+            return outcome;
+        };
+        let floor = parse_error_outcome(why, policy);
+        if strictness(&floor) > strictness(&outcome) {
+            let mut floor = floor;
+            // Keep the audit trail (the decision comes from the floor alone).
+            floor.sensitive_columns = outcome.sensitive_columns;
+            floor.access_denied = outcome.access_denied;
+            if !outcome.violations.is_empty() {
+                let codes: Vec<&str> = outcome
+                    .violations
+                    .iter()
+                    .map(|v| v.rule_code.as_str())
+                    .collect();
+                floor.ast_node_path = floor
+                    .ast_node_path
+                    .map(|p| format!("{p} (also reported: {})", codes.join(", ")));
+            }
+            floor
+        } else {
+            outcome
+        }
     }
 
     /// Folds the identity's allowlist (VERICTO-087) into `outcome`. The only
