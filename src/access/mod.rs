@@ -393,14 +393,17 @@ fn effective_schema(dialect: Dialect, schema: Option<&str>, table: &str) -> Opti
 /// The schema an unqualified name lands in without a `search_path` change
 /// (which is denied under a policy): the host's
 /// [`AccessPolicy::default_schema`] when it sets one, else `public` on
-/// Postgres and `dbo` on SQL Server. MySQL's is the session's current
-/// database, unknown unless the host names it; Oracle's is the user's schema,
-/// never known.
+/// Postgres, `dbo` on SQL Server and `main` on SQLite. MySQL's is the
+/// session's current database, unknown unless the host names it; Oracle's is
+/// the user's schema, never known. (On SQLite an unqualified name resolves to
+/// `temp` first when a temporary table of that name exists; creating one is
+/// DDL, denied under a policy.)
 fn default_schema(dialect: Dialect, host: Option<&str>) -> Option<&str> {
     let host = host.filter(|s| !s.is_empty());
     match dialect {
         Dialect::Postgres => host.or(Some("public")),
         Dialect::MsSql => host.or(Some("dbo")),
+        Dialect::Sqlite => host.or(Some("main")),
         // Snowflake's is the connection's current schema, like MySQL's
         // current database: unknown unless the host names it.
         Dialect::Mysql | Dialect::Snowflake => host,
@@ -464,21 +467,24 @@ impl Case {
 /// - Snowflake: exact. Both sides are folded the way Snowflake stores them
 ///   (unquoted → upper case; quoted as written, or upper case too under
 ///   `QUOTED_IDENTIFIERS_IGNORE_CASE`).
+/// - SQLite: ASCII case-insensitive, quoted or not, as SQLite compares every
+///   identifier.
 fn relation_case(dialect: Dialect, schema: Option<&str>) -> Case {
     match dialect {
         Dialect::Postgres | Dialect::Snowflake => Case::Exact,
         Dialect::Mysql if schema.is_some_and(|s| ieq(s, "information_schema")) => Case::Insensitive,
         Dialect::Mysql => Case::Exact,
-        Dialect::MsSql | Dialect::Oracle => Case::Insensitive,
+        Dialect::MsSql | Dialect::Oracle | Dialect::Sqlite => Case::Insensitive,
     }
 }
 
 /// Column names: exact on Postgres and Snowflake (folded as above);
-/// case-insensitive on MySQL (as MySQL compares them), SQL Server and Oracle.
+/// case-insensitive on MySQL (as MySQL compares them), SQL Server, Oracle and
+/// SQLite.
 fn column_case(dialect: Dialect) -> Case {
     match dialect {
         Dialect::Postgres | Dialect::Snowflake => Case::Exact,
-        Dialect::Mysql | Dialect::MsSql | Dialect::Oracle => Case::Insensitive,
+        Dialect::Mysql | Dialect::MsSql | Dialect::Oracle | Dialect::Sqlite => Case::Insensitive,
     }
 }
 
@@ -487,8 +493,8 @@ fn column_case(dialect: Dialect) -> Case {
 /// case, exactly as the same name unquoted in a query would; an entry written
 /// in double quotes (`"Customers"`, with `""` for an embedded quote) is taken
 /// as written. That is how a case-sensitive Postgres name is granted. MySQL
-/// also accepts backticks; elsewhere quotes are stripped and the name compares
-/// as the dialect compares names. On Snowflake, the mirror image of Postgres:
+/// also accepts backticks, SQLite backticks and `[name]`; elsewhere quotes are
+/// stripped and the name compares as the dialect compares names. On Snowflake, the mirror image of Postgres:
 /// unquoted entries fold to upper case, quoted ones are taken as written
 /// (upper-cased too under `QUOTED_IDENTIFIERS_IGNORE_CASE`).
 fn entry_ident(names: Names, raw: &str) -> std::borrow::Cow<'_, str> {
@@ -506,9 +512,15 @@ fn entry_ident(names: Names, raw: &str) -> std::borrow::Cow<'_, str> {
             }
             return Cow::Owned(s);
         }
-        if dialect == Dialect::Mysql {
+        if matches!(dialect, Dialect::Mysql | Dialect::Sqlite) {
             if let Some(s) = unquote('`') {
                 return Cow::Owned(s);
+            }
+        }
+        // SQLite also accepts `[name]` (no escape inside).
+        if dialect == Dialect::Sqlite {
+            if let Some(inner) = raw.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                return Cow::Owned(inner.to_string());
             }
         }
     }
@@ -691,7 +703,7 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, policy: &AccessPolicy) -> Option<Ac
         } => one(*dialect, &|t| sql::collect(statements, t, *dialect), false),
         // Snowflake text only the pre-classifier recognised: a statement kind
         // denied outright (DDL, transfers, role switches).
-        SourceAst::Classified { what } => Ok((
+        SourceAst::Classified { what, .. } => Ok((
             vec![DeniedRef {
                 schema: None,
                 table: what.clone(),

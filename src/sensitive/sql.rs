@@ -55,6 +55,32 @@ pub(crate) fn analyze_snowflake(
     Ok((touches, Some(rewrite)))
 }
 
+/// SQLite: derivation, and the mask rewrite when `any_mask`, rendered and
+/// checked by [`super::sqlite::render`] against the client's text.
+pub(crate) fn analyze_sqlite(
+    statements: &[Statement],
+    sql: &str,
+    tags: &Tags,
+    any_mask: bool,
+) -> Result<(Touches, super::pg::Rewrite)> {
+    let mut statements = statements.to_vec();
+    let original = any_mask.then(|| statements.clone());
+    let mut w = Walker::new(tags, any_mask, None);
+    w.sqlite = true;
+    for s in statements.iter_mut() {
+        w.stmt(s, 0)?;
+    }
+    let (touches, rewrote, refused) = (w.touches, w.rewrote, w.refused);
+    if !rewrote {
+        return Ok((touches, None));
+    }
+    let rewrite = match refused {
+        Some(why) => Err(why),
+        None => super::sqlite::render(sql, original.as_deref().unwrap_or_default(), &statements),
+    };
+    Ok((touches, Some(rewrite)))
+}
+
 /// Oracle / MS SQL: derivation only.
 pub(crate) fn analyze(statements: &[Statement], tags: &Tags) -> Result<Touches> {
     let mut statements = statements.to_vec();
@@ -118,6 +144,7 @@ pub(crate) fn access_walk(
     w.ansi_quotes = dialect == crate::parser::Dialect::Mysql;
     w.oracle = dialect == crate::parser::Dialect::Oracle;
     w.snowflake = dialect == crate::parser::Dialect::Snowflake;
+    w.sqlite = dialect == crate::parser::Dialect::Sqlite;
     w.stmt(stmt, 0)
 }
 
@@ -170,6 +197,9 @@ struct Walker<'a, 't, 'p, 's> {
     /// table functions denied (access analysis), and the Snowflake mask
     /// rewrite (see [`super::snowflake`]).
     snowflake: bool,
+    /// SQLite: table-valued functions are relations (access analysis), and
+    /// the SQLite mask rewrite (see [`super::sqlite`]).
+    sqlite: bool,
     /// The access analysis: every clause counts (WHERE, JOIN, GROUP BY, …),
     /// not only what is projected, and tables and write targets are recorded.
     all: bool,
@@ -329,6 +359,49 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         }
     }
 
+    /// SQLite's access analysis: a table-valued function (`pragma_table_info('t')`,
+    /// `dbstat`, an extension's virtual table) is read like a table of that
+    /// name, so only an entry naming it allows it; `json_each` and
+    /// `json_tree`, whose rows come from their arguments only, read nothing
+    /// else.
+    fn sqlite_table_function(&self, name: Option<&ObjectName>) {
+        const PURE: &[&str] = &["json_each", "json_tree", "jsonb_each", "jsonb_tree"];
+        if !(self.sqlite && self.all) {
+            return;
+        }
+        match name {
+            Some(n) if n.0.len() == 1 && PURE.iter().any(|p| ieq(p, name_part(&n.0[0]))) => {}
+            Some(n) => {
+                let (schema, table) = split_name(n);
+                self.tags.relation(schema.as_deref(), &table);
+                self.tags.of_table(schema.as_deref(), &table);
+            }
+            None => self.tags.statement("TABLE(…)"),
+        }
+    }
+
+    /// The dialect whose mask rewrite this walk prints from the tree
+    /// (Snowflake or SQLite), for the reasons a rewrite is refused.
+    fn tree_dialect(&self) -> &'static str {
+        if self.sqlite { "SQLite" } else { "Snowflake" }
+    }
+
+    /// The tree-printed mask (Snowflake, SQLite) of `orig`; `None` (and the
+    /// rewrite refused) when the dialect has no form for `style`.
+    fn tree_mask(&mut self, style: super::MaskStyle, orig: &Expr) -> Option<Expr> {
+        if self.sqlite {
+            match super::sqlite::mask_expr(style, orig) {
+                Ok(e) => Some(e),
+                Err(why) => {
+                    self.refuse(why);
+                    None
+                }
+            }
+        } else {
+            Some(super::snowflake::mask_expr(style, orig))
+        }
+    }
+
     fn new(tags: &'a Tags<'t>, rewrite: bool, mysql: Option<&'p Prepared<'s>>) -> Self {
         Walker {
             tags,
@@ -342,6 +415,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             ansi_quotes: mysql.is_some(),
             oracle: false,
             snowflake: false,
+            sqlite: false,
             all: false,
             lock: None,
         }
@@ -973,13 +1047,14 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             let order = if all { q.order_by.as_mut() } else { None };
             self.select(sel, sink, order, depth + 1)
                 .map(|(outs, rw, star, distinct)| {
-                    if !rw.is_empty() && self.snowflake {
-                        // Snowflake resolves ORDER BY names to the select
-                        // aliases first: ordering by a masked output would
-                        // order by the masked value. Refused, as is a
+                    if !rw.is_empty() && (self.snowflake || self.sqlite) {
+                        // Snowflake and SQLite resolve ORDER BY names to the
+                        // select aliases first: ordering by a masked output
+                        // would order by the masked value. Refused, as is a
                         // position naming one.
                         if let Some(ob) = q.order_by.as_ref() {
-                            if let Some(why) = snowflake_order_refusal(ob, &rw) {
+                            if let Some(why) = snowflake_order_refusal(ob, &rw, self.tree_dialect())
+                            {
                                 self.refuse(why);
                             }
                         }
@@ -1139,11 +1214,13 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                             self.touches.record(&lin, sink);
                             if let Sink::Projected { rewrite: true } = sink {
                                 if let Some(style) = mask_style_for(self.tags, &lin) {
-                                    *e = if self.snowflake {
-                                        super::snowflake::mask_expr(style, e)
+                                    if self.snowflake || self.sqlite {
+                                        if let Some(m) = self.tree_mask(style, e) {
+                                            *e = m;
+                                        }
                                     } else {
-                                        mysql::mask_expr(style, e)
-                                    };
+                                        *e = mysql::mask_expr(style, e);
+                                    }
                                     self.rewrote = true;
                                 }
                             }
@@ -1246,7 +1323,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         })();
         self.scopes.pop();
         let (outs, rw, star) = r?;
-        if !rw.is_empty() && self.snowflake {
+        if !rw.is_empty() && (self.snowflake || self.sqlite) {
             self.snowflake_clause_refusals(sel, &rw);
         } else if !rw.is_empty() {
             self.fix_group_and_having(sel, &rw, star);
@@ -1378,10 +1455,10 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
         }
     }
 
-    /// Snowflake: after masking, `GROUP BY`, `HAVING` and `QUALIFY` naming a
-    /// masked output (or `GROUP BY` a position of one) may see the masked
-    /// value, depending on name resolution the engine cannot check without
-    /// a schema: the rewrite is refused (the query blocks).
+    /// Snowflake and SQLite: after masking, `GROUP BY`, `HAVING` and
+    /// `QUALIFY` naming a masked output (or `GROUP BY` a position of one) may
+    /// see the masked value, depending on name resolution the engine cannot
+    /// check without a schema: the rewrite is refused (the query blocks).
     fn snowflake_clause_refusals(&mut self, sel: &Select, rw: &[Rewritten]) {
         let names: Vec<&str> = rw.iter().map(|(_, n, _)| n.as_str()).collect();
         if let GroupByExpr::Expressions(exprs, _) = &sel.group_by {
@@ -1401,8 +1478,9 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 .is_some_and(|e| super::snowflake::mentions(e, &names))
             {
                 self.refuse(format!(
-                    "{clause} uses the masked output name(s) {}; Snowflake would compare the masked value",
-                    names.join(", ")
+                    "{clause} uses the masked output name(s) {}; {} would compare the masked value",
+                    names.join(", "),
+                    self.tree_dialect()
                 ));
             }
         }
@@ -1523,7 +1601,9 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
             };
             if let Some(sink) = sink {
                 self.touches.record(&lin, sink);
-                if let (Sink::Projected { rewrite: true }, true) = (sink, self.snowflake) {
+                if let (Sink::Projected { rewrite: true }, true) =
+                    (sink, self.snowflake || self.sqlite)
+                {
                     if let Some(style) = mask_style_for(self.tags, &lin) {
                         // Snowflake names an unaliased column after the column
                         // (folded unless quoted): the alias is the column's
@@ -1545,19 +1625,19 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                                 | SelectItem::ExprWithAlias { expr: e, .. },
                             ) => {
                                 let orig = e.clone();
-                                *item = SelectItem::ExprWithAlias {
-                                    expr: super::snowflake::mask_expr(style, &orig),
-                                    alias,
-                                };
+                                if let Some(expr) = self.tree_mask(style, &orig) {
+                                    *item = SelectItem::ExprWithAlias { expr, alias };
+                                }
                                 rewritten.push((idx, name.clone(), orig));
                                 self.rewrote = true;
                             }
                             _ => {
                                 self.rewrote = true;
-                                self.refuse(
-                                    "an unaliased expression over a masked column has a name Snowflake derives from its text; alias it (`AS name`)"
-                                        .to_string(),
+                                let why = format!(
+                                    "an unaliased expression over a masked column has a name {} derives from its text; alias it (`AS name`)",
+                                    self.tree_dialect()
                                 );
+                                self.refuse(why);
                             }
                         }
                     }
@@ -1683,6 +1763,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 if let Some(args) = args {
                     // A table-valued function call.
                     self.snowflake_table_function(Some(name));
+                    self.sqlite_table_function(Some(name));
                     let mut lin = Lineage::new();
                     for a in args.args.iter_mut() {
                         merge(&mut lin, self.function_arg(a, d)?);
@@ -1737,10 +1818,12 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 }]
             }
             TableFactor::TableFunction { expr, alias } => {
-                self.snowflake_table_function(match &*expr {
+                let name = match &*expr {
                     Expr::Function(f) => Some(&f.name),
                     _ => None,
-                });
+                };
+                self.snowflake_table_function(name);
+                self.sqlite_table_function(name);
                 vec![Item::Opaque {
                     refname: alias_name(alias),
                     lin: indirect(self.expr(expr, d)?),
@@ -1750,6 +1833,7 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
                 name, args, alias, ..
             } => {
                 self.snowflake_table_function(Some(name));
+                self.sqlite_table_function(Some(name));
                 let mut lin = Lineage::new();
                 for a in args.iter_mut() {
                     merge(&mut lin, self.function_arg(a, d)?);
@@ -2223,9 +2307,9 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
 /// first (measured on 5.7 and 8.0), so the alias can no longer capture it.
 /// An expression over the name of a masked alias that is not itself a column
 /// (`ORDER BY LENGTH(le)`) would sort by the masked value: refused.
-/// Snowflake: why an `ORDER BY` cannot stay as it is over masked outputs
-/// (see the caller), or `None`.
-fn snowflake_order_refusal(ob: &OrderBy, rw: &[Rewritten]) -> Option<String> {
+/// Snowflake and SQLite: why an `ORDER BY` cannot stay as it is over masked
+/// outputs (see the caller), or `None`.
+fn snowflake_order_refusal(ob: &OrderBy, rw: &[Rewritten], dialect: &str) -> Option<String> {
     let names: Vec<&str> = rw.iter().map(|(_, n, _)| n.as_str()).collect();
     let OrderByKind::Expressions(items) = &ob.kind else {
         // `ORDER BY ALL` orders by every output, the masked ones included.
@@ -2239,7 +2323,7 @@ fn snowflake_order_refusal(ob: &OrderBy, rw: &[Rewritten]) -> Option<String> {
         })
         .then(|| {
             format!(
-                "ORDER BY uses the masked output(s) {}; Snowflake would order by the masked value",
+                "ORDER BY uses the masked output(s) {}; {dialect} would order by the masked value",
                 names.join(", ")
             )
         })

@@ -7,6 +7,145 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.0] — 2026-10-14
+
+SQLite becomes a dialect: `Dialect::Sqlite` (`"sqlite"`, also `"sqlite3"`),
+parsed with sqlparser's `SQLiteDialect`, with four SQLite rules, SQLite readings
+of five standard rules, SQLite identifier semantics for agent allowlists, a
+SQLite mask rewrite, and, for the statements sqlparser 0.63 does not read, a
+`PRAGMA` grammar, a planner-hint read-through, a keyword pre-classifier and an
+allowlist. SQLite is a library inside the application, so there is no wire
+protocol and no proxy: hosts evaluate through the Runtime API and its driver
+wrappers, the CLI and MCP. A minor release: every API change is additive (the
+`#[non_exhaustive]` types of 4.0.0 take the new variants and fields).
+
+**Nothing changes for the other dialects**: the verdicts of every SQL string in
+the test suites and fixtures of the engine (4.1.0's included), the proxy and the
+sidecar — 3,479 statements — were compared with 4.0.0 on PostgreSQL, MySQL,
+Oracle, SQL Server and Snowflake under seven policies (default, `parse_error:
+block`, `monitor_mode`, a CI `schema_migration_cap`, block/mask/flag tags, an
+enforced allowlist, an observed allowlist with tags): 121,765 outcomes, compared
+field by field, and none differs. No sqlparser type is part of the public API.
+
+### Added
+
+- **`Dialect::Sqlite`** and `parser::sqlite::SqliteParser`. The shared sqlparser
+  walker records the SQLite statement kinds the rules need: `ATTACH`, `PRAGMA`
+  (reads and writes), `VACUUM`, `CREATE TABLE … AS SELECT` (VERICTO-084), and a
+  trigger's body (`CREATE TRIGGER … BEGIN … END`), whose statements run on every
+  matching write and are walked as nested statements (`DELETE FROM log` inside
+  a trigger is VERICTO-001). UPSERT (`ON CONFLICT`), `INSERT OR REPLACE`,
+  `REPLACE INTO`, `RETURNING`, `WITH RECURSIVE`, window and JSON functions, every
+  quoting style (`"x"`, `` `x` ``, `[x]`) and placeholder (`?`, `?NNN`, `:name`,
+  `@name`, `$name`) read as on the other dialects. `parser::walk::not_analysed`
+  analyses `VACUUM` / `VACUUM <schema>` on SQLite; every other kind added since
+  sqlparser 0.52 is still a parse error.
+- **Before a SQLite text is a parse error** (only when the parse fails): the
+  planner hints `INDEXED BY <index>` / `NOT INDEXED` after a table name, and the
+  `IF NOT EXISTS` of `CREATE TRIGGER`, are read through (the statement is read
+  without them, the client's text is kept); a `PRAGMA` whose value is a keyword
+  or a name (`PRAGMA foreign_keys = OFF`, `PRAGMA table_info(users)`, `PRAGMA
+  cache_size = -2000`) is read with SQLite's grammar; an **allowlist** analyses
+  `DETACH [DATABASE] <name>`, `REINDEX [[schema.]name]` and `CREATE [TEMP]
+  VIRTUAL TABLE … USING fts3 | fts4 | fts5 | rtree | rtree_i32 | geopoly(…)`
+  (names, literals and `name = literal` options only) with no finding; and a
+  **pre-classifier** turns `VACUUM … INTO`, the `ATTACH` forms sqlparser does not
+  read, a safety pragma outside the grammar and a native-code call into findings.
+  A statement only recognised by its keywords is unread code: its outcome is the
+  stricter of the findings and the parse-error one.
+- **VERICTO-098 — SQLite ATTACH DATABASE** (High, Security): `ATTACH [DATABASE]
+  <file> AS <name>` opens, or creates, another database file on the connection.
+  `DETACH` is not reported.
+- **VERICTO-099 — SQLite safety PRAGMA** (High, SchemaMigration): a `PRAGMA`
+  write that turns a safety off — `writable_schema` (any value), `trusted_schema
+  = ON`, `foreign_keys = OFF`, `ignore_check_constraints = ON`, `journal_mode =
+  OFF`, `synchronous = OFF`, `cell_size_check = OFF`, `query_only = OFF`,
+  `schema_version = n`, `temp_store_directory` / `data_store_directory`. Reads
+  and other settings are not reported. SchemaMigration, so a CI channel's
+  `schema_migration_cap` softens it: `PRAGMA foreign_keys = OFF` is the standard
+  step of a SQLite table rebuild in Prisma, Drizzle, Django and Alembic
+  migrations.
+- **VERICTO-100 — SQLite extension loading or file functions** (Critical,
+  Security): `load_extension()`, `fts3_tokenizer()`, and the sqlite3 shell's
+  `readfile()`, `writefile()`, `edit()`, `fsdir()` and `zipfile()`. Read from the
+  tokens of the whole text, so a call in `INSERT … VALUES`, `UPDATE … SET`,
+  `ORDER BY` or under a quoted name is found; one in a string or a comment is
+  not.
+- **VERICTO-101 — SQLite VACUUM INTO** (High, Security): `VACUUM [schema] INTO
+  <file>`, a full copy of the database written to a path. Plain `VACUUM` is not
+  reported.
+- **The standard rules on SQLite** (design §4.2): direct — 001, 002, 010, 013,
+  015, 016, 019 (`DROP TRIGGER`), 030, 040, 042, 050, 051, 060, 061, 084;
+  variants — 003 and 090 (SQLite truthiness: a string literal with a non-zero
+  numeric prefix, `WHERE '1abc'`, and a double-quoted name spelling one, is
+  always-true), 070 (no sleep on SQLite: `randomblob(N)` / `zeroblob(N)` with a
+  constant `N` ≥ 10,000,000, the time-based probe), 085, 087; not applicable,
+  never fire on SQLite — 011, 012, 017, 018, 031, 033, 080, 081, 082, 083, 086.
+  The new codes read only what the SQLite walker and pre-classifier record, so
+  they never fire on another dialect, and like every code they fire only once
+  the host's catalogue lists them.
+- **VERICTO-087 on SQLite**: names compare ASCII case-insensitively, quoted or
+  not (entries accept `"x"`, `` `x` `` and `[x]`); the default schema is `main`
+  (or the host's `default_schema`), `temp` and attached databases are other
+  schemas; `sqlite_master` and the table-valued functions (`pragma_table_info`,
+  `dbstat`) need an entry naming them (`json_each` / `json_tree` read only their
+  arguments); `PRAGMA table_info | table_xinfo | index_list |
+  foreign_key_list(<t>)` reads every column of `<t>`; the connection settings
+  drivers send (`foreign_keys = ON`, `busy_timeout`, `journal_mode = WAL |
+  DELETE | TRUNCATE | PERSIST`, `synchronous = NORMAL | FULL | EXTRA`,
+  `cache_size`, `temp_store`, `defer_foreign_keys`, `recursive_triggers`,
+  `case_sensitive_like`) are allowed; every other `PRAGMA`, `ATTACH`, `DETACH`,
+  `VACUUM`, `REINDEX` and `ANALYZE` are denied as DDL.
+- **VERICTO-085 on SQLite**: a mask rewrite printed from the tree with core
+  functions only (`full`, `last4` with `substr(…, -4)`, `email` with
+  `instr`/`substr`), forwarded only when the unmodified statement prints back to
+  the client's tokens, the rewrite reparses to itself and the bind parameters
+  are the client's. **`hash` blocks on SQLite** (core SQLite has no SHA-256;
+  design open question Q7, resolved the conservative way). **A statement holding
+  a double-quoted name is not rewritten** (it blocks): SQLite reads `"x"` as a
+  string literal when no column `x` exists (DQS), which the engine cannot rule
+  out without a schema; block and flag tags count `"x"` as the column. As on
+  Snowflake, output names are kept and `ORDER BY` / `GROUP BY` / `HAVING` over a
+  masked output, or an unaliased expression over a masked column, block.
+- **`ParseErrorKind`** (`UnknownStatement`, `Syntax`, `TooComplex`; serialized
+  `unknown_statement`, `syntax`, `too_complex`; `#[non_exhaustive]`) and
+  `EvaluationOutcome::parse_error_kind()`, which tells a statement kind the
+  engine does not read (a corpus gap) from invalid SQL, for telemetry (design
+  §4.6). `None` for every outcome that is not a parse error. Also
+  `ParseErrorKind::classify` for a parse-error message.
+- `parser::SqliteRisk` (`#[non_exhaustive]`) and `StatementInfo::sqlite`.
+- Tests: `tests/sqlite.rs` (what the walker reads, the rules × SQLite matrix,
+  every SQLite rule's positive and negative cases and catalogue examples, rule
+  classes, parse errors and their kind, the parse-error floor, anchored
+  fallbacks, VERICTO-087 names, VERICTO-085 golden rewrites and refusals);
+  `tests/sqlite_corpus.rs` with a golden file over 171 SQLite statements written
+  for this repository (ORM and migration-tool DDL and DML, UPSERT, `WITH
+  RECURSIVE`, window, JSON and FTS5 queries, pragmas, transactions, maintenance,
+  and the dangerous statements, which all block), each checked with sqlite3
+  3.51: the engine recognises 100% (sqlparser alone 84.8%);
+  `tests/sqlite_mask_equivalence.rs`, which runs every SQLite mask through the
+  `sqlite3` shell (when one is on `PATH` or in `VERICTO_SQLITE3`) and compares the
+  values with the Postgres masks'. The 003/090 tautology suite, the nesting guard
+  and the property P9 also run on SQLite; the fuzz target covers Snowflake and
+  SQLite and the Snowflake and SQLite codes.
+
+### Changed
+
+- `SourceAst::Classified` (crate-private) carries its dialect; the README rule
+  classes table lists the Snowflake and SQLite codes.
+
+### Notes for hosts
+
+- The control plane seeds VERICTO-098 to VERICTO-101 (dialect `sqlite`); until
+  the catalogue lists them, an `ATTACH` or a `load_extension()` is not reported.
+- The proxy never sees SQLite (no wire protocol); its built-in fallback catalogue
+  needs no SQLite code. Hosts that `match` on `Dialect` already have a wildcard
+  arm (`#[non_exhaustive]` since 4.0.0).
+- Unparseable SQLite text follows the host's `parse_error`, as on every dialect.
+  A host that wants SQLite fail-closed by default (design §4.6, open question
+  Q10) serves `parse_error: block` for SQLite databases.
+- The version-pinned snippets in README.md and src/lib.rs are now v4.1.0.
+
 ## [4.0.0] — 2026-10-13
 
 A major release: Snowflake becomes a dialect, and the public types that grow
@@ -1547,7 +1686,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.0.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.1.0...HEAD
+[4.1.0]: https://github.com/vericto/vericto-engine/compare/v4.0.0...v4.1.0
 [4.0.0]: https://github.com/vericto/vericto-engine/compare/v3.9.0...v4.0.0
 [3.9.0]: https://github.com/vericto/vericto-engine/compare/v3.8.1...v3.9.0
 [3.8.1]: https://github.com/vericto/vericto-engine/compare/v3.8.0...v3.8.1

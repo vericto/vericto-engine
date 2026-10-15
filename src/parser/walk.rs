@@ -7,7 +7,7 @@
 
 use crate::error::{MAX_AST_DEPTH, ProxyError, Result, guard_nesting_depth};
 use crate::parser::{
-    AlterTableKind, Dialect, DropObjectKind, ParsedQuery, SnowflakeRisk, StatementInfo,
+    AlterTableKind, Dialect, DropObjectKind, ParsedQuery, SnowflakeRisk, SqliteRisk, StatementInfo,
     StatementKind, WherePresence,
 };
 
@@ -47,16 +47,28 @@ pub(crate) fn parse_text<D: SqlDialect>(
 
     let statements =
         SqlAstParser::parse_sql(dialect, sql).map_err(|e| ProxyError::ParseError(e.to_string()))?;
+    from_statements(statements, which, original)
+}
+
+/// Walks statements already parsed (or, for the SQLite `PRAGMA` forms
+/// sqlparser rejects, built by the SQLite parser) into a [`ParsedQuery`],
+/// keeping `original` (the client's text) where the dialect needs it.
+pub(crate) fn from_statements(
+    statements: Vec<Statement>,
+    which: crate::parser::Dialect,
+    original: &str,
+) -> Result<ParsedQuery> {
     // A statement kind sqlparser 0.52 rejected still resolves as the parse
     // error it was (see `not_analysed`).
     if let Some(kind) = statements.iter().find_map(|s| not_analysed(s, which)) {
         return Err(ProxyError::ParseError(format!(
-            "{kind}: statement not supported by the engine"
+            "{kind}: {UNSUPPORTED_STATEMENT}"
         )));
     }
 
     let cx = Cx {
         snowflake: which == Dialect::Snowflake,
+        sqlite: which == Dialect::Sqlite,
     };
     let mut collected: Vec<StatementInfo> = Vec::new();
     for stmt in &statements {
@@ -76,7 +88,7 @@ pub(crate) fn parse_text<D: SqlDialect>(
         ast: crate::parser::SourceAst::Sql {
             statements: std::sync::Arc::new(statements),
             dialect: which,
-            sql: matches!(which, Dialect::Mysql | Dialect::Snowflake)
+            sql: matches!(which, Dialect::Mysql | Dialect::Snowflake | Dialect::Sqlite)
                 .then(|| std::sync::Arc::from(original)),
         },
         mysql: None,
@@ -84,11 +96,20 @@ pub(crate) fn parse_text<D: SqlDialect>(
     })
 }
 
-/// What the walk needs to know about the dialect. Only Snowflake changes
-/// what is recorded; every other dialect walks exactly as before.
+/// The text of the parse error for a statement kind the engine does not
+/// analyse (see `not_analysed`); [`crate::ParseErrorKind`] reads it as an
+/// unknown statement.
+pub(crate) const UNSUPPORTED_STATEMENT: &str = "statement not supported by the engine";
+
+/// What the walk needs to know about the dialect. Only Snowflake and SQLite
+/// change what is recorded; every other dialect walks exactly as before.
 #[derive(Clone, Copy)]
 struct Cx {
     snowflake: bool,
+    /// SQLite: its statement kinds (`ATTACH`, `PRAGMA`, `VACUUM`), its
+    /// truthiness (`WHERE '1abc'` is true) and its time probe
+    /// (`randomblob(N)`).
+    sqlite: bool,
 }
 
 /// Snowflake code the engine does not read: a scripting block (`BEGIN … END`,
@@ -157,6 +178,22 @@ pub(crate) fn not_analysed(stmt: &Statement, dialect: Dialect) -> Option<&'stati
         | Statement::ShowObjects { .. }
         | Statement::CreateFileFormat { .. }
             if dialect == Dialect::Snowflake =>
+        {
+            None
+        }
+        // SQLite's `VACUUM` and `VACUUM <schema>` rebuild the database file in
+        // place (sqlparser reads them as Redshift's VACUUM, whose options
+        // SQLite does not have). `VACUUM INTO` does not parse; the SQLite
+        // pre-classifier reports it.
+        Statement::Vacuum(v)
+            if dialect == Dialect::Sqlite
+                && !(v.full
+                    || v.sort_only
+                    || v.delete_only
+                    || v.reindex
+                    || v.recluster
+                    || v.boost
+                    || v.threshold.is_some()) =>
         {
             None
         }
@@ -430,14 +467,13 @@ fn walk_statement(
     match stmt {
         // ── DELETE ─────────────────────────────────────────────────────────
         Statement::Delete(delete) => {
-            let presence = where_presence(delete.selection.as_ref());
+            let presence = where_presence(delete.selection.as_ref(), cx.sqlite);
             let relation = relation_from_delete(delete);
             let delete_limit = delete.limit.as_ref().and_then(expr_as_i64);
             let tautology = delete
                 .selection
                 .as_ref()
-                .map(has_or_tautology)
-                .unwrap_or(false);
+                .is_some_and(|e| has_or_tautology(e, cx.sqlite));
 
             out.push(StatementInfo {
                 kind: StatementKind::Delete,
@@ -461,9 +497,11 @@ fn walk_statement(
         Statement::Update(sqlparser::ast::Update {
             selection, table, ..
         }) => {
-            let presence = where_presence(selection.as_ref());
+            let presence = where_presence(selection.as_ref(), cx.sqlite);
             let relation = relation_from_table_with_joins(table);
-            let tautology = selection.as_ref().map(has_or_tautology).unwrap_or(false);
+            let tautology = selection
+                .as_ref()
+                .is_some_and(|e| has_or_tautology(e, cx.sqlite));
             out.push(StatementInfo {
                 kind: StatementKind::Update,
                 relation,
@@ -634,7 +672,7 @@ fn walk_statement(
                         let effective_where = select
                             .selection
                             .as_ref()
-                            .map(|e| !is_always_true(e))
+                            .map(|e| !is_always_true(e, cx.sqlite))
                             .unwrap_or(false);
                         effective_where || has_row_limit(query) || query.fetch.is_some()
                     }
@@ -753,9 +791,96 @@ fn walk_statement(
             if cx.snowflake {
                 walk_snowflake(other, is_nested, depth, cx, out)?;
             }
+            if cx.sqlite {
+                walk_sqlite(other, is_nested, depth, cx, out)?;
+            }
         }
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SQLite statements
+// ---------------------------------------------------------------------------
+
+/// The SQLite-only statement kinds (`ATTACH`, `PRAGMA`), and the SQLite
+/// readings of shared ones (`CREATE TABLE … AS`, a trigger's body). Only
+/// called on SQLite.
+fn walk_sqlite(
+    stmt: &Statement,
+    is_nested: bool,
+    depth: usize,
+    cx: Cx,
+    out: &mut Vec<StatementInfo>,
+) -> Result<()> {
+    let risk = |what: SqliteRisk, relation: Option<String>, path: String| StatementInfo {
+        relation,
+        is_nested,
+        ast_node_path: path,
+        sqlite: Some(what),
+        ..Default::default()
+    };
+    match stmt {
+        // `ATTACH 'file' AS name` opens (or creates) that file: VERICTO-098.
+        Statement::AttachDatabase {
+            schema_name,
+            database_file_name,
+            ..
+        } => out.push(risk(
+            SqliteRisk::Attach,
+            Some(schema_name.to_string()),
+            format!("AttachStmt > {database_file_name} AS {schema_name}"),
+        )),
+        // A PRAGMA that turns a safety off: VERICTO-099. Reads and the other
+        // settings are recorded with no finding.
+        Statement::Pragma { name, value, .. } => {
+            let value = value.as_ref().map(|v| &v.value);
+            out.push(match crate::parser::sqlite::pragma_risk(name, value) {
+                Some(why) => risk(
+                    SqliteRisk::SafetyPragma,
+                    None,
+                    format!("PragmaStmt > {why}"),
+                ),
+                None => StatementInfo {
+                    is_nested,
+                    ast_node_path: format!("PragmaStmt > {name}"),
+                    ..Default::default()
+                },
+            });
+        }
+        // `CREATE TABLE … AS SELECT` copies the rows (VERICTO-084).
+        Statement::CreateTable(ct) => {
+            if let Some(q) = ct.query.as_deref() {
+                out.push(StatementInfo {
+                    kind: StatementKind::CreateTableAs,
+                    relation: Some(ct.name.to_string()),
+                    is_nested,
+                    ast_node_path: "CreateTableAsStmt".to_string(),
+                    ..Default::default()
+                });
+                walk_query(q, true, depth + 1, cx, out)?;
+            }
+        }
+        // A trigger's body runs on every matching write, outside any check:
+        // its statements are walked, as nested.
+        Statement::CreateTrigger(ct) => {
+            if let Some(body) = &ct.statements {
+                let start = out.len();
+                for s in body.statements() {
+                    walk_statement(s, true, depth + 1, cx, out)?;
+                }
+                for s in &mut out[start..] {
+                    let path = s
+                        .ast_node_path
+                        .strip_prefix("WithClause > ")
+                        .unwrap_or(&s.ast_node_path);
+                    s.ast_node_path = format!("CreateTriggerStmt {} > {path}", ct.name);
+                }
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -1214,8 +1339,7 @@ fn walk_set_expr(
             let tautology = select
                 .selection
                 .as_ref()
-                .map(has_or_tautology)
-                .unwrap_or(false);
+                .is_some_and(|e| has_or_tautology(e, cx.sqlite));
 
             // WHERE recursion (subqueries and sleep-family calls)
             if let Some(expr) = select.selection.as_ref() {
@@ -1260,7 +1384,7 @@ fn walk_set_expr(
                 has_or_tautology: tautology,
                 where_presence: match select.selection.as_ref() {
                     None => WherePresence::Absent,
-                    Some(e) if is_always_true(e) => WherePresence::AlwaysTrue,
+                    Some(e) if is_always_true(e, cx.sqlite) => WherePresence::AlwaysTrue,
                     Some(_) => WherePresence::Present,
                 },
                 ..Default::default()
@@ -1343,11 +1467,23 @@ fn walk_expr(expr: &Expr, depth: usize, cx: Cx, out: &mut Vec<StatementInfo>) ->
             // rule's `func_name:` predicate can name any function as documented.
             // The sleep-family filter lives in VERICTO-070's predicate; mirrors
             // the pg_query walker.
+            // SQLite has no sleep: a huge `randomblob(N)` / `zeroblob(N)` is
+            // its time-based probe (VERICTO-070).
+            let probe = cx.sqlite
+                && matches!(name.as_str(), "randomblob" | "zeroblob")
+                && first_arg(func)
+                    .and_then(const_number)
+                    .is_some_and(|n| n >= SQLITE_PROBE_BYTES);
             if !name.is_empty() {
                 out.push(StatementInfo {
                     kind: StatementKind::FunctionCall,
-                    ast_node_path: format!("FunctionCall > {name}()"),
+                    ast_node_path: if probe {
+                        format!("FunctionCall > {name}() (a huge constant size: a time probe)")
+                    } else {
+                        format!("FunctionCall > {name}()")
+                    },
                     function_name: Some(name),
+                    sqlite: probe.then_some(SqliteRisk::TimeProbe),
                     ..Default::default()
                 });
             }
@@ -1384,6 +1520,57 @@ fn walk_expr(expr: &Expr, depth: usize, cx: Cx, out: &mut Vec<StatementInfo>) ->
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The `randomblob(N)` / `zeroblob(N)` size from which SQLite spends a
+/// noticeable time building the value: 10 MB (a second or more at 500 MB,
+/// the size injection tools use). Legitimate blobs this size are not built
+/// in SQL text.
+const SQLITE_PROBE_BYTES: f64 = 10_000_000.0;
+
+/// The first positional argument of a call.
+fn first_arg(func: &sqlparser::ast::Function) -> Option<&Expr> {
+    match &func.args {
+        FunctionArguments::List(list) => match list.args.first()? {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                Some(e)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The value of a constant arithmetic expression over number literals
+/// (`500000000/2`, `-(1e9)`); `None` for anything else.
+fn const_number(e: &Expr) -> Option<f64> {
+    use sqlparser::ast::{BinaryOperator, UnaryOperator};
+    match e {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) => n.parse().ok(),
+        Expr::Nested(x) => const_number(x),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => const_number(expr).map(|v| -v),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => const_number(expr),
+        Expr::BinaryOp { left, op, right } => {
+            let (l, r) = (const_number(left)?, const_number(right)?);
+            match op {
+                BinaryOperator::Plus => Some(l + r),
+                BinaryOperator::Minus => Some(l - r),
+                BinaryOperator::Multiply => Some(l * r),
+                BinaryOperator::Divide if r != 0.0 => Some(l / r),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn walk_with_from_ctes(
     from: &FromTable,
     depth: usize,
@@ -1400,10 +1587,10 @@ fn walk_with_from_ctes(
     Ok(())
 }
 
-fn where_presence(selection: Option<&Expr>) -> WherePresence {
+fn where_presence(selection: Option<&Expr>, sqlite: bool) -> WherePresence {
     match selection {
         None => WherePresence::Absent,
-        Some(expr) if is_always_true(expr) => WherePresence::AlwaysTrue,
+        Some(expr) if is_always_true(expr, sqlite) => WherePresence::AlwaysTrue,
         Some(_) => WherePresence::Present,
     }
 }
@@ -1417,8 +1604,17 @@ fn where_presence(selection: Option<&Expr>) -> WherePresence {
 /// Every form other than `id = id` is constant-only: a column operand disqualifies
 /// the predicate, since its truth value then depends on the row. Property 9
 /// (`rules::properties`) locks that invariant across both walkers.
-fn is_always_true(expr: &Expr) -> bool {
+///
+/// `sqlite`: SQLite reads a text value as a number in a boolean context
+/// (its numeric prefix, `'1abc'` → 1), so a string literal with a non-zero
+/// numeric prefix is true; so is a double-quoted name spelling one, which
+/// SQLite takes for a string when no column has that name (its
+/// double-quoted-string fallback).
+fn is_always_true(expr: &Expr, sqlite: bool) -> bool {
     use sqlparser::ast::{BinaryOperator, UnaryOperator};
+    if sqlite && sqlite_text_truth(expr) == Some(true) {
+        return true;
+    }
     match expr {
         Expr::Value(ValueWithSpan {
             value: Value::Boolean(true),
@@ -1436,11 +1632,11 @@ fn is_always_true(expr: &Expr) -> bool {
             value: Value::Number(n, _),
             ..
         }) => n.parse::<f64>().map(|v| v != 0.0).unwrap_or(false),
-        Expr::Nested(inner) => is_always_true(inner),
+        Expr::Nested(inner) => is_always_true(inner, sqlite),
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr: inner,
-        } => is_always_false(inner),
+        } => is_always_false(inner, sqlite),
 
         // `<const> IN (<const>, …)`. Only the positive form: `NOT IN` is not the
         // negation of `IN` under three-valued logic — with a NULL in the list the
@@ -1478,8 +1674,8 @@ fn is_always_true(expr: &Expr) -> bool {
             | BinaryOperator::LtEq
             | BinaryOperator::Gt
             | BinaryOperator::GtEq => const_cmp_true(left, op, right),
-            BinaryOperator::Or => is_always_true(left) || is_always_true(right),
-            BinaryOperator::And => is_always_true(left) && is_always_true(right),
+            BinaryOperator::Or => is_always_true(left, sqlite) || is_always_true(right, sqlite),
+            BinaryOperator::And => is_always_true(left, sqlite) && is_always_true(right, sqlite),
             _ => false,
         },
         _ => false,
@@ -1487,8 +1683,11 @@ fn is_always_true(expr: &Expr) -> bool {
 }
 
 /// Dual of `is_always_true` for evaluating `NOT (…)`. Conservative.
-fn is_always_false(expr: &Expr) -> bool {
+fn is_always_false(expr: &Expr, sqlite: bool) -> bool {
     use sqlparser::ast::{BinaryOperator, UnaryOperator};
+    if sqlite && sqlite_text_truth(expr) == Some(false) {
+        return true;
+    }
     match expr {
         Expr::Value(ValueWithSpan {
             value: Value::Boolean(false),
@@ -1502,11 +1701,11 @@ fn is_always_false(expr: &Expr) -> bool {
             value: Value::Number(n, _),
             ..
         }) => n.parse::<f64>().map(|v| v == 0.0).unwrap_or(false),
-        Expr::Nested(inner) => is_always_false(inner),
+        Expr::Nested(inner) => is_always_false(inner, sqlite),
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr: inner,
-        } => is_always_true(inner),
+        } => is_always_true(inner, sqlite),
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::Eq
             | BinaryOperator::NotEq
@@ -1667,28 +1866,81 @@ fn const_cmp_true(left: &Expr, op: &sqlparser::ast::BinaryOperator, right: &Expr
 ///
 /// Note: `is_always_true` already covers the case where the entire predicate
 /// is trivial. This function catches the mixed case where only an OR branch is.
-fn has_or_tautology(expr: &Expr) -> bool {
+fn has_or_tautology(expr: &Expr, sqlite: bool) -> bool {
     match expr {
         Expr::BinaryOp { left, op, right } => {
             use sqlparser::ast::BinaryOperator;
             match op {
                 // `a OR always_true` or `always_true OR a`
                 BinaryOperator::Or => {
-                    is_always_true(left.as_ref())
-                        || is_always_true(right.as_ref())
-                        || has_or_tautology(left.as_ref())
-                        || has_or_tautology(right.as_ref())
+                    is_always_true(left.as_ref(), sqlite)
+                        || is_always_true(right.as_ref(), sqlite)
+                        || has_or_tautology(left.as_ref(), sqlite)
+                        || has_or_tautology(right.as_ref(), sqlite)
                 }
                 // Recurse into AND branches
                 BinaryOperator::And => {
-                    has_or_tautology(left.as_ref()) || has_or_tautology(right.as_ref())
+                    has_or_tautology(left.as_ref(), sqlite)
+                        || has_or_tautology(right.as_ref(), sqlite)
                 }
                 _ => false,
             }
         }
-        Expr::Nested(inner) => has_or_tautology(inner),
+        Expr::Nested(inner) => has_or_tautology(inner, sqlite),
         _ => false,
     }
+}
+
+/// SQLite's truth value of a text constant: a string literal (or a
+/// double-quoted name, which SQLite reads as a string when no column has
+/// that name) is read as the number its numeric prefix spells (`'1abc'` →
+/// 1, `' 2.5'` → 2.5, `'abc'` → 0). `None` for anything else.
+fn sqlite_text_truth(expr: &Expr) -> Option<bool> {
+    let text = match unwrap_nested(expr) {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+            ..
+        }) => s.as_str(),
+        Expr::Identifier(i) if i.quote_style == Some('"') => i.value.as_str(),
+        _ => return None,
+    };
+    Some(sqlite_numeric_prefix(text) != 0.0)
+}
+
+/// The value SQLite gives a text in a numeric context: its longest prefix
+/// that reads as a number, after leading spaces (`0` when there is none).
+pub(crate) fn sqlite_numeric_prefix(text: &str) -> f64 {
+    let t = text.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    let b = t.as_bytes();
+    let mut end = 0;
+    if matches!(b.first(), Some(b'+' | b'-')) {
+        end = 1;
+    }
+    let digits = |from: usize| b[from..].iter().take_while(|c| c.is_ascii_digit()).count();
+    let int = digits(end);
+    end += int;
+    let mut frac = 0;
+    if b.get(end) == Some(&b'.') {
+        frac = digits(end + 1);
+        if int + frac > 0 {
+            end += 1 + frac;
+        }
+    }
+    if int + frac == 0 {
+        return 0.0;
+    }
+    // An exponent counts only when digits follow it.
+    if matches!(b.get(end), Some(b'e' | b'E')) {
+        let mut k = end + 1;
+        if matches!(b.get(k), Some(b'+' | b'-')) {
+            k += 1;
+        }
+        let n = digits(k);
+        if n > 0 {
+            end = k + n;
+        }
+    }
+    t[..end].parse::<f64>().unwrap_or(0.0)
 }
 
 fn expr_as_i64(expr: &Expr) -> Option<i64> {

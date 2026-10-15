@@ -6,7 +6,7 @@
 use serde::Deserialize;
 
 use crate::parser::{
-    AlterTableKind, Dialect, DropObjectKind, ParsedQuery, SnowflakeRisk, StatementInfo,
+    AlterTableKind, Dialect, DropObjectKind, ParsedQuery, SnowflakeRisk, SqliteRisk, StatementInfo,
     StatementKind, WherePresence, is_sleep_function,
 };
 use crate::rules::engine::{Rule, RuleType};
@@ -41,11 +41,40 @@ pub fn evaluate_rule(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
 ///
 /// VERICTO-080 (`COPY … PROGRAM`) needs no entry: Snowflake has no `PROGRAM`
 /// form, and its exfiltration analogue, `COPY INTO @stage`, is VERICTO-091.
+///
+/// SQLite (statements sqlparser reads but SQLite rejects, so they never run):
+/// - VERICTO-011: no `TRUNCATE` (SQLite's truncate optimisation is a `DELETE`
+///   without `WHERE`, VERICTO-001).
+/// - VERICTO-012: no `DROP SCHEMA` (`DETACH` closes an attached database and
+///   destroys nothing).
+/// - VERICTO-017 / VERICTO-018: `ALTER TABLE` has no `DROP CONSTRAINT` and no
+///   `ALTER COLUMN`.
+/// - VERICTO-031 / VERICTO-033: no data-modifying CTEs.
+/// - VERICTO-080 / VERICTO-081 / VERICTO-082 / VERICTO-083: no `COPY`, no `DO`
+///   block, no `GRANT`/`REVOKE`, no `MERGE`.
+/// - VERICTO-086: MySQL's lexical ambiguity; SQLite's own (a double-quoted
+///   string) is handled by VERICTO-085 and VERICTO-087.
+///
+/// VERICTO-019 stays: SQLite has `DROP TRIGGER`.
 fn not_applicable(code: &str, dialect: Option<Dialect>) -> bool {
     match dialect {
         Some(Dialect::Snowflake) => matches!(
             code,
             "VERICTO-002" | "VERICTO-031" | "VERICTO-033" | "VERICTO-086"
+        ),
+        Some(Dialect::Sqlite) => matches!(
+            code,
+            "VERICTO-011"
+                | "VERICTO-012"
+                | "VERICTO-017"
+                | "VERICTO-018"
+                | "VERICTO-031"
+                | "VERICTO-033"
+                | "VERICTO-080"
+                | "VERICTO-081"
+                | "VERICTO-082"
+                | "VERICTO-083"
+                | "VERICTO-086"
         ),
         Some(Dialect::Postgres | Dialect::Mysql | Dialect::Oracle | Dialect::MsSql) | None => false,
     }
@@ -352,11 +381,14 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         // name any function; this arm previously matched *any* FunctionCall and
         // relied on the parser having pre-filtered, which would make
         // `SELECT now()` a Critical/High violation the moment that filter moved.
+        // SQLite has no sleep: its probe is a huge `randomblob(N)` /
+        // `zeroblob(N)`, which only the SQLite walker records.
         "VERICTO-070" => find(stmts, |s| {
             s.kind == StatementKind::FunctionCall
-                && s.function_name
+                && (s.function_name
                     .as_deref()
                     .is_some_and(is_sleep_function)
+                    || s.sqlite == Some(SqliteRisk::TimeProbe))
         })
         .map(|s| {
             let fname = s.function_name.as_deref().unwrap_or("sleep");
@@ -582,6 +614,49 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
             )
         }),
 
+        // ── SQLite (design §4.3, SL-1 … SL-4) ─────────────────────────────
+        // Read only the `sqlite` field, which only the SQLite walker and
+        // pre-classifier set: these codes never fire on another dialect.
+
+        // VERICTO-098: `ATTACH [DATABASE] <file> AS <name>` — opens, or
+        // creates, another database file on the connection.
+        "VERICTO-098" => sqlite(stmts, SqliteRisk::Attach).map(|s| {
+            violation(
+                rule,
+                s,
+                Some("Open the databases the application needs in its connection setup, never from SQL it receives".to_string()),
+            )
+        }),
+
+        // VERICTO-099: a PRAGMA write that turns a safety off.
+        "VERICTO-099" => sqlite(stmts, SqliteRisk::SafetyPragma).map(|s| {
+            violation(
+                rule,
+                s,
+                Some("Leave safety pragmas to the connection setup; in a migration, restore them in the same script".to_string()),
+            )
+        }),
+
+        // VERICTO-100: `load_extension()`, `fts3_tokenizer()`, `readfile()`,
+        // `writefile()`, `edit()` — native code or the file system.
+        "VERICTO-100" => sqlite(stmts, SqliteRisk::NativeCode).map(|s| {
+            violation(
+                rule,
+                s,
+                Some("Load extensions in the application's connection setup with extension loading disabled for SQL".to_string()),
+            )
+        }),
+
+        // VERICTO-101: `VACUUM [schema] INTO <file>` — a full copy of the
+        // database written to a path.
+        "VERICTO-101" => sqlite(stmts, SqliteRisk::VacuumInto).map(|s| {
+            violation(
+                rule,
+                s,
+                Some("Back up through the backup API or a reviewed job, not from SQL it receives".to_string()),
+            )
+        }),
+
         // Unknown or not-yet-implemented built-in codes: pass through.
         _ => None,
     }
@@ -590,6 +665,11 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
 /// The first entry recording the Snowflake risk `what`.
 fn snowflake(stmts: &[StatementInfo], what: SnowflakeRisk) -> Option<&StatementInfo> {
     find(stmts, |s| s.snowflake == Some(what))
+}
+
+/// The first entry recording the SQLite risk `what`.
+fn sqlite(stmts: &[StatementInfo], what: SqliteRisk) -> Option<&StatementInfo> {
+    find(stmts, |s| s.sqlite == Some(what))
 }
 
 // ---------------------------------------------------------------------------

@@ -50,6 +50,17 @@ const CODES: &[&str] = &[
     "VERICTO-086",
     "VERICTO-087",
     "VERICTO-090",
+    "VERICTO-091",
+    "VERICTO-092",
+    "VERICTO-093",
+    "VERICTO-094",
+    "VERICTO-095",
+    "VERICTO-096",
+    "VERICTO-097",
+    "VERICTO-098",
+    "VERICTO-099",
+    "VERICTO-100",
+    "VERICTO-101",
 ];
 
 fn rules() -> &'static [Rule] {
@@ -80,11 +91,13 @@ fuzz_target!(|data: &[u8]| {
     let Ok(sql) = std::str::from_utf8(rest) else {
         return;
     };
-    let dialect = match selector % 4 {
+    let dialect = match selector % 6 {
         0 => Dialect::Postgres,
         1 => Dialect::Mysql,
         2 => Dialect::Oracle,
-        _ => Dialect::MsSql,
+        3 => Dialect::MsSql,
+        4 => Dialect::Snowflake,
+        _ => Dialect::Sqlite,
     };
     let _ = evaluate(sql, dialect, rules(), &EnforcementPolicy::default());
 });

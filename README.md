@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.0.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.1.0" }
 ```
 
 ### Quick example
@@ -122,9 +122,19 @@ already ran every rule and simply discarded the rest.
 | SQL Server | `sqlparser-rs` 0.63                  | host's `parse_error` (fail-open: flag) |
 | Oracle     | `sqlparser-rs` 0.63                  | host's `parse_error` (fail-open: flag) |
 | Snowflake  | `sqlparser-rs` 0.63 (`SnowflakeDialect`) + keyword pre-classifier and allowlist | host's `parse_error` (fail-open: flag); see [Snowflake](#snowflake) |
+| SQLite     | `sqlparser-rs` 0.63 (`SQLiteDialect`) + `PRAGMA` grammar, keyword pre-classifier and allowlist | host's `parse_error` (fail-open: flag); see [SQLite](#sqlite) |
 
 `Dialect::parse_dialect` accepts `postgres`/`postgresql`, `mysql`, `oracle`,
-`mssql`/`sqlserver`/`tsql` and `snowflake`.
+`mssql`/`sqlserver`/`tsql`, `snowflake` and `sqlite`/`sqlite3`.
+
+Every parse-error outcome says why the text did not parse:
+`EvaluationOutcome::parse_error_kind()` is `Some(ParseErrorKind::UnknownStatement)`
+for a statement kind the parser does not know or the engine does not analyse (a
+gap worth adding to a corpus), `Some(ParseErrorKind::Syntax)` for a known kind
+whose text the parser rejects, `Some(ParseErrorKind::TooComplex)` for nesting past
+the limits, and `None` for every outcome that is not a parse error
+(`ParseErrorKind::as_str`: `unknown_statement`, `syntax`, `too_complex`).
+PostgreSQL's parser reports every failure as a syntax error.
 
 ---
 
@@ -138,8 +148,9 @@ enforcement action via the policy (Critical/High → Block, Medium → Flag,
 Low/Informational → Monitor).
 
 > Dialect notes: PostgreSQL is parsed with `libpg_query`; MySQL/Oracle/MSSQL/
-> Snowflake with `sqlparser-rs`. Differences are called out per rule; how each
-> rule applies on Snowflake is in [Snowflake](#snowflake).
+> Snowflake/SQLite with `sqlparser-rs`. Differences are called out per rule; how
+> each rule applies on Snowflake is in [Snowflake](#snowflake), and on SQLite in
+> [SQLite](#sqlite).
 
 ### Critical
 
@@ -159,6 +170,7 @@ Low/Informational → Monitor).
 | VERICTO-091 | Stage unload or file transfer | `COPY INTO @stage \| @~ \| 's3://…' \| 'azure://…' \| 'gcs://…'` (an unload), `GET @stage`, `PUT … @stage` — data or files leave through a stage or an external location. Security; never softened by a channel cap. (Snowflake.) |
 | VERICTO-092 | External stage or integration | `CREATE`/`ALTER STAGE` with `URL =` or inline `CREDENTIALS`, `CREATE STORAGE \| EXTERNAL ACCESS \| API INTEGRATION`, `CREATE EXTERNAL FUNCTION`, an egress `CREATE NETWORK RULE` — a path out of the account. Security. (Snowflake.) |
 | VERICTO-093 | Share to another account | `GRANT … TO SHARE`, `CREATE SHARE`, `ALTER SHARE … ADD \| SET ACCOUNTS`, `CREATE LISTING` — data leaves the account. `GRANT … TO SHARE` is also a GRANT (VERICTO-082). Security. (Snowflake.) |
+| VERICTO-100 | SQLite extension loading or file functions | `load_extension()` (native code), `fts3_tokenizer()` (a tokenizer registered by raw pointer), and the sqlite3 shell's `readfile()`, `writefile()`, `edit()` (the file system), in any clause, a quoted function name too. Security. (SQLite.) |
 
 ### High
 
@@ -174,7 +186,7 @@ Low/Informational → Monitor).
 | VERICTO-031 | UPDATE in CTE without WHERE | A data-modifying CTE (`WITH x AS (UPDATE … )`) whose `UPDATE` has no WHERE. |
 | VERICTO-033 | DELETE in subquery/CTE without WHERE | A nested `DELETE` with no WHERE inside a subquery or CTE. |
 | VERICTO-040 | INSERT INTO … SELECT without filter | `INSERT … SELECT` whose source has no filter — copies every source row. |
-| VERICTO-070 | SLEEP() / PG_SLEEP() | A sleep-family call (`sleep`, `pg_sleep`, `pg_sleep_for`, `pg_sleep_until`, Snowflake's `system$wait`) anywhere in the query — DoS / time-based blind injection probing. |
+| VERICTO-070 | SLEEP() / PG_SLEEP() | A sleep-family call (`sleep`, `pg_sleep`, `pg_sleep_for`, `pg_sleep_until`, Snowflake's `system$wait`) anywhere in the query — DoS / time-based blind injection probing. SQLite has no sleep: there, a `randomblob(N)` / `zeroblob(N)` with a constant `N` of 10,000,000 bytes or more (`randomblob(500000000/2)`). |
 | VERICTO-082 | GRANT / REVOKE | A `GRANT` or `REVOKE` — privilege escalation or accidental lockout. |
 | VERICTO-083 | MERGE | `MERGE INTO …` — can mass-mutate the target like an UPDATE/DELETE with no effective WHERE. |
 | VERICTO-084 | CREATE TABLE AS SELECT | `CREATE TABLE … AS SELECT …` / `SELECT … INTO` — bulk data copy that can duplicate a whole table. |
@@ -183,6 +195,9 @@ Low/Informational → Monitor).
 | VERICTO-095 | Warehouse cost | `CREATE`/`ALTER WAREHOUSE` setting `WAREHOUSE_SIZE`, a cluster count, a type, a scaling policy, query acceleration or a never-suspend `AUTO_SUSPEND` (`0`/`NULL`); `ALTER RESOURCE MONITOR`. A warehouse created with the defaults is not reported. Performance. (Snowflake.) |
 | VERICTO-096 | Code that runs later | `CREATE TASK \| STREAM \| PIPE \| PROCEDURE \| FUNCTION \| ALERT` (`OR REPLACE`/`OR ALTER` too), `ALTER TASK … RESUME \| MODIFY AS`, `EXECUTE TASK \| ALERT …` — embedded statements run later, outside any check. Security. (Snowflake.) |
 | VERICTO-097 | Role switch | `USE ROLE r` (the evidence names an administrative role: `ACCOUNTADMIN`, `SECURITYADMIN`, `SYSADMIN`, `USERADMIN`, `ORGADMIN`), `USE SECONDARY ROLES ALL \| <roles>`. `USE SECONDARY ROLES NONE` only narrows privileges and is not reported. Security. (Snowflake.) |
+| VERICTO-098 | SQLite ATTACH DATABASE | `ATTACH [DATABASE] <file> AS <name>` — opens, or creates, another database file on the connection: arbitrary file access or creation, reads and writes across databases (`':memory:'` too). `DETACH` is not reported. Security. (SQLite.) |
+| VERICTO-099 | SQLite safety PRAGMA | A `PRAGMA` write that turns a safety off: `writable_schema` (any value), `trusted_schema = ON`, `foreign_keys = OFF`, `ignore_check_constraints = ON`, `journal_mode = OFF`, `synchronous = OFF`, `cell_size_check = OFF`, `query_only = OFF`, `schema_version = n`, `temp_store_directory` / `data_store_directory`. Reads (`PRAGMA table_info(t)`) and other settings are not reported. SchemaMigration: a CI channel's `schema_migration_cap` softens it (`PRAGMA foreign_keys = OFF` is the standard step of a SQLite table rebuild in migrations). (SQLite.) |
+| VERICTO-101 | SQLite VACUUM INTO | `VACUUM [schema] INTO <file>` — a full copy of the database written to a path. Plain `VACUUM` is not reported. Security. (SQLite.) |
 | VERICTO-087 | Access outside the agent's allowlist | The identity making the call (an API key, or the database user of a proxy session) references a table, column or write target its allowlist does not grant, or runs DDL. Every reference counts, predicates included. Driven by `EnforcementPolicy::access_policy`, not by the rules slice; blocks under `mode = enforce`, flags under `observe`. See [Agent access allowlists](#agent-access-allowlists-vericto-087). |
 
 ### Medium
@@ -229,6 +244,12 @@ then cannot depend on the row, so it filters nothing:
 Plus one deliberate exception: the column self-comparison `id = id`, the canonical
 trick for neutralising a `WHERE`, which has no legitimate use.
 
+**SQLite** reads a text value as a number in a boolean context (its numeric
+prefix: `'1abc'` is 1), so on SQLite a string literal with a non-zero numeric
+prefix is always-true too (`WHERE '1abc'`, `OR '1'`), and so is a double-quoted
+name spelling one (`WHERE "1"`), which SQLite reads as a string when no column
+has that name.
+
 ### What does not count, and why
 
 A predicate that references a column is a real filter, even when it reads like a
@@ -263,10 +284,10 @@ Every built-in code carries a static [`RuleClass`](src/rules/engine.rs) — the
 
 | Class | Codes | What it covers |
 |---|---|---|
-| `SchemaMigration` | 010–019 | DROP TABLE/DATABASE/SCHEMA, TRUNCATE, ALTER TABLE, DROP INDEX, DROP TRIGGER. Destructive against a live database, but normal in a versioned migration. |
+| `SchemaMigration` | 010–019, 094, 099 | DROP TABLE/DATABASE/SCHEMA, TRUNCATE, ALTER TABLE, DROP INDEX, DROP TRIGGER, Snowflake recovery reduced, SQLite safety pragmas. Destructive against a live database, but normal in a versioned migration. |
 | `DataMutation` | 001, 002, 003, 030, 031, 033, 040, 042, 083, 084 | Data mutation without adequate scope. Dangerous on *any* channel — a WHERE-less DELETE is never intended, even in a migration. |
-| `Security` | 070, 080, 081, 082, 085, 086, 087, 090 | Injection tautologies, `COPY … PROGRAM`, `DO` blocks, GRANT/REVOKE, sleep-based probing, reads of sensitive columns, MySQL text read differently, access outside an agent's allowlist. |
-| `Performance` | 050, 051, 060, 061 | Best-practice / performance hints. Advisory. |
+| `Security` | 070, 080, 081, 082, 085, 086, 087, 090, 091–093, 096–098, 100, 101 | Injection tautologies, `COPY … PROGRAM`, `DO` blocks, GRANT/REVOKE, sleep-based probing, reads of sensitive columns, MySQL text read differently, access outside an agent's allowlist, Snowflake unloads, external access, shares, persistent code and role switches, SQLite `ATTACH`, native-code functions and `VACUUM INTO`. |
+| `Performance` | 050, 051, 060, 061, 095 | Best-practice / performance hints, Snowflake warehouse cost. Advisory. |
 
 Custom rules and any unrecognized code classify as `DataMutation` — the
 conservative default, since that class is never softened by a cap.
@@ -493,6 +514,34 @@ The rewrites are pinned by golden outputs (`tests/snowflake.rs`); there is no
 Snowflake emulator, so an equivalence run against a real account, like the
 Postgres and MySQL ones, is not part of this repository's CI.
 
+### Mask rewrite (SQLite)
+
+Printed back from the sqlparser tree, with Snowflake's checks (the unmodified
+statement prints back to the client's tokens, the rewrite parses back to itself,
+the bind parameters `?`, `?NNN`, `:name`, `@name`, `$name` are the client's, in
+order) and one more: **a statement holding a double-quoted name is not
+rewritten** (it blocks). SQLite reads `"x"` as a string literal when no column
+`x` is in scope (its double-quoted-string fallback), and without a schema the
+engine cannot rule that out; `[x]` and `` `x` `` are always names. Block and flag
+tags count `"x"` as a column reference, the conservative direction. Hosts that
+open the database should also turn the fallback off
+(`SQLITE_DBCONFIG_DQS_DML = 0`). The masks use core functions only:
+
+| Style | Expression (`x` = `CAST(col AS TEXT)`) |
+|---|---|
+| `full` | `'[redacted]'` (a computed value or one holding a bind parameter: `'[redacted]' \|\| coalesce(substr(x, 1, 0), '')`) |
+| `last4` | `'****' \|\| substr(x, -4)` |
+| `email` | `CASE WHEN length(x) = 0 THEN x WHEN instr(substr(x, 2), '@') > 0 THEN substr(x, 1, 1) \|\| '***' \|\| substr(x, instr(substr(x, 2), '@') + 1) ELSE substr(x, 1, 1) \|\| '***' END` |
+| `hash` | **blocks**: core SQLite has no SHA-256 (it is a loadable extension). Tag the column `block`, or mask it `full`, `last4` or `email`. |
+
+They return what the Postgres masks return for the same text (NULL stays NULL
+except under `full`). Output names are kept as on Snowflake (an alias as written,
+a bare column aliased with its own identifier); an unaliased expression over a
+masked column, and `ORDER BY`, `GROUP BY` or `HAVING` naming a masked output (or
+its position), **block**. `tests/sqlite_mask_equivalence.rs` runs every mask
+through the `sqlite3` command-line shell when one is on `PATH` and compares the
+values with the Postgres forms' expected outputs.
+
 ## Agent access allowlists (VERICTO-087)
 
 Sensitive-column tags are a denylist that applies to every caller. An agent
@@ -603,6 +652,19 @@ because a predicate lets an agent probe a value it may not read. Every table in
   the pre-classifier recognised are denied outright; `ALTER SESSION SET` is
   allowed for formatting, tagging and timeout parameters only
   (`QUOTED_IDENTIFIERS_IGNORE_CASE`, which changes how names resolve, is denied).
+- **SQLite.** Names compare ASCII case-insensitively, quoted or not (`"x"`,
+  `` `x` `` and `[x]` are accepted in queries and entries). The default schema is
+  `main` (the host may set another in `default_schema`); `temp` and attached
+  databases are other schemas. `sqlite_master`/`sqlite_schema` and the
+  table-valued functions (`pragma_table_info('t')`, `dbstat`) are relations like
+  any other: only an entry naming them allows them (`json_each` and `json_tree`
+  read only their arguments). `PRAGMA table_info | table_xinfo | index_list |
+  foreign_key_list(<t>)` reads every column of `<t>`; the connection settings
+  drivers send (`foreign_keys = ON`, `busy_timeout`, `journal_mode = WAL |
+  DELETE | TRUNCATE | PERSIST`, `synchronous = NORMAL | FULL | EXTRA`,
+  `cache_size`, `temp_store`, `defer_foreign_keys`, `recursive_triggers`,
+  `case_sensitive_like`) are allowed; every other `PRAGMA`, `ATTACH`, `DETACH`,
+  `VACUUM`, `REINDEX` and `ANALYZE` are denied as DDL.
 - **Identifier case follows the dialect.** Snowflake is Postgres's mirror image:
   unquoted names fold to **upper** case and quoted names compare exactly, in the
   query and in the entry alike (an entry `orders` is `ORDERS`; `"orders"` is a
@@ -764,6 +826,72 @@ another dialect. `tests/snowflake_corpus.rs` pins how the engine reads a corpus
 of public Snowflake SQL (rendered dbt models and the DDL around them, the
 statements dbt-snowflake sends, sqlglot's Snowflake tests) and prints its parse
 and recognition rates (parsed, pre-classified or allowlisted).
+
+## SQLite
+
+SQLite is a library inside the application, not a server: there is no wire
+protocol and so no proxy. The host evaluates each statement before the
+application runs it — the Runtime API and the driver wrappers that call it, the
+CLI on migrations, MCP for agents. It is parsed with sqlparser's `SQLiteDialect`
+and walked by the shared sqlparser walker, which records the SQLite statement
+kinds for the rules: `ATTACH`, `PRAGMA` (reads and writes), `VACUUM`,
+`CREATE TABLE … AS SELECT` (VERICTO-084), and a trigger's body, whose statements
+run on every matching write and are walked like any other (a `CREATE TRIGGER …
+BEGIN DELETE FROM log; END` is a WHERE-less DELETE). UPSERT (`ON CONFLICT`),
+`INSERT OR REPLACE`, `REPLACE INTO`, `RETURNING`, `WITH RECURSIVE`, window and
+JSON functions read as on the other dialects.
+
+**Before a text is a parse error** (only when sqlparser 0.63 rejects it):
+
+- `INDEXED BY <index>` and `NOT INDEXED` after a table name, query-planner hints
+  that change no result, are read through: the statement is analysed without
+  them (a mask rewrite of such a statement blocks, since the printed text would
+  not be the client's);
+- a `PRAGMA` with a keyword or a name as its value (`PRAGMA foreign_keys = OFF`,
+  `PRAGMA journal_mode = WAL`, `PRAGMA table_info(users)`, `PRAGMA cache_size =
+  -2000`) is read with SQLite's own grammar (`PRAGMA [schema.]name [= value |
+  (value)]`);
+- `DETACH [DATABASE] <name>` and `REINDEX [[<schema>.]<name>]` are analysed with
+  no finding (the allowlist, `parser::sqlite::allowlisted`);
+- the pre-classifier turns `VACUUM [schema] INTO …`, the `ATTACH` forms sqlparser
+  does not read (`… KEY '…'`) and a safety pragma outside the grammar into
+  findings of the rule that names them. Unless its pattern covers the whole
+  statement, such a statement is **unread code**: the outcome is the stricter of
+  the findings and the parse-error outcome.
+
+Everything else resolves like on every dialect: flagged by default, blocked
+under `parse_error: block`, a `block`/`mask` tag or an enforced allowlist
+(`SELECT … WHERE a IS NOT b`, an expression sqlparser does not read, is one).
+
+**Native code anywhere.** VERICTO-100 reads the tokens of the whole text, so a
+`load_extension(…)` in `INSERT … VALUES`, `UPDATE … SET` or a quoted function
+name (`"load_extension"(…)`) is found where the walker visits no expression; a
+name in a string literal or a comment is not.
+
+**The standard rules on SQLite** (design §4.2; `tests/sqlite.rs` holds the
+matrix):
+
+- **Direct** (same predicate): 001, 002 (`DELETE … LIMIT`, in builds with
+  `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`), 010, 013, 015, 016, 019 (`DROP TRIGGER`;
+  SQLite has no `DISABLE TRIGGER` or row-level security), 030, 040, 042, 050,
+  051, 060, 061 (`INSERT` batches; no `COPY`), 084 (`CREATE TABLE … AS SELECT`).
+- **Variants**: 003 and 090 (SQLite truthiness, see [what counts as
+  always-true](#what-counts-as-always-true)), 070 (`randomblob(N)` /
+  `zeroblob(N)` with a huge constant `N`), 085 (the SQLite mask rewrite above),
+  087 (SQLite names above).
+- **Not applicable** (the construct does not exist, or SQLite rejects it; the rule
+  stays in the catalogue and never fires on SQLite): 011 (`TRUNCATE`), 012 (`DROP
+  SCHEMA`; `DETACH` destroys nothing), 017 and 018 (no `DROP CONSTRAINT`, no
+  `ALTER COLUMN`), 031 and 033 (no data-modifying CTEs), 080, 081, 082 and 083
+  (no `COPY`, `DO`, `GRANT`/`REVOKE` or `MERGE`), 086 (MySQL's lexical
+  ambiguity).
+
+The SQLite rules VERICTO-098 to VERICTO-101 are in the tables above; they read
+only what the SQLite walker and pre-classifier record, so they never fire on
+another dialect. `tests/sqlite_corpus.rs` pins how the engine reads a corpus of
+SQLite statements written for it (the DDL, DML and pragmas ORMs and migration
+tools send, UPSERT, `WITH RECURSIVE`, window and JSON functions, transactions,
+and the dangerous statements) and prints its parse and recognition rates.
 
 ## Custom rules (YAML)
 

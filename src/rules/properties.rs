@@ -606,6 +606,7 @@ mod column_predicates_are_not_tautologies {
             Just(Dialect::Mysql),
             Just(Dialect::Oracle),
             Just(Dialect::MsSql),
+            Just(Dialect::Sqlite),
         ]
     }
 

@@ -117,6 +117,15 @@ impl RuleClass {
             "VERICTO-091" | "VERICTO-092" | "VERICTO-093" | "VERICTO-096" | "VERICTO-097" => {
                 RuleClass::Security
             }
+            // SQLite: ATTACH (another file on the connection), native code
+            // or file functions, VACUUM INTO (a copy of the database to a
+            // path). Never softened by a CI channel.
+            "VERICTO-098" | "VERICTO-100" | "VERICTO-101" => RuleClass::Security,
+            // SQLite: a safety PRAGMA. `PRAGMA foreign_keys = OFF` is the
+            // standard step of a SQLite table rebuild in migrations (Prisma,
+            // Drizzle, Django, Alembic), so a CI channel may soften it like
+            // other schema DDL; at run time it blocks under the default policy.
+            "VERICTO-099" => RuleClass::SchemaMigration,
             // Performance / best-practice
             "VERICTO-050" | "VERICTO-051" | "VERICTO-060" | "VERICTO-061" => RuleClass::Performance,
             // Snowflake warehouse cost.
@@ -154,6 +163,52 @@ pub enum ParseErrorAction {
     AllowReport,
     /// Fail-closed opt-in: reject with SQLSTATE 42501 (R4.9).
     Block,
+}
+
+/// Why a statement did not parse (design §4.6), for telemetry: it tells a gap
+/// in what the engine reads (a statement kind it does not know, worth adding
+/// to a corpus) from SQL that is simply invalid. Read it from an outcome with
+/// [`EvaluationOutcome::parse_error_kind`]. Since 4.1.0; `#[non_exhaustive]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ParseErrorKind {
+    /// A statement kind the parser does not know (`DETACH` on 0.63's SQLite
+    /// dialect, a Snowflake `CREATE TASK`), one the engine does not analyse,
+    /// or one only the pre-classifier recognised by its keywords.
+    UnknownStatement,
+    /// A known statement kind whose text the parser rejects: invalid SQL, or
+    /// syntax the parser does not support. PostgreSQL's parser reports every
+    /// failure this way.
+    Syntax,
+    /// Refused before it was read: nesting past the limits.
+    TooComplex,
+}
+
+impl ParseErrorKind {
+    /// `unknown_statement`, `syntax` or `too_complex`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ParseErrorKind::UnknownStatement => "unknown_statement",
+            ParseErrorKind::Syntax => "syntax",
+            ParseErrorKind::TooComplex => "too_complex",
+        }
+    }
+
+    /// The kind of a parse-error message (an outcome's `ast_node_path`, with
+    /// or without its `PARSE_ERROR: ` prefix, or a [`crate::ProxyError`]'s text).
+    pub fn classify(message: &str) -> ParseErrorKind {
+        if message.contains("VERICTO-AST-TOO-DEEP") || message.contains("VERICTO-QUERY-TOO-LARGE") {
+            ParseErrorKind::TooComplex
+        } else if message.contains(crate::parser::walk::UNSUPPORTED_STATEMENT)
+            || message.contains("recognised by its keywords")
+            || message.contains("Expected: an SQL statement")
+        {
+            ParseErrorKind::UnknownStatement
+        } else {
+            ParseErrorKind::Syntax
+        }
+    }
 }
 
 /// Per-workspace enforcement policy injected by the host into the engine (R4).
@@ -278,12 +333,12 @@ impl EnforcementPolicy {
     /// Hosts that parse themselves and branch on the parse-error action must
     /// call this (with the client's text) instead of `effective_parse_error`.
     ///
-    /// Snowflake follows the same rule as every dialect (fail-open flag by
-    /// default; block under `parse_error: block`, a `block`/`mask` tag or an
-    /// enforced allowlist). Its statements sqlparser does not read but the
-    /// engine knows are either findings (the pre-classifier) or, for a short
-    /// allowlist of legitimate forms, analysed with no finding (see
-    /// `parser::snowflake`).
+    /// Snowflake and SQLite follow the same rule as every dialect (fail-open
+    /// flag by default; block under `parse_error: block`, a `block`/`mask` tag
+    /// or an enforced allowlist). Their statements sqlparser does not read but
+    /// the engine knows are either findings (the pre-classifier) or, for a
+    /// short allowlist of legitimate forms, analysed with no finding (see
+    /// `parser::snowflake` and `parser::sqlite`).
     pub fn effective_parse_error_for(
         &self,
         sql: &str,
@@ -446,6 +501,19 @@ pub struct EvaluationOutcome {
 }
 
 impl EvaluationOutcome {
+    /// Why the statement did not parse, when the outcome is a parse error
+    /// (`rule_code` `VERICTO-PARSE-ERROR`, including the floor of a statement
+    /// only the pre-classifier recognised); `None` for every other outcome.
+    /// Since 4.1.0.
+    pub fn parse_error_kind(&self) -> Option<ParseErrorKind> {
+        if self.rule_code.as_deref() != Some("VERICTO-PARSE-ERROR") {
+            return None;
+        }
+        Some(ParseErrorKind::classify(
+            self.ast_node_path.as_deref().unwrap_or_default(),
+        ))
+    }
+
     pub fn allowed() -> Self {
         Self {
             decision: Decision::Allow,
@@ -555,8 +623,8 @@ impl RuleEngine {
         Self::with_unread(outcome, parsed, policy)
     }
 
-    /// Snowflake code the engine did not read (a scripting block, `EXECUTE
-    /// IMMEDIATE`, a statement only the pre-classifier recognised): the
+    /// Snowflake or SQLite code the engine did not read (a scripting block,
+    /// `EXECUTE IMMEDIATE`, a statement only the pre-classifier recognised): the
     /// parse-error outcome is a floor, resolved as for any parse error (a
     /// flag by default, a block under `parse_error: block`, a protective tag
     /// or an enforced allowlist). The findings keep the flat fields unless

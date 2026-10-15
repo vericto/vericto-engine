@@ -893,9 +893,11 @@ pub(crate) fn splice(e: &mut Expr, orig: &Expr) {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
     match e {
         Expr::Identifier(i) if i.value == MASK_ARG => *e = orig.clone(),
-        Expr::Nested(x) | Expr::Collate { expr: x, .. } | Expr::Convert { expr: x, .. } => {
-            splice(x, orig)
-        }
+        // `Cast`: the SQLite templates (`CAST(x AS TEXT)`).
+        Expr::Nested(x)
+        | Expr::Collate { expr: x, .. }
+        | Expr::Convert { expr: x, .. }
+        | Expr::Cast { expr: x, .. } => splice(x, orig),
         Expr::BinaryOp { left, right, .. } => {
             splice(left, orig);
             splice(right, orig);

@@ -21,6 +21,7 @@ fn deep_not_nesting_is_refused_on_every_dialect() {
         Dialect::Mysql,
         Dialect::Oracle,
         Dialect::MsSql,
+        Dialect::Sqlite,
     ] {
         let parser = parser_for(dialect);
         // Well past the measured overflow threshold (920-950).
