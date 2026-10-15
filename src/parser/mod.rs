@@ -1,9 +1,9 @@
 //! Multi-dialect AST parsers (Strategy Pattern).
 //!
-//! `PostgresParser`, `MySqlParser`, `OracleParser`, `MsSqlParser` and
-//! `SnowflakeParser` implement the same [`SqlParser`] trait and produce a
-//! normalized [`ParsedQuery`] that the rule engine evaluates
-//! dialect-agnostically.
+//! `PostgresParser`, `MySqlParser`, `OracleParser`, `MsSqlParser`,
+//! `SnowflakeParser` and `SqliteParser` implement the same [`SqlParser`]
+//! trait and produce a normalized [`ParsedQuery`] that the rule engine
+//! evaluates dialect-agnostically.
 
 pub mod mssql;
 pub mod mysql;
@@ -12,6 +12,7 @@ pub mod oracle;
 pub mod pg_ast;
 pub mod postgres;
 pub mod snowflake;
+pub mod sqlite;
 pub(crate) mod walk;
 
 use crate::error::{ProxyError, Result};
@@ -31,12 +32,17 @@ pub enum Dialect {
     /// pre-classifier and an allowlist for the statements it does not read;
     /// see [`snowflake`]).
     Snowflake,
+    /// SQLite (sqlparser's `SQLiteDialect`, with a keyword pre-classifier
+    /// and an allowlist for the statements it does not read; see
+    /// [`sqlite`]). Since 4.1.0.
+    Sqlite,
 }
 
 impl Dialect {
     /// The canonical lowercase name (`postgres`, `mysql`, `oracle`, `mssql`,
-    /// `snowflake`), accepted back by [`Dialect::parse_dialect`]. Since 4.0.0,
-    /// so a host reporting the dialect does not need its own `match`.
+    /// `snowflake`, `sqlite`), accepted back by [`Dialect::parse_dialect`].
+    /// Since 4.0.0, so a host reporting the dialect does not need its own
+    /// `match`.
     pub fn as_str(self) -> &'static str {
         match self {
             Dialect::Postgres => "postgres",
@@ -44,6 +50,7 @@ impl Dialect {
             Dialect::Oracle => "oracle",
             Dialect::MsSql => "mssql",
             Dialect::Snowflake => "snowflake",
+            Dialect::Sqlite => "sqlite",
         }
     }
 
@@ -54,6 +61,7 @@ impl Dialect {
             "oracle" => Ok(Dialect::Oracle),
             "mssql" | "sqlserver" | "tsql" => Ok(Dialect::MsSql),
             "snowflake" => Ok(Dialect::Snowflake),
+            "sqlite" | "sqlite3" => Ok(Dialect::Sqlite),
             other => Err(ProxyError::UnsupportedDialect(other.to_string())),
         }
     }
@@ -118,6 +126,32 @@ pub enum SnowflakeRisk {
     /// Privilege context switch: `USE ROLE`, `USE SECONDARY ROLES ALL`
     /// (VERICTO-097).
     RoleSwitch,
+}
+
+/// What a SQLite statement does that only SQLite can do, for the SQLite rules
+/// (VERICTO-098 to VERICTO-101) and the SQLite reading of VERICTO-070. Set by
+/// the SQLite walker and the SQLite pre-classifier only, so these rules never
+/// fire on another dialect. Since 4.1.0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SqliteRisk {
+    /// `ATTACH [DATABASE] <file> AS <name>`: opens, or creates, another
+    /// database file on the connection (VERICTO-098).
+    Attach,
+    /// A `PRAGMA` write that turns a safety off: `writable_schema`,
+    /// `trusted_schema = ON`, `foreign_keys = OFF`, `journal_mode = OFF`, …
+    /// (VERICTO-099).
+    SafetyPragma,
+    /// `load_extension()`, `fts3_tokenizer()` and the shell's `readfile()`,
+    /// `writefile()`, `edit()`: native code or the file system (VERICTO-100).
+    NativeCode,
+    /// `VACUUM [schema] INTO <file>`: a full copy of the database written to
+    /// a path (VERICTO-101).
+    VacuumInto,
+    /// `randomblob(N)` / `zeroblob(N)` with a huge constant `N`: SQLite has
+    /// no sleep, and this is its time-based blind-injection probe
+    /// (VERICTO-070).
+    TimeProbe,
 }
 
 /// Object type in a DROP statement. `#[non_exhaustive]` since 4.0.0.
@@ -259,6 +293,9 @@ pub struct StatementInfo {
     /// The Snowflake-only risk this entry records (Snowflake rules). `None`
     /// on every other dialect.
     pub snowflake: Option<SnowflakeRisk>,
+    /// The SQLite-only risk this entry records (SQLite rules, and the SQLite
+    /// reading of VERICTO-070). `None` on every other dialect. Since 4.1.0.
+    pub sqlite: Option<SqliteRisk>,
 }
 
 impl Default for StatementInfo {
@@ -284,6 +321,7 @@ impl Default for StatementInfo {
             copy_from_file: false,
             has_or_tautology: false,
             snowflake: None,
+            sqlite: None,
         }
     }
 }
@@ -303,8 +341,8 @@ pub struct ParsedQuery {
     /// are then the base reading, and this carries the rest. `None` for every
     /// other text, which is evaluated exactly as before.
     pub(crate) mysql: Option<std::sync::Arc<MysqlReadings>>,
-    /// Snowflake only: part of the text is code the engine does not read (a
-    /// scripting block, `EXECUTE IMMEDIATE`, a statement only the
+    /// Snowflake and SQLite only: part of the text is code the engine does
+    /// not read (a scripting block, `EXECUTE IMMEDIATE`, a statement only the
     /// pre-classifier recognised). The rule engine then keeps the stricter of
     /// the rules' outcome and the parse-error outcome, so whatever the
     /// engine cannot read is never treated more leniently than a parse
@@ -320,7 +358,7 @@ impl ParsedQuery {
             SourceAst::None => None,
             SourceAst::Pg(_) => Some(Dialect::Postgres),
             SourceAst::Sql { dialect, .. } => Some(*dialect),
-            SourceAst::Classified { .. } => Some(Dialect::Snowflake),
+            SourceAst::Classified { dialect, .. } => Some(*dialect),
         }
     }
 }
@@ -346,19 +384,22 @@ pub(crate) enum SourceAst {
     Sql {
         statements: std::sync::Arc<Vec<sqlparser::ast::Statement>>,
         dialect: Dialect,
-        /// The client's text, kept for MySQL and Snowflake only: the
+        /// The client's text, kept for MySQL, Snowflake and SQLite only: the
         /// sensitive-column analysis re-reads it the way MySQL does (comments,
         /// `?` order, string literals verbatim), which the tree alone cannot
-        /// tell; on Snowflake it is the reference a mask rewrite must print
-        /// back to, and the access analysis folds its identifiers. One copy of
-        /// the query, only walked when the policy carries tags or an allowlist.
+        /// tell; on Snowflake and SQLite it is the reference a mask rewrite
+        /// must print back to, and on Snowflake the access analysis folds its
+        /// identifiers. One copy of the query, only walked when the policy
+        /// carries tags or an allowlist.
         sql: Option<std::sync::Arc<str>>,
     },
-    /// Snowflake text sqlparser rejects but the pre-classifier recognised by
-    /// its keywords (`UNDROP`, `CREATE TASK`, `ALTER WAREHOUSE`, …): no tree.
-    /// `what` names the statement (`CREATE TASK`); an allowlist denies it.
+    /// Snowflake or SQLite text sqlparser rejects but the pre-classifier
+    /// recognised by its keywords (`UNDROP`, `CREATE TASK`, `VACUUM INTO`,
+    /// …): no tree. `what` names the statement (`CREATE TASK`); an allowlist
+    /// denies it.
     Classified {
         what: String,
+        dialect: Dialect,
     },
 }
 
@@ -438,6 +479,7 @@ pub fn parser_for(dialect: Dialect) -> Box<dyn SqlParser> {
         Dialect::Oracle => Box::new(oracle::OracleParser::new()),
         Dialect::MsSql => Box::new(mssql::MsSqlParser::new()),
         Dialect::Snowflake => Box::new(snowflake::SnowflakeParser::new()),
+        Dialect::Sqlite => Box::new(sqlite::SqliteParser::new()),
     }
 }
 

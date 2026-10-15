@@ -67,6 +67,7 @@ impl SqlParser for SnowflakeParser {
                     }],
                     ast: SourceAst::Classified {
                         what: what.to_string(),
+                        dialect: Dialect::Snowflake,
                     },
                     mysql: None,
                     // Read, not unread: analysed with no finding.
@@ -78,6 +79,7 @@ impl SqlParser for SnowflakeParser {
                     statements,
                     ast: SourceAst::Classified {
                         what: what.to_string(),
+                        dialect: Dialect::Snowflake,
                     },
                     mysql: None,
                     unread: Some(format!(

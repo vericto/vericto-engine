@@ -44,6 +44,7 @@ pub(crate) mod mysql;
 pub(crate) mod pg;
 pub(crate) mod snowflake;
 pub(crate) mod sql;
+pub(crate) mod sqlite;
 
 use std::collections::BTreeMap;
 
@@ -70,7 +71,8 @@ pub enum SensitivePolicy {
     /// Allow the query, record and alert.
     Flag,
     /// Rewrite the projection so the column's value is masked (Postgres,
-    /// MySQL and Snowflake; Oracle and SQL Server block).
+    /// MySQL, Snowflake and SQLite; Oracle and SQL Server block; on SQLite
+    /// the `hash` style blocks too).
     Mask,
     /// Reject the query.
     Block,
@@ -126,7 +128,8 @@ pub enum MaskStyle {
     Last4,
     /// First character and the domain kept: `j***@example.com`.
     Email,
-    /// SHA-256 hex of the text value.
+    /// SHA-256 hex of the text value. Blocks on SQLite, whose core has no
+    /// SHA-256.
     Hash,
 }
 
@@ -959,7 +962,7 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, cols: &[SensitiveColumn]) -> Option
     let dialect = match &parsed.ast {
         SourceAst::Pg(_) => Dialect::Postgres,
         SourceAst::Sql { dialect, .. } => *dialect,
-        // Snowflake text only the pre-classifier recognised has no tree: it
+        // Snowflake or SQLite text only the pre-classifier recognised has no tree: it
         // is unread code, whose parse-error floor blocks under a protective
         // tag (see `ParsedQuery::unread`); an allowlisted one reads no
         // column.
@@ -1000,6 +1003,11 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, cols: &[SensitiveColumn]) -> Option
             sql: Some(sql),
             dialect: Dialect::Snowflake,
         } => sql::analyze_snowflake(statements, sql, &tags, any_mask),
+        SourceAst::Sql {
+            statements,
+            sql: Some(sql),
+            dialect: Dialect::Sqlite,
+        } => sql::analyze_sqlite(statements, sql, &tags, any_mask),
         SourceAst::Sql { statements, .. } => sql::analyze(statements, &tags).map(|t| (t, None)),
         SourceAst::None | SourceAst::Classified { .. } => return None,
     };
@@ -1126,7 +1134,7 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, cols: &[SensitiveColumn]) -> Option
             };
             if !matches!(
                 dialect,
-                Dialect::Postgres | Dialect::Mysql | Dialect::Snowflake
+                Dialect::Postgres | Dialect::Mysql | Dialect::Snowflake | Dialect::Sqlite
             ) {
                 // Oracle and SQL Server have no rewrite. Forwarding the
                 // unmasked value (flag) would silently downgrade "never in

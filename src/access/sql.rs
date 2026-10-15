@@ -1,6 +1,6 @@
-//! Access analysis over the `sqlparser` AST (MySQL, Oracle, SQL Server): which
-//! statements are analysed, allowed or denied outright. The analysis itself
-//! is the VERICTO-085 walker run in access mode
+//! Access analysis over the `sqlparser` AST (MySQL, Oracle, SQL Server,
+//! Snowflake, SQLite): which statements are analysed, allowed or denied
+//! outright. The analysis itself is the VERICTO-085 walker run in access mode
 //! ([`crate::sensitive::sql::access_walk`]).
 
 use sqlparser::ast::{
@@ -452,6 +452,22 @@ fn classify(s: &Statement, tags: &Tags, depth: usize, dialect: Dialect) -> Resul
             Ok(Class::Allowed)
         }
         Statement::Set(set) => set_class(set),
+        // SQLite: the structure reads (`PRAGMA table_info(t)`: every column
+        // of `t`) and the connection settings drivers send are allowed; every
+        // other pragma is denied as DDL.
+        Statement::Pragma { name, value, .. } if dialect == Dialect::Sqlite => {
+            use crate::parser::sqlite::{PragmaAccess, pragma_access};
+            match pragma_access(name, value.as_ref().map(|v| &v.value)) {
+                PragmaAccess::ReadsTable(t) => {
+                    let (schema, table) = split(&t, dialect);
+                    tags.relation(schema.as_deref(), &table);
+                    tags.of_table(schema.as_deref(), &table);
+                    Ok(Class::Allowed)
+                }
+                PragmaAccess::Allowed => Ok(Class::Allowed),
+                PragmaAccess::Denied(what) => Ok(Class::Denied(what)),
+            }
+        }
         Statement::Use(_) => denied("USE"),
         // A block of statements (Snowflake scripting; on every other dialect
         // it is a parse error): its control flow is not analysed.

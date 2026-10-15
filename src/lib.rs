@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.0.0" }
+//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.1.0" }
 //! ```
 //!
 //! ```rust
@@ -53,7 +53,8 @@ pub use error::{ProxyError, Result};
 pub use parser::Dialect;
 pub use rules::engine::{
     Decision, EnforcementAction, EnforcementPolicy, EvaluationOutcome, ParseErrorAction,
-    ReportedViolation, Rule, RuleClass, RuleEngine, RuleType, Severity, TEXT_DIVERGENCE_RULE_CODE,
+    ParseErrorKind, ReportedViolation, Rule, RuleClass, RuleEngine, RuleType, Severity,
+    TEXT_DIVERGENCE_RULE_CODE,
 };
 pub use sensitive::{
     MaskStyle, SENSITIVE_RULE_CODE, SensitiveColumn, SensitivePolicy, TouchedColumn,

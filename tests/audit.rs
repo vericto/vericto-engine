@@ -587,11 +587,12 @@ fn no_regressions_on_safe_queries() {
 // five blocking rules, so a false positive rejects legitimate production traffic.
 
 /// Every dialect must agree, so drift between the two walkers fails the test.
-const ALL_DIALECTS: [Dialect; 4] = [
+const ALL_DIALECTS: [Dialect; 5] = [
     Dialect::Postgres,
     Dialect::Mysql,
     Dialect::Oracle,
     Dialect::MsSql,
+    Dialect::Sqlite,
 ];
 
 fn fires_003(sql: &str, d: Dialect) -> bool {
@@ -1104,8 +1105,9 @@ fn copy_from_stdin_and_copy_to_keep_their_verdict() {
             assert_eq!(o.decision, Decision::Allow, "{sql} on {d:?}: {o:?}");
         }
     }
-    // FROM PROGRAM stays VERICTO-080 alone.
-    for d in ALL_DIALECTS {
+    // FROM PROGRAM stays VERICTO-080 alone (SQLite has no COPY: 080 is not
+    // applicable there).
+    for d in ALL_DIALECTS.into_iter().filter(|d| *d != Dialect::Sqlite) {
         assert_matches(
             "copy from program",
             "COPY orders FROM PROGRAM 'gunzip -c /tmp/orders.csv.gz'",
