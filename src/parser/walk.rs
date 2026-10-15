@@ -11,9 +11,11 @@ use crate::parser::{
     StatementKind, WherePresence,
 };
 
+use std::ops::ControlFlow;
+
 use sqlparser::ast::{
     Expr, FromTable, FunctionArguments, LimitClause, ObjectType, Query, SelectItem, SetExpr,
-    Statement, TableFactor, TableWithJoins, Value, ValueWithSpan,
+    Statement, TableFactor, TableWithJoins, Value, ValueWithSpan, Visit, Visitor,
 };
 use sqlparser::dialect::Dialect as SqlDialect;
 use sqlparser::parser::Parser as SqlAstParser;
@@ -69,6 +71,7 @@ pub(crate) fn from_statements(
     let cx = Cx {
         snowflake: which == Dialect::Snowflake,
         sqlite: which == Dialect::Sqlite,
+        complete: which == Dialect::Sqlite,
     };
     let mut collected: Vec<StatementInfo> = Vec::new();
     for stmt in &statements {
@@ -110,6 +113,16 @@ struct Cx {
     /// truthiness (`WHERE '1abc'` is true) and its time probe
     /// (`randomblob(N)`).
     sqlite: bool,
+    /// Walk every expression a statement runs, not only the projection,
+    /// `WHERE` and call arguments: `IS [NOT] NULL`, `CASE`, `IN (…)`,
+    /// `BETWEEN`, `CAST`, `ORDER BY` / `GROUP BY` / `HAVING`, `JOIN … ON`,
+    /// `LIMIT`, window specifications, `UPDATE … SET`, `INSERT … VALUES`,
+    /// `ON CONFLICT`, `RETURNING`, a trigger's `WHEN`, and every subquery
+    /// they hold (see [`Rest`]). SQLite only since 4.1.1, where VERICTO-070
+    /// otherwise missed a wrapped `randomblob(N)`; turning it on for the other
+    /// sqlparser dialects reports more calls and subqueries there, a verdict
+    /// change left to a minor release.
+    complete: bool,
 }
 
 /// Snowflake code the engine does not read: a scripting block (`BEGIN … END`,
@@ -491,12 +504,25 @@ fn walk_statement(
                 walk_expr(expr, depth + 1, cx, out)?;
             }
             walk_with_from_ctes(&delete.from, depth + 1, cx, out)?;
+            if cx.complete {
+                let walked_queries = match &delete.from {
+                    FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
+                        tables.iter().filter_map(|t| derived(&t.relation)).collect()
+                    }
+                };
+                let walked = Walked {
+                    exprs: delete.selection.iter().collect(),
+                    queries: walked_queries,
+                };
+                walk_rest(delete, walked, depth + 1, cx, out)?;
+            }
         }
 
         // ── UPDATE ─────────────────────────────────────────────────────────
-        Statement::Update(sqlparser::ast::Update {
-            selection, table, ..
-        }) => {
+        Statement::Update(update) => {
+            let sqlparser::ast::Update {
+                selection, table, ..
+            } = update;
             let presence = where_presence(selection.as_ref(), cx.sqlite);
             let relation = relation_from_table_with_joins(table);
             let tautology = selection
@@ -513,6 +539,14 @@ fn walk_statement(
             });
             if let Some(expr) = selection.as_ref() {
                 walk_expr(expr, depth + 1, cx, out)?;
+            }
+            // `SET x = zeroblob(…)`, `FROM`, `RETURNING`, `ORDER BY`, `LIMIT`.
+            if cx.complete {
+                let walked = Walked {
+                    exprs: selection.iter().collect(),
+                    queries: Vec::new(),
+                };
+                walk_rest(update, walked, depth + 1, cx, out)?;
             }
         }
 
@@ -710,6 +744,14 @@ fn walk_statement(
             if let Some(source) = insert.source.as_ref() {
                 walk_query(source.as_ref(), true, depth + 1, cx, out)?;
             }
+            // `ON CONFLICT … DO UPDATE SET`, `RETURNING`, MySQL's `SET` form.
+            if cx.complete {
+                let walked = Walked {
+                    exprs: Vec::new(),
+                    queries: insert.source.iter().map(|q| q.as_ref()).collect(),
+                };
+                walk_rest(insert, walked, depth + 1, cx, out)?;
+            }
         }
 
         // ── COPY … TO/FROM PROGRAM (VERICTO-080) ─────────────────────────────
@@ -767,14 +809,17 @@ fn walk_statement(
         }
 
         // ── MERGE (VERICTO-083) ──────────────────────────────────────────────
-        Statement::Merge(sqlparser::ast::Merge { table, .. }) => {
+        Statement::Merge(merge) => {
             out.push(StatementInfo {
                 kind: StatementKind::Merge,
-                relation: relation_from_table_factor(table),
+                relation: relation_from_table_factor(&merge.table),
                 is_nested,
                 ast_node_path: "MergeStmt".to_string(),
                 ..Default::default()
             });
+            if cx.complete {
+                walk_rest(merge, Walked::default(), depth + 1, cx, out)?;
+            }
         }
 
         // ── SELECT ─────────────────────────────────────────────────────────
@@ -827,11 +872,15 @@ fn walk_sqlite(
             schema_name,
             database_file_name,
             ..
-        } => out.push(risk(
-            SqliteRisk::Attach,
-            Some(schema_name.to_string()),
-            format!("AttachStmt > {database_file_name} AS {schema_name}"),
-        )),
+        } => {
+            out.push(risk(
+                SqliteRisk::Attach,
+                Some(schema_name.to_string()),
+                format!("AttachStmt > {database_file_name} AS {schema_name}"),
+            ));
+            // The file name is an expression SQLite evaluates.
+            walk_expr(database_file_name, depth + 1, cx, out)?;
+        }
         // A PRAGMA that turns a safety off: VERICTO-099. Reads and the other
         // settings are recorded with no finding.
         Statement::Pragma { name, value, .. } => {
@@ -863,10 +912,14 @@ fn walk_sqlite(
             }
         }
         // A trigger's body runs on every matching write, outside any check:
-        // its statements are walked, as nested.
+        // its statements are walked, as nested, after its `WHEN` condition
+        // (evaluated for every one of those rows).
         Statement::CreateTrigger(ct) => {
             if let Some(body) = &ct.statements {
                 let start = out.len();
+                if let Some(condition) = &ct.condition {
+                    walk_expr(condition, depth + 1, cx, out)?;
+                }
                 for s in body.statements() {
                     walk_statement(s, true, depth + 1, cx, out)?;
                 }
@@ -1294,6 +1347,32 @@ fn walk_query(
         cx,
         out,
     )?;
+
+    // `ORDER BY`, `LIMIT` / `OFFSET`, `FETCH` and the rest of the query
+    // around its body. Destructured without `..`: a field a sqlparser upgrade
+    // adds fails to compile here until it is classified.
+    if cx.complete {
+        let Query {
+            with: _,
+            body: _,
+            order_by,
+            limit_clause,
+            fetch,
+            locks,
+            for_clause,
+            settings,
+            format_clause,
+            pipe_operators: _,
+        } = query;
+        let d = depth + 1;
+        walk_rest(order_by, Walked::default(), d, cx, out)?;
+        walk_rest(limit_clause, Walked::default(), d, cx, out)?;
+        walk_rest(fetch, Walked::default(), d, cx, out)?;
+        walk_rest(locks, Walked::default(), d, cx, out)?;
+        walk_rest(for_clause, Walked::default(), d, cx, out)?;
+        walk_rest(settings, Walked::default(), d, cx, out)?;
+        walk_rest(format_clause, Walked::default(), d, cx, out)?;
+    }
     Ok(())
 }
 
@@ -1397,6 +1476,38 @@ fn walk_set_expr(
                     walk_table_factor(&join.relation, depth + 1, cx, out)?;
                 }
             }
+
+            // Everything else the SELECT evaluates: `JOIN … ON`, table-valued
+            // function arguments, `GROUP BY`, `HAVING`, `WINDOW`, …
+            if cx.complete {
+                let mut exprs: Vec<&Expr> = select.selection.iter().collect();
+                if cx.snowflake {
+                    exprs.extend(select.qualify.iter());
+                }
+                for item in &select.projection {
+                    match item {
+                        SelectItem::UnnamedExpr(e)
+                        | SelectItem::ExprWithAlias { expr: e, .. }
+                        | SelectItem::ExprWithAliases { expr: e, .. } => exprs.push(e),
+                        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {}
+                    }
+                }
+                let queries = select
+                    .from
+                    .iter()
+                    .flat_map(|twj| {
+                        std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation))
+                    })
+                    .filter_map(derived)
+                    .collect();
+                walk_rest(
+                    select.as_ref(),
+                    Walked { exprs, queries },
+                    depth + 1,
+                    cx,
+                    out,
+                )?;
+            }
         }
 
         SetExpr::Query(query) => {
@@ -1416,6 +1527,10 @@ fn walk_set_expr(
         | SetExpr::Delete(stmt)
         | SetExpr::Merge(stmt) => {
             walk_statement(stmt, true, depth + 1, cx, out)?;
+        }
+        // `VALUES (…)` (an `INSERT`'s rows): its expressions run.
+        SetExpr::Values(values) if cx.complete => {
+            walk_rest(values, Walked::default(), depth + 1, cx, out)?;
         }
         // VALUES and TABLE t: no statement, no call.
         SetExpr::Values(_) | SetExpr::Table(_) => {}
@@ -1447,6 +1562,9 @@ fn walk_expr(expr: &Expr, depth: usize, cx: Cx, out: &mut Vec<StatementInfo>) ->
     if depth > MAX_AST_DEPTH {
         return Err(ProxyError::AstTooDeep);
     }
+    if cx.complete {
+        return walk_rest(expr, Walked::default(), depth, cx, out);
+    }
 
     match expr {
         Expr::Subquery(query) => {
@@ -1455,38 +1573,7 @@ fn walk_expr(expr: &Expr, depth: usize, cx: Cx, out: &mut Vec<StatementInfo>) ->
 
         // Function call — check for the sleep family (VERICTO-070)
         Expr::Function(func) => {
-            let name = func
-                .name
-                .0
-                .last()
-                .and_then(|p| p.as_ident())
-                .map(|p| p.value.to_ascii_lowercase())
-                .unwrap_or_default();
-
-            // Record EVERY function call, not just the sleep family, so a custom
-            // rule's `func_name:` predicate can name any function as documented.
-            // The sleep-family filter lives in VERICTO-070's predicate; mirrors
-            // the pg_query walker.
-            // SQLite has no sleep: a huge `randomblob(N)` / `zeroblob(N)` is
-            // its time-based probe (VERICTO-070).
-            let probe = cx.sqlite
-                && matches!(name.as_str(), "randomblob" | "zeroblob")
-                && first_arg(func)
-                    .and_then(const_number)
-                    .is_some_and(|n| n >= SQLITE_PROBE_BYTES);
-            if !name.is_empty() {
-                out.push(StatementInfo {
-                    kind: StatementKind::FunctionCall,
-                    ast_node_path: if probe {
-                        format!("FunctionCall > {name}() (a huge constant size: a time probe)")
-                    } else {
-                        format!("FunctionCall > {name}()")
-                    },
-                    function_name: Some(name),
-                    sqlite: probe.then_some(SqliteRisk::TimeProbe),
-                    ..Default::default()
-                });
-            }
+            record_call(func, cx, out);
 
             // Recurse into function arguments
             if let FunctionArguments::List(arg_list) = &func.args {
@@ -1514,6 +1601,154 @@ fn walk_expr(expr: &Expr, depth: usize, cx: Cx, out: &mut Vec<StatementInfo>) ->
     }
 
     Ok(())
+}
+
+/// Records a function call: every call, not just the sleep family, so a
+/// custom rule's `func_name:` predicate can name any function as documented.
+/// The sleep-family filter lives in VERICTO-070's predicate; mirrors the
+/// pg_query walker. SQLite has no sleep: a huge `randomblob(N)` /
+/// `zeroblob(N)` is its time-based probe (VERICTO-070).
+fn record_call(func: &sqlparser::ast::Function, cx: Cx, out: &mut Vec<StatementInfo>) {
+    let name = func
+        .name
+        .0
+        .last()
+        .and_then(|p| p.as_ident())
+        .map(|p| p.value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let probe = cx.sqlite
+        && matches!(name.as_str(), "randomblob" | "zeroblob")
+        && first_arg(func)
+            .and_then(const_number)
+            .is_some_and(|n| n >= SQLITE_PROBE_BYTES);
+    if !name.is_empty() {
+        out.push(StatementInfo {
+            kind: StatementKind::FunctionCall,
+            ast_node_path: if probe {
+                format!("FunctionCall > {name}() (a huge constant size: a time probe)")
+            } else {
+                format!("FunctionCall > {name}()")
+            },
+            function_name: Some(name),
+            sqlite: probe.then_some(SqliteRisk::TimeProbe),
+            ..Default::default()
+        });
+    }
+}
+
+/// What the structural walk of a node already visited, so [`walk_rest`] does
+/// not record it twice: expression roots (a `WHERE`, the projection) and
+/// queries (a `FROM` subquery).
+#[derive(Default)]
+struct Walked<'a> {
+    exprs: Vec<&'a Expr>,
+    queries: Vec<&'a Query>,
+}
+
+/// The subquery of a `FROM (SELECT …)` source, which `walk_table_factor`
+/// walks.
+fn derived(factor: &TableFactor) -> Option<&Query> {
+    match factor {
+        TableFactor::Derived { subquery, .. } => Some(subquery.as_ref()),
+        _ => None,
+    }
+}
+
+/// Walks every expression under `node` but the ones in `walked` (see
+/// [`Cx::complete`]): each call is recorded, and each subquery is walked as a
+/// nested query (by [`walk_query`], which records its SELECT and walks what
+/// it holds in turn).
+fn walk_rest<V: Visit + ?Sized>(
+    node: &V,
+    walked: Walked<'_>,
+    depth: usize,
+    cx: Cx,
+    out: &mut Vec<StatementInfo>,
+) -> Result<()> {
+    let mut rest = Rest {
+        walked,
+        depth,
+        cx,
+        out,
+        skipped: None,
+        in_query: 0,
+        nesting: 0,
+    };
+    match node.visit(&mut rest) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(e) => Err(e),
+    }
+}
+
+/// The [`Visitor`] behind [`walk_rest`]. sqlparser derives the traversal over
+/// every field of every node, so a clause or an expression kind the walker
+/// does not name is still visited, and a sqlparser upgrade that adds one is
+/// covered without a change here.
+struct Rest<'w, 'o> {
+    walked: Walked<'w>,
+    depth: usize,
+    cx: Cx,
+    out: &'o mut Vec<StatementInfo>,
+    /// The already-walked expression being skipped, while inside it.
+    skipped: Option<*const Expr>,
+    /// How many queries deep the visit is: a subquery is walked whole by
+    /// `walk_query`, so nothing inside it is recorded here.
+    in_query: usize,
+    /// Expression nesting, for the depth limit.
+    nesting: usize,
+}
+
+impl Rest<'_, '_> {
+    fn active(&self) -> bool {
+        self.skipped.is_none() && self.in_query == 0
+    }
+}
+
+impl Visitor for Rest<'_, '_> {
+    type Break = ProxyError;
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<ProxyError> {
+        if self.active() && !self.walked.queries.iter().any(|q| std::ptr::eq(*q, query)) {
+            let depth = self.depth + self.nesting + 1;
+            if let Err(e) = walk_query(query, true, depth, self.cx, self.out) {
+                return ControlFlow::Break(e);
+            }
+        }
+        self.in_query += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<ProxyError> {
+        self.in_query -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<ProxyError> {
+        if !self.active() {
+            return ControlFlow::Continue(());
+        }
+        if self.walked.exprs.iter().any(|e| std::ptr::eq(*e, expr)) {
+            self.skipped = Some(expr as *const Expr);
+            return ControlFlow::Continue(());
+        }
+        self.nesting += 1;
+        if self.depth + self.nesting > MAX_AST_DEPTH {
+            return ControlFlow::Break(ProxyError::AstTooDeep);
+        }
+        if let Expr::Function(func) = expr {
+            record_call(func, self.cx, self.out);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, expr: &Expr) -> ControlFlow<ProxyError> {
+        if self.skipped == Some(expr as *const Expr) {
+            self.skipped = None;
+        } else if self.active() {
+            self.nesting -= 1;
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2066,6 +2301,63 @@ mod tests {
         let p = parse_pg("INSERT INTO t (a) VALUES (1)");
         assert!(!p.statements[0].insert_has_select);
         assert!(!p.statements[0].insert_select_has_filter);
+    }
+
+    // The complete walk (SQLite, 4.1.1) records every call a statement
+    // evaluates exactly once: checked against sqlparser's own traversal of the
+    // whole tree over the SQLite corpus, for the statement kinds whose every
+    // expression runs.
+    #[test]
+    fn sqlite_walk_records_every_call_once() {
+        use sqlparser::ast::visit_expressions;
+        use sqlparser::dialect::SQLiteDialect;
+        let corpus = include_str!("../../tests/fixtures/sqlite_corpus.sql");
+        let extra = [
+            "SELECT a FROM t JOIN u ON u.id = abs(t.id) WHERE t.x IN (SELECT max(y) FROM v GROUP BY lower(z) HAVING count(*) > 1) ORDER BY upper(a) LIMIT length('ab')",
+            "SELECT CASE WHEN f(1) THEN g(2) ELSE h(3) END, sum(x) OVER (PARTITION BY k(x) ORDER BY m(x)), count(*) FILTER (WHERE n(x)) FROM t WINDOW w AS (ORDER BY p(x)) LIMIT 1",
+            "WITH c AS (SELECT q(1) AS a) SELECT a FROM c WHERE r(a) IS NULL AND NOT s(a) BETWEEN t(1) AND u(2) LIMIT 1",
+            "INSERT INTO t (a) VALUES (f(1)), (g(2)) ON CONFLICT (a) DO UPDATE SET a = h(excluded.a) WHERE i(t.a) RETURNING j(a)",
+            "UPDATE t SET a = f(1), b = (SELECT g(2)) FROM (SELECT h(3) AS x) AS s WHERE i(t.a) = s.x RETURNING j(a)",
+            "DELETE FROM t WHERE f(a) IS NULL RETURNING g(a)",
+            "CREATE TRIGGER tr AFTER INSERT ON t WHEN f(NEW.a) BEGIN UPDATE t SET a = g(1) WHERE id = NEW.id; INSERT INTO u VALUES (h(2)); END",
+        ];
+        let mut checked = 0;
+        let entries = corpus
+            .split("\n----\n")
+            .skip(1)
+            .map(|chunk| chunk.lines().skip(1).collect::<Vec<_>>().join("\n"));
+        for sql in entries.chain(extra.iter().map(|s| s.to_string())) {
+            let Ok(stmts) = SqlAstParser::parse_sql(&SQLiteDialect {}, &sql) else {
+                continue;
+            };
+            let runs_every_expression = stmts.iter().all(|s| {
+                matches!(
+                    s,
+                    Statement::Query(_)
+                        | Statement::Insert(_)
+                        | Statement::Update(_)
+                        | Statement::Delete(_)
+                        | Statement::CreateTrigger(_)
+                )
+            });
+            if !runs_every_expression {
+                continue;
+            }
+            let mut calls = 0;
+            let _ = visit_expressions(&stmts, |e| {
+                calls += matches!(e, Expr::Function(_)) as usize;
+                ControlFlow::<()>::Continue(())
+            });
+            let parsed = from_statements(stmts, Dialect::Sqlite, &sql).expect("walks");
+            let recorded = parsed
+                .statements
+                .iter()
+                .filter(|s| s.kind == StatementKind::FunctionCall)
+                .count();
+            assert_eq!(recorded, calls, "{sql}: {:?}", parsed.statements);
+            checked += 1;
+        }
+        assert!(checked > 60, "corpus not read: {checked}");
     }
 
     // VERICTO-070 inputs. `pg_sleep_until` used to be missing from this walker's

@@ -496,6 +496,151 @@ fn standard_rule_variants() {
     );
 }
 
+/// Statements that evaluate `{f}` (a `randomblob(N)` / `zeroblob(N)` call)
+/// outside the projection, the `WHERE` root and call arguments, where 4.1.0
+/// did not look (4.1.1). Every one is valid SQLite (checked with sqlite3 3.51:
+/// `EXPLAIN` over the schema in `PROBE_SCHEMA`).
+const PROBE_SHAPES: &[&str] = &[
+    "SELECT 1 WHERE {f} IS NOT NULL",
+    "SELECT 1 WHERE {f} IS NULL",
+    "SELECT 1 WHERE {f} NOTNULL",
+    "SELECT {f} IS NULL AS x",
+    "SELECT CASE WHEN {f} IS NULL THEN 1 ELSE 0 END AS x",
+    "SELECT CASE {f} WHEN x'00' THEN 1 END AS x",
+    "SELECT CASE WHEN id = 1 THEN 0 ELSE {f} END AS x FROM users WHERE id = 1 LIMIT 1",
+    "SELECT 1 WHERE NOT ({f} IS NULL)",
+    "SELECT id FROM users WHERE id = 1 AND NOT (length({f}) = 0) LIMIT 1",
+    "SELECT 1 WHERE (length({f}) IS NOT NULL)",
+    "SELECT CAST(length({f}) AS TEXT) AS n",
+    "SELECT 1 WHERE length({f}) BETWEEN 1 AND 2",
+    "SELECT 1 WHERE hex({f}) LIKE 'A%'",
+    "SELECT 1 WHERE 1 IN (length({f}), 2)",
+    "SELECT 1 WHERE length({f}) IN (1, 2)",
+    "SELECT 1 WHERE 1 IN (SELECT length({f}))",
+    "SELECT 1 WHERE EXISTS (SELECT 1 WHERE {f} IS NULL)",
+    "SELECT (SELECT {f} IS NULL) AS x",
+    "SELECT x FROM (SELECT {f} IS NULL AS x) LIMIT 1",
+    "WITH p AS (SELECT {f} IS NULL AS x) SELECT x FROM p LIMIT 1",
+    "WITH p AS (SELECT 1 AS x) SELECT x FROM p WHERE x IN (SELECT length({f})) LIMIT 1",
+    "SELECT 1 UNION ALL SELECT {f} IS NULL",
+    "SELECT id FROM users ORDER BY length({f}) LIMIT 1",
+    "SELECT count(*) AS n FROM users GROUP BY length({f})",
+    "SELECT count(*) AS n FROM users GROUP BY id HAVING length({f}) > 0",
+    "SELECT id FROM users LIMIT length({f})",
+    "SELECT id FROM users LIMIT 1 OFFSET length({f})",
+    "SELECT u.id FROM users u JOIN docs d ON d.id = u.id AND {f} IS NOT NULL LIMIT 1",
+    "SELECT sum(id) OVER (ORDER BY length({f})) AS s FROM users LIMIT 1",
+    "SELECT count(*) FILTER (WHERE {f} IS NULL) AS n FROM users",
+    "SELECT value FROM json_each(json_array(length({f}))) LIMIT 1",
+    "INSERT INTO docs (body) SELECT {f} IS NULL",
+    "INSERT INTO docs (body) SELECT body FROM docs WHERE {f} IS NULL LIMIT 1",
+    "INSERT INTO docs (body) VALUES ({f})",
+    "INSERT INTO docs (id, body) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET body = {f}",
+    "INSERT INTO docs (id, body) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET body = 'y' WHERE {f} IS NULL",
+    "INSERT INTO docs (body) VALUES ('x') RETURNING length({f})",
+    "UPDATE docs SET body = {f} WHERE id = 1",
+    "UPDATE docs SET body = CASE WHEN {f} IS NULL THEN 'a' END WHERE id = 1",
+    "UPDATE docs SET body = 'x' WHERE id = 1 RETURNING {f} IS NULL",
+    "UPDATE docs SET body = s.x FROM (SELECT {f} IS NULL AS x) AS s WHERE docs.id = 1",
+    "DELETE FROM docs WHERE {f} IS NULL",
+    "DELETE FROM docs WHERE id = 1 RETURNING {f} IS NULL",
+    "CREATE TABLE copy AS SELECT {f} IS NULL AS x",
+    "CREATE TRIGGER g AFTER INSERT ON docs BEGIN UPDATE docs SET body = {f} WHERE id = NEW.id; END",
+    "CREATE TRIGGER g AFTER INSERT ON docs BEGIN SELECT 1 WHERE {f} IS NOT NULL; END",
+    "CREATE TRIGGER g AFTER INSERT ON docs BEGIN INSERT INTO users (id) VALUES (length({f})); END",
+    "CREATE TRIGGER g AFTER INSERT ON docs WHEN {f} IS NOT NULL BEGIN SELECT 1; END",
+];
+
+/// The tables `PROBE_SHAPES` name, for checking them with sqlite3.
+#[allow(dead_code)]
+const PROBE_SCHEMA: &str = "CREATE TABLE users (id INTEGER PRIMARY KEY); CREATE TABLE docs (id INTEGER PRIMARY KEY, body BLOB);";
+
+#[test]
+fn vericto_070_probe_wherever_sqlite_evaluates_it() {
+    // A constant N of 10 MB or more is the probe, in any clause that runs.
+    for shape in PROBE_SHAPES {
+        for f in [
+            "randomblob(100000000)",
+            "zeroblob(100000000)",
+            "RANDOMBLOB(500000000/2)",
+            "zeroblob(10000000)",
+        ] {
+            let sql = shape.replace("{f}", f);
+            assert_fires(&sql, "VERICTO-070");
+            let o = sl(&sql);
+            assert_eq!(o.decision, Decision::Block, "{sql}: {o:?}");
+        }
+    }
+    // Below 10 MB, or a size that is not a constant (a bind parameter, a
+    // call), is no probe, as before: the rule reads constants only. (A
+    // trigger cannot hold a bind parameter.)
+    for shape in PROBE_SHAPES {
+        for f in [
+            "randomblob(16)",
+            "zeroblob(9999999)",
+            "randomblob(abs(100000000))",
+            "zeroblob(abs(random() % 16))",
+            "zeroblob(?)",
+            "randomblob(:n)",
+        ] {
+            if f.contains(['?', ':']) && shape.starts_with("CREATE TRIGGER") {
+                continue;
+            }
+            assert_quiet(&shape.replace("{f}", f), "VERICTO-070");
+        }
+    }
+    // The probe is SQLite's: elsewhere randomblob is any function, and the
+    // other dialects walk exactly what they walked in 4.1.0.
+    for dialect in [
+        Dialect::Mysql,
+        Dialect::Oracle,
+        Dialect::MsSql,
+        Dialect::Snowflake,
+        Dialect::Postgres,
+    ] {
+        for shape in PROBE_SHAPES {
+            let sql = shape.replace("{f}", "zeroblob(1000000000)");
+            let o = evaluate(&sql, dialect, &catalogue(), &EnforcementPolicy::default());
+            assert!(
+                !o.violations.iter().any(|v| v.rule_code == "VERICTO-070"),
+                "{dialect:?} {sql}: {o:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn complete_walk_reaches_the_other_rules() {
+    // A sleep() an extension defines is still a sleep-family name.
+    assert_fires("SELECT 1 WHERE sleep(5) IS NULL", "VERICTO-070");
+    // A subquery under IN / EXISTS / ORDER BY is walked like any other: its
+    // SELECT is recorded (VERICTO-051), its calls too (custom rules).
+    assert_fires(
+        "SELECT id FROM users WHERE id IN (SELECT * FROM docs) LIMIT 1",
+        "VERICTO-051",
+    );
+    assert_fires(
+        "SELECT id FROM users WHERE EXISTS (SELECT * FROM docs) LIMIT 1",
+        "VERICTO-051",
+    );
+    // A trigger's WHEN is walked before its body; the body's paths stay
+    // prefixed with the trigger.
+    let o = sl(
+        "CREATE TRIGGER g AFTER INSERT ON docs BEGIN UPDATE docs SET body = zeroblob(1000000000) WHERE id = NEW.id; END",
+    );
+    assert_eq!(o.rule_code.as_deref(), Some("VERICTO-070"), "{o:?}");
+    // Benign statements with the same shapes stay quiet.
+    for sql in [
+        "SELECT id FROM users WHERE id IN (SELECT id FROM docs WHERE id = 1) LIMIT 1",
+        "UPDATE docs SET body = zeroblob(16) WHERE id = 1",
+        "INSERT INTO docs (id, body) VALUES (1, randomblob(16)) ON CONFLICT (id) DO UPDATE SET body = excluded.body",
+        "SELECT id FROM users ORDER BY lower(id) LIMIT 1",
+    ] {
+        let o = sl(sql);
+        assert!(o.violations.is_empty(), "{sql}: {o:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The SQLite rules (design §4.3)
 // ---------------------------------------------------------------------------

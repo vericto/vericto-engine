@@ -1,6 +1,6 @@
 [package]
 name = "vericto-engine"
-version = "4.1.0"
+version = "4.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Vericto — Deterministic SQL AST evaluation engine (open core)"
@@ -17,7 +17,8 @@ path = "src/lib.rs"
 [dependencies]
 # SQL parsing — AST engine
 pg_query = "6.2"
-sqlparser = "0.63"
+# `visitor`: the complete expression walk (`parser::walk::walk_rest`).
+sqlparser = { version = "0.63", features = ["visitor"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.1.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.1.1" }
 ```
 
 ### Quick example
@@ -186,7 +186,7 @@ Low/Informational → Monitor).
 | VERICTO-031 | UPDATE in CTE without WHERE | A data-modifying CTE (`WITH x AS (UPDATE … )`) whose `UPDATE` has no WHERE. |
 | VERICTO-033 | DELETE in subquery/CTE without WHERE | A nested `DELETE` with no WHERE inside a subquery or CTE. |
 | VERICTO-040 | INSERT INTO … SELECT without filter | `INSERT … SELECT` whose source has no filter — copies every source row. |
-| VERICTO-070 | SLEEP() / PG_SLEEP() | A sleep-family call (`sleep`, `pg_sleep`, `pg_sleep_for`, `pg_sleep_until`, Snowflake's `system$wait`) anywhere in the query — DoS / time-based blind injection probing. SQLite has no sleep: there, a `randomblob(N)` / `zeroblob(N)` with a constant `N` of 10,000,000 bytes or more (`randomblob(500000000/2)`). |
+| VERICTO-070 | SLEEP() / PG_SLEEP() | A sleep-family call (`sleep`, `pg_sleep`, `pg_sleep_for`, `pg_sleep_until`, Snowflake's `system$wait`) anywhere in the query — DoS / time-based blind injection probing. SQLite has no sleep: there, a `randomblob(N)` / `zeroblob(N)` with a constant `N` of 10,000,000 bytes or more (`randomblob(500000000/2)`), in any clause SQLite evaluates (`WHERE … IS NULL`, `CASE`, `IN (…)`, subqueries, CTEs, `ORDER BY` / `GROUP BY` / `HAVING`, `UPDATE … SET`, `INSERT … VALUES`, `RETURNING`, trigger bodies and their `WHEN`). |
 | VERICTO-082 | GRANT / REVOKE | A `GRANT` or `REVOKE` — privilege escalation or accidental lockout. |
 | VERICTO-083 | MERGE | `MERGE INTO …` — can mass-mutate the target like an UPDATE/DELETE with no effective WHERE. |
 | VERICTO-084 | CREATE TABLE AS SELECT | `CREATE TABLE … AS SELECT …` / `SELECT … INTO` — bulk data copy that can duplicate a whole table. |
@@ -877,7 +877,8 @@ matrix):
   051, 060, 061 (`INSERT` batches; no `COPY`), 084 (`CREATE TABLE … AS SELECT`).
 - **Variants**: 003 and 090 (SQLite truthiness, see [what counts as
   always-true](#what-counts-as-always-true)), 070 (`randomblob(N)` /
-  `zeroblob(N)` with a huge constant `N`), 085 (the SQLite mask rewrite above),
+  `zeroblob(N)` with a huge constant `N`, wherever SQLite evaluates it; a bind
+  parameter or a computed `N` is not read), 085 (the SQLite mask rewrite above),
   087 (SQLite names above).
 - **Not applicable** (the construct does not exist, or SQLite rejects it; the rule
   stays in the catalogue and never fires on SQLite): 011 (`TRUNCATE`), 012 (`DROP
