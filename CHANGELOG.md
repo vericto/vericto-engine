@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.1] — 2026-10-15
+
+### Fixed
+
+- **VERICTO-070 on SQLite missed a wrapped `randomblob(N)` / `zeroblob(N)`.**
+  The sqlparser walker looked for calls only in the projection, the `WHERE`
+  root, call arguments and `AND`/`OR`/`NOT`/parentheses, so `SELECT 1 WHERE
+  randomblob(100000000) IS NOT NULL`, `IS NULL`, `CASE WHEN …`, `IN (…)`,
+  `BETWEEN`, `LIKE`, `CAST`, a subquery under `IN` / `EXISTS`, `ORDER BY`,
+  `GROUP BY`, `HAVING`, `LIMIT` / `OFFSET`, `JOIN … ON`, a window or `FILTER`
+  clause, `INSERT … VALUES`, `ON CONFLICT … DO UPDATE`, `UPDATE … SET`, `UPDATE …
+  FROM`, `RETURNING` and a trigger's `WHEN` were allowed (4.1.0 already walked
+  trigger bodies, with the same blind spots inside them). On SQLite the walker
+  now visits every expression a statement evaluates, through sqlparser's
+  derived traversal (the `visitor` feature of `sqlparser`, which adds
+  `sqlparser_derive` to the build), so a clause or an expression kind it does
+  not name is still read. The threshold and the constant-only reading are
+  unchanged: `N` ≥ 10,000,000 as a number literal or constant arithmetic; a
+  bind parameter or a computed `N` is not a probe.
+- **The other rules on SQLite see the same expressions**: a `SELECT *`
+  subquery under `IN` / `EXISTS` is a nested SELECT for VERICTO-051, a
+  `sleep()` an application defines is VERICTO-070 wherever it is, and a custom
+  rule's `func_name:` matches a call in any clause (`CURRENT_TIMESTAMP`, which
+  sqlparser reads as a call, is now recorded too).
+- Unchanged on the other dialects: PostgreSQL has its own walker, and MySQL,
+  Oracle, SQL Server and Snowflake walk exactly what they walked in 4.1.0
+  (3,654 SQL strings from the engine, proxy and eval sources × 7 policies:
+  identical outcomes). Extending the complete walk to them changes verdicts
+  (`SELECT 1 WHERE sleep(5) IS NULL` on MySQL), so it is left to a minor
+  release.
+
 ## [4.1.0] — 2026-10-14
 
 SQLite becomes a dialect: `Dialect::Sqlite` (`"sqlite"`, also `"sqlite3"`),
@@ -1686,7 +1717,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.1.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.1.1...HEAD
+[4.1.1]: https://github.com/vericto/vericto-engine/compare/v4.1.0...v4.1.1
 [4.1.0]: https://github.com/vericto/vericto-engine/compare/v4.0.0...v4.1.0
 [4.0.0]: https://github.com/vericto/vericto-engine/compare/v3.9.0...v4.0.0
 [3.9.0]: https://github.com/vericto/vericto-engine/compare/v3.8.1...v3.9.0
