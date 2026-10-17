@@ -1,9 +1,12 @@
 //! `vericto-engine` — Deterministic SQL AST evaluation engine.
 //!
-//! This crate is the open-core of Vericto: it parses SQL queries into an Abstract
-//! Syntax Tree using `pg_query` (PostgreSQL's own parser) and `sqlparser-rs`,
-//! then evaluates them against a ruleset deterministically — same input always
-//! produces the same result, no ML, no thresholds, no false positives.
+//! This crate is the source-available core of Vericto (Elastic License 2.0): it
+//! parses SQL queries into an Abstract Syntax Tree using `pg_query`
+//! (PostgreSQL's own parser) and `sqlparser-rs`, then evaluates them against a
+//! ruleset deterministically — the same input always produces the same result,
+//! with no ML and no thresholds. Every false positive found so far has been
+//! fixed with a regression test; `EnforcementPolicy::monitor_mode` reports a
+//! would-be block as a flag, to trial a ruleset without blocking.
 //!
 //! ## Usage
 //!

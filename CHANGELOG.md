@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Documentation only. No API, behaviour or rule changes.
+
+### Documentation
+
+- **The README and the crate docs said the engine has "no false positives".**
+  Determinism means the same input always gets the same result; it does not
+  mean a rule never matches a legitimate query, and this changelog records
+  several that did (VERICTO-010 on non-table `DROP`s, VERICTO-040 on a filtered
+  `INSERT … SELECT`, VERICTO-050 on a bounded `UNION`). The intro now says what
+  is verifiable: deterministic, no ML, no thresholds, every false positive found
+  fixed with a regression test, and `monitor_mode` to trial a ruleset without
+  blocking.
+- **"Open core" is now "source-available".** The README tagline, the crate docs
+  and the `Cargo.toml` description called the engine the open core of Vericto.
+  It is licensed under the Elastic License 2.0, which is source-available, not
+  an open-source license.
+
 ## [4.1.2] — 2026-10-17
 
 ### Fixed

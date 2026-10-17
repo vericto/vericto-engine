@@ -1,16 +1,25 @@
 # vericto-engine
 
-> Deterministic SQL AST evaluation engine — the open core of [Vericto](https://vericto.com).
+> Deterministic SQL AST evaluation engine — the source-available core of [Vericto](https://vericto.com).
 
 [![CI](https://github.com/vericto/vericto-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/vericto/vericto-engine/actions/workflows/ci.yml)
 [![License: ELv2](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](LICENSE)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
-`vericto-engine` parses every SQL query into its full Abstract Syntax Tree using
+`vericto-engine` parses each SQL query into its full Abstract Syntax Tree using
 [pg_query](https://github.com/pganalyze/pg_query.rs) (PostgreSQL's own internal
 parser) and [sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs), then
-evaluates it against a ruleset **deterministically** — same input always produces
-the same result, no ML, no thresholds, no false positives.
+evaluates it against a ruleset **deterministically** — the same input always
+produces the same result, with no ML and no thresholds.
+
+Deterministic is not the same as free of false positives. Every false positive
+found so far has been fixed with a regression test that pins it, for example
+VERICTO-010 on `DROP VIEW` / `DROP FUNCTION`, VERICTO-040 on a filtered
+`INSERT … SELECT` and VERICTO-050 on a `UNION … LIMIT` (see the
+[CHANGELOG](CHANGELOG.md)). To trial a ruleset against real traffic before it
+blocks, set `monitor_mode` on the `EnforcementPolicy`: a rule match that would
+block is reported as a `Flag` instead (a parse error still follows the host's
+`parse_error` setting).
 
 This crate is consumed by:
 - **[vericto-proxy](https://github.com/vericto/vericto-proxy)** — TCP wire-protocol proxy deployed in customer infrastructure
