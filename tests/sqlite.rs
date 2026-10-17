@@ -1192,7 +1192,7 @@ fn vericto_085_sqlite_golden_rewrites() {
         ),
         (
             "SELECT card, note FROM customers WHERE id = ?1",
-            "SELECT '****' || SUBSTR(CAST(card AS TEXT), -4) AS card, '[redacted]' AS note FROM customers WHERE id = ?1".to_string(),
+            "SELECT CASE WHEN length(CAST(card AS TEXT)) <= 8 THEN '[redacted]' ELSE '****' || SUBSTR(CAST(card AS TEXT), -4) END AS card, '[redacted]' AS note FROM customers WHERE id = ?1".to_string(),
         ),
         // The client's alias, and a bracketed or backticked name, are kept.
         (

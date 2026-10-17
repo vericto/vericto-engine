@@ -124,7 +124,8 @@ pub enum MaskStyle {
     /// `'[redacted]'`
     #[default]
     Full,
-    /// `'****' || right(col::text, 4)`
+    /// `'****' || right(col::text, 4)`, or `'[redacted]'` when the text is
+    /// 8 characters or shorter (`LAST4_REDACT_MAX_CHARS`): see its comment.
     Last4,
     /// First character and the domain kept: `j***@example.com`.
     Email,
@@ -132,6 +133,19 @@ pub enum MaskStyle {
     /// SHA-256.
     Hash,
 }
+
+/// `last4` renders exactly what `full` renders for a value of this many
+/// characters or fewer, and `'****'` plus the last four above it.
+///
+/// With 8 characters or fewer, the 4 revealed characters are half of the value
+/// or more: a PIN, a short code, `''` or a single character came back whole
+/// (`right(x, 4)` of a 4-character value is the value). A fixed rule of the
+/// style, not configuration, so the same tag reveals the same thing on every
+/// host and every dialect. Counted in characters (`char_length`, MySQL's
+/// `CHAR_LENGTH`, Snowflake's and SQLite's `length` of text), never bytes:
+/// `'ñandú12'` is 7 characters and 9 UTF-8 bytes, and a byte count would hand
+/// out `'dú12'`.
+pub(crate) const LAST4_REDACT_MAX_CHARS: usize = 8;
 
 impl<'de> Deserialize<'de> for MaskStyle {
     fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {

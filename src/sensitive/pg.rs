@@ -16,8 +16,8 @@ use pg_query::protobuf::{
 
 use crate::error::{MAX_AST_DEPTH, ProxyError, Result};
 use crate::sensitive::{
-    Item, Lineage, MaskStyle, OutCol, Scopes, Sink, Tags, Touches, indirect, mask_style_for, merge,
-    outcol_all, outcols_all, starred,
+    Item, LAST4_REDACT_MAX_CHARS, Lineage, MaskStyle, OutCol, Scopes, Sink, Tags, Touches,
+    indirect, mask_style_for, merge, outcol_all, outcols_all, starred,
 };
 
 /// Rewrite outcome: `Some(Ok(sql))` when at least one projection was masked,
@@ -1475,13 +1475,17 @@ fn fix_order_and_group(s: &mut SelectStmt, rewritten: &[(usize, String, Node)], 
 const MASK_ARG: &str = "vericto_mask_arg";
 
 /// Design §5.4, built from SQL templates parsed once by Postgres's own parser,
-/// with the original expression spliced in for the placeholder. Two deliberate
-/// departures from the design text, both fail-safe:
+/// with the original expression spliced in for the placeholder. Three
+/// deliberate departures from the design text, all fail-safe:
 /// - `email` uses `^(.)[^@]*(@.*)?$`, so a value with no `@` is still masked
 ///   (`'^(.).*(@.*)$'` would not match it and return it in clear);
 /// - `hash` hashes `convert_to(x::text, 'UTF8')` instead of `x::text::bytea`,
-///   which fails on any text containing a backslash.
-static TEMPLATES: OnceLock<[Node; 5]> = OnceLock::new();
+///   which fails on any text containing a backslash;
+/// - `last4` is `'[redacted]'` up to [`LAST4_REDACT_MAX_CHARS`] characters
+///   (`char_length`, not `octet_length`): `right(x, 4)` of a short value is
+///   most or all of it. NULL stays NULL, as before (`char_length(NULL) <= 8`
+///   is not true, and the ELSE branch is NULL).
+static TEMPLATES: OnceLock<[Node; 6]> = OnceLock::new();
 
 fn template(style: MaskStyle) -> &'static Node {
     let all = TEMPLATES.get_or_init(|| {
@@ -1502,10 +1506,15 @@ fn template(style: MaskStyle) -> &'static Node {
         };
         [
             parse("SELECT '[redacted]'::text"),
-            parse("SELECT '****' || right(vericto_mask_arg::text, 4)"),
+            parse(&format!(
+                "SELECT CASE WHEN char_length(vericto_mask_arg::text) <= {LAST4_REDACT_MAX_CHARS} \
+                 THEN '[redacted]'::text ELSE '****' || right(vericto_mask_arg::text, 4) END"
+            )),
             parse(r"SELECT regexp_replace(vericto_mask_arg::text, '^(.)[^@]*(@.*)?$', '\1***\2')"),
             parse("SELECT encode(sha256(convert_to(vericto_mask_arg::text, 'UTF8')), 'hex')"),
             parse("SELECT concat('[redacted]'::text, left(vericto_mask_arg::text, 0))"),
+            // `last4` over anything but a bare column (see `mask_node`).
+            parse("SELECT '[redacted]'::text || left(vericto_mask_arg::text, 0)"),
         ]
     });
     match style {
@@ -1533,6 +1542,23 @@ fn full_keeping_params() -> &'static Node {
     // `template` initialises every entry, including this one.
     let _ = template(MaskStyle::Full);
     &TEMPLATES.get().expect("templates initialised")[4]
+}
+
+/// `last4` over a value that is not a bare column (a scalar subquery):
+/// `'[redacted]'::text || left((expr)::text, 0)`.
+///
+/// The `last4` template names its argument twice (the length test and the
+/// tail). A column reference reads the same value both times; a scalar
+/// subquery is planned twice and run twice, and a volatile one (`ORDER BY
+/// random() LIMIT 1` over a long value and a short one) could pass the length
+/// test with one row and hand out the last four characters of another, a
+/// short value revealed whole. So it is redacted outright, whatever its
+/// length: the expression is kept once (each `$n` stays, in its own context,
+/// so Postgres infers the same type for it), and `||` keeps last4's NULL
+/// semantics: NULL for NULL, `'[redacted]'` for every other value.
+fn last4_redacted() -> &'static Node {
+    let _ = template(MaskStyle::Full);
+    &TEMPLATES.get().expect("templates initialised")[5]
 }
 
 /// Whether a node contains a bind parameter anywhere inside it.
@@ -1569,30 +1595,47 @@ fn plain_value(node: &Node) -> bool {
 /// set-returning function must still decide how many rows come back
 /// (`'[redacted]'` in place of `string_agg(email, ',')` returns one row per
 /// input row instead of one).
+///
+/// `last4` repeats its argument, so only a bare column gets the length test;
+/// anything else ([`last4_redacted`]) is redacted outright, keeping the
+/// expression once.
 pub(crate) fn mask_node(style: MaskStyle, orig: Node) -> Node {
-    let base = if style == MaskStyle::Full && (has_param(&orig) || !plain_value(&orig)) {
-        full_keeping_params()
-    } else {
-        template(style)
+    let column = matches!(orig.node.as_ref(), Some(NodeEnum::ColumnRef(_)));
+    let base = match style {
+        MaskStyle::Full if has_param(&orig) || !plain_value(&orig) => full_keeping_params(),
+        MaskStyle::Last4 if !column => last4_redacted(),
+        _ => template(style),
     };
     let mut out = base.clone();
-    let mut orig = Some(orig);
-    splice(&mut out, &mut orig);
+    splice(&mut out, &orig);
     out
 }
 
-fn splice(node: &mut Node, orig: &mut Option<Node>) {
+/// Replaces every placeholder in `node` with a copy of `orig`.
+fn splice(node: &mut Node, orig: &Node) {
     let is_placeholder = matches!(
         node.node.as_ref(),
         Some(NodeEnum::ColumnRef(c)) if c.fields.len() == 1 && str_of(&c.fields[0]) == Some(MASK_ARG)
     );
     if is_placeholder {
-        if let Some(o) = orig.take() {
-            *node = o;
-        }
+        *node = orig.clone();
         return;
     }
     match node.node.as_mut() {
+        Some(NodeEnum::CaseExpr(c)) => {
+            c.args.iter_mut().for_each(|a| splice(a, orig));
+            if let Some(d) = c.defresult.as_deref_mut() {
+                splice(d, orig);
+            }
+        }
+        Some(NodeEnum::CaseWhen(w)) => {
+            for x in [w.expr.as_deref_mut(), w.result.as_deref_mut()]
+                .into_iter()
+                .flatten()
+            {
+                splice(x, orig);
+            }
+        }
         Some(NodeEnum::FuncCall(f)) => f.args.iter_mut().for_each(|a| splice(a, orig)),
         Some(NodeEnum::AExpr(a)) => {
             if let Some(l) = a.lexpr.as_deref_mut() {

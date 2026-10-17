@@ -27,9 +27,9 @@ const MASK_ARG: &str = "vericto_mask_arg";
 /// values (a JSON string without its quotes) as Snowflake displays them.
 const X: &str = "TO_VARCHAR(vericto_mask_arg)";
 
-static TEMPLATES: std::sync::OnceLock<[Expr; 5]> = std::sync::OnceLock::new();
+static TEMPLATES: std::sync::OnceLock<[Expr; 6]> = std::sync::OnceLock::new();
 
-fn templates() -> &'static [Expr; 5] {
+fn templates() -> &'static [Expr; 6] {
     TEMPLATES.get_or_init(|| {
         let parse = |sql: &str| -> Expr {
             let mut st = Parser::parse_sql(&SnowflakeDialect {}, &format!("SELECT {sql}"))
@@ -47,7 +47,14 @@ fn templates() -> &'static [Expr; 5] {
         };
         [
             parse("'[redacted]'"),
-            parse(&format!("CONCAT('****', RIGHT({X}, 4))")),
+            // Postgres: '[redacted]' up to LAST4_REDACT_MAX_CHARS characters
+            // (LENGTH counts characters), else '****' || right(x, 4). NULL
+            // stays NULL.
+            parse(&format!(
+                "CASE WHEN LENGTH({X}) <= {} THEN '[redacted]' \
+                 ELSE CONCAT('****', RIGHT({X}, 4)) END",
+                super::LAST4_REDACT_MAX_CHARS
+            )),
             // The Postgres form is regexp_replace(x, '^(.)[^@]*(@.*)?$',
             // '\1***\2'): the first character, then the domain from the first
             // `@` after it. Written without a regular expression, so neither
@@ -65,6 +72,9 @@ fn templates() -> &'static [Expr; 5] {
             // CONCAT is NULL if an argument is, hence the COALESCE: the
             // result is `'[redacted]'` for every value and for NULL.
             parse(&format!("CONCAT('[redacted]', COALESCE(LEFT({X}, 0), ''))")),
+            // `last4` over anything but a bare column: '[redacted]', NULL
+            // staying NULL (see `super::mysql::mask_expr`).
+            parse(&format!("CONCAT('[redacted]', LEFT({X}, 0))")),
         ]
     })
 }
@@ -77,6 +87,9 @@ fn templates() -> &'static [Expr; 5] {
 /// expression stays in place (each `?` keeps its position and context) and
 /// its value is discarded at run time. `email` repeats its argument, so over
 /// an expression with a parameter it falls back to that same `full` form.
+/// `last4` repeats it as well, so only a bare column gets its length test;
+/// anything else is redacted outright, kept once, NULL staying NULL (the
+/// reasons are on [`super::mysql::mask_expr`]).
 pub(crate) fn mask_expr(style: super::MaskStyle, orig: &Expr) -> Expr {
     use super::MaskStyle::*;
     let t = templates();
@@ -89,6 +102,7 @@ pub(crate) fn mask_expr(style: super::MaskStyle, orig: &Expr) -> Expr {
         Full | Email if params => &t[4],
         Full if !plain => &t[4],
         Full => return t[0].clone(),
+        Last4 if !super::mysql::is_column(orig) => &t[5],
         Last4 => &t[1],
         Email => &t[2],
         Hash => &t[3],

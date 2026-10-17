@@ -202,7 +202,9 @@ fn render() -> String {
             // one, byte for byte, except six lines changed by sqlparser 0.63
             // in 3.9.0: MySQL's `SET SESSION TRANSACTION …` now parses
             // (allowed, as on Postgres, instead of a parse error) and a mask
-            // rewrite keeps a table alias without `AS` as the client wrote it.
+            // rewrite keeps a table alias without `AS` as the client wrote it,
+            // and one line changed in 4.1.2: the `last4` mask now redacts a
+            // value of 8 characters or fewer.
             assert!(o.access_denied.is_empty(), "{sql}");
             let line = format!("{o:?}").replace(", access_denied: []", "");
             out.push_str(&format!("{dialect:?}\t{name}\t{sql:?}\t{line}\n"));

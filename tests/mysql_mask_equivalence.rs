@@ -125,6 +125,56 @@ const ROWS: &[Row] = &[
         Some("a@b"),
         Some("2024-12-01"),
     ),
+    // last4 around its threshold: 8 and 9 characters, multibyte text of 7
+    // characters (9 bytes) and 9 characters, 4-byte characters, NULL.
+    (
+        13,
+        "e8",
+        Some("e8@x.io"),
+        Some("12345678"),
+        Some("s13"),
+        Some("2025-01-01"),
+    ),
+    (
+        14,
+        "e9",
+        Some("e9@x.io"),
+        Some("123456789"),
+        Some("s14"),
+        Some("2025-02-01"),
+    ),
+    (
+        15,
+        "mb7",
+        Some("mb7@x.io"),
+        Some("ñandú12"),
+        Some("s15"),
+        Some("2025-03-01"),
+    ),
+    (
+        16,
+        "mb9",
+        Some("mb9@x.io"),
+        Some("ñandú1234"),
+        Some("s16"),
+        Some("2025-04-01"),
+    ),
+    (
+        17,
+        "nul",
+        Some("nul@x.io"),
+        None,
+        Some("s17"),
+        Some("2025-05-01"),
+    ),
+    (
+        18,
+        "emoji9",
+        Some("e18@x.io"),
+        Some("😀😀😀😀😀1234"),
+        Some("s18"),
+        Some("2025-06-01"),
+    ),
 ];
 
 fn my_lit(v: Option<&str>) -> String {
@@ -278,9 +328,17 @@ fn cases() -> Vec<Case> {
             "SELECT email, COUNT(*) AS n FROM customers GROUP BY email ORDER BY email",
             &[("email", Email)],
         ),
+        Case {
+            params: Some(json!([3])),
+            ..case(
+                "SELECT id, card FROM customers WHERE id >= ? ORDER BY id",
+                &[("card", Last4)],
+            )
+        },
+        // A grouped last4 column: the mask reads only the grouped column
+        // (ONLY_FULL_GROUP_BY accepts it), and the count is per group.
         case(
-            "SELECT c.id, (SELECT c2.card FROM customers c2 WHERE c2.id = c.id) AS card \
-             FROM customers c ORDER BY 1",
+            "SELECT card, COUNT(*) AS n FROM customers GROUP BY card ORDER BY card",
             &[("card", Last4)],
         ),
         Case {
@@ -503,17 +561,24 @@ fn connect(config: Value, tag: &str) -> My {
     my
 }
 
+/// What `last4` returns for a non-NULL text on every dialect: `[redacted]`
+/// up to 8 characters (characters, not bytes), `****` and the last four above.
+fn last4(o: &str) -> String {
+    let chars: Vec<char> = o.chars().collect();
+    if chars.len() <= 8 {
+        return "[redacted]".into();
+    }
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("****{tail}")
+}
+
 /// The Postgres outputs for the same text (`regexp_replace(x,
-/// '^(.)[^@]*(@.*)?$', '\1***\2')`, `'****' || right(x, 4)`), written out.
+/// '^(.)[^@]*(@.*)?$', '\1***\2')`, [`last4`]), written out.
 fn check_masked(style: MaskStyle, orig: Option<&str>, got: Option<&str>) -> bool {
     match (style, orig) {
         (MaskStyle::Full, _) => got == Some("[redacted]"),
         (_, None) => got.is_none(),
-        (MaskStyle::Last4, Some(o)) => {
-            let chars: Vec<char> = o.chars().collect();
-            let tail: String = chars[chars.len().saturating_sub(4)..].iter().collect();
-            got == Some(format!("****{tail}").as_str())
-        }
+        (MaskStyle::Last4, Some(o)) => got == Some(last4(o).as_str()),
         (MaskStyle::Email, Some(o)) => {
             let mut chars = o.chars();
             let Some(first) = chars.next() else {
@@ -614,6 +679,66 @@ fn rewritten_queries_return_the_same_rows_with_masked_values() {
             Some("1913fb3460b7de0641842fcd677d93acd064fbac170ca4e60b2fc186cf95d5ca"),
             "{rw}"
         );
+    }
+}
+
+/// `last4` on real MySQL servers, value by value, over both protocols: a
+/// value of 8 characters or fewer used to come back whole or nearly
+/// (`'1234'` → `'****1234'`, `'ñandú12'` → `'****dú12'`).
+#[test]
+fn last4_reveals_nothing_of_short_values_on_mysql() {
+    let servers = servers();
+    if servers.is_empty() {
+        eprintln!("VERICTO_EQUIV_MYSQL not set: skipping the database half");
+        return;
+    }
+    let r = Some("[redacted]");
+    let want: Vec<Option<&str>> = vec![
+        Some("****1111"),
+        Some("****0004"),
+        r, // '1234'
+        Some("****0005"),
+        r, // '12'
+        r, // ''
+        r, // '9'
+        r, // '€€€€€': 5 characters, 15 bytes
+        r, // '1'
+        r, // 'x😀'
+        r, // "it's"
+        r, // 'ab'
+        r, // 8 characters
+        Some("****6789"),
+        r, // 'ñandú12': 7 characters, 9 bytes
+        Some("****1234"),
+        None,
+        Some("****1234"), // 9 characters, 24 bytes
+    ];
+    assert_eq!(want.len(), ROWS.len());
+    for (n, config) in servers.into_iter().enumerate() {
+        let my = connect(config, &format!("l4{n}"));
+        let version = my.version();
+        let rw = rewritten("SELECT id, card FROM customers ORDER BY id", Dialect::Mysql);
+        for params in [None, Some(&json!([]))] {
+            let (_, rows) = my.run(&rw, params);
+            let got: Vec<Option<&str>> = rows.iter().map(|r| r[1].as_deref()).collect();
+            assert_eq!(got, want, "MySQL {version}: {rw}");
+        }
+        // A scalar subquery is redacted outright (it would run twice under
+        // the length test), NULL staying NULL; its `?` is kept, once.
+        let rw = rewritten(
+            "SELECT (SELECT card FROM customers WHERE id = ?) AS c",
+            Dialect::Mysql,
+        );
+        for (id, want) in [(1, r), (3, r), (17, None)] {
+            let (h, rows) = my.run(&rw, Some(&json!([id])));
+            assert_eq!(h, ["c"], "{rw}");
+            assert_eq!(
+                rows,
+                [[want.map(str::to_string)]],
+                "MySQL {version}: {rw} with ? = {id}"
+            );
+        }
+        eprintln!("ok: last4 on MySQL {version}");
     }
 }
 

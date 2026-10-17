@@ -331,6 +331,36 @@ fn placeholders_keep_count_and_order() {
     );
     assert_eq!(placeholders(&rw), 2, "{rw}");
     assert!(rw.contains("CONCAT('[redacted]'"), "{rw}");
+    // The same for last4, whose length test repeats its argument: one copy
+    // of the subquery and of each `?`, redacted, NULL staying NULL (no
+    // COALESCE).
+    let rw = same_tree_minus(
+        "SELECT id, (SELECT card FROM customers c2 WHERE c2.id = ?) AS k FROM customers WHERE id < ?",
+        &["k"],
+    );
+    assert_eq!(placeholders(&rw), 2, "{rw}");
+    assert_eq!(rw.matches("SELECT card").count(), 1, "{rw}");
+    assert!(
+        rw.contains("CONCAT('[redacted]', LEFT((CONVERT(((SELECT card FROM customers c2 WHERE c2.id = ?)) USING utf8mb4) COLLATE utf8mb4_bin), 0)) AS `k`"),
+        "{rw}"
+    );
+}
+
+#[test]
+fn last4_redacts_short_values_counted_in_characters() {
+    // `CONCAT('****', RIGHT(x, 4))` alone returned a value of 4 characters
+    // or fewer whole. Up to 8 characters it is now '[redacted]', counted by
+    // CHAR_LENGTH (characters), not LENGTH (bytes).
+    let rw = same_tree_minus("SELECT id, card FROM customers WHERE id = ?", &["card"]);
+    let x = "(CONVERT((card) USING utf8mb4) COLLATE utf8mb4_bin)";
+    assert!(
+        rw.contains(&format!(
+            "CASE WHEN CHAR_LENGTH({x}) <= 8 THEN '[redacted]' ELSE CONCAT('****', RIGHT({x}, 4)) END AS `card`"
+        )),
+        "{rw}"
+    );
+    assert!(!rw.contains(" LENGTH("), "bytes, not characters: {rw}");
+    assert_eq!(placeholders(&rw), 1, "{rw}");
 }
 
 #[test]

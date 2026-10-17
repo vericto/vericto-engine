@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.1.1" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.1.2" }
 ```
 
 ### Quick example
@@ -419,7 +419,7 @@ so audit the original too). If anything about the rewrite fails, the query is
 | Style | Expression |
 |---|---|
 | `full` | `'[redacted]'::text` |
-| `last4` | `'****' \|\| right(col::text, 4)` |
+| `last4` | `CASE WHEN char_length(col::text) <= 8 THEN '[redacted]'::text ELSE '****' \|\| right(col::text, 4) END` |
 | `email` | `regexp_replace(col::text, '^(.)[^@]*(@.*)?$', '\1***\2')` |
 | `hash` | `encode(sha256(convert_to(col::text, 'UTF8')), 'hex')` |
 
@@ -427,6 +427,13 @@ The tag's style applies only when the projected value **is** the column (a bare
 reference, possibly through CTEs and subqueries). Any computed value —
 `substring(card, 1, 4)`, `lower(email)`, `string_agg(…)` — is masked `full`:
 applying `last4` to a caller-chosen substring would hand out any four characters.
+`last4` reveals the last four characters only of a value longer than 8 characters
+(counted in characters, not bytes); a shorter one, where four characters are half
+of it or more, renders `'[redacted]'`, as under `full`. NULL stays NULL. Its
+length test names the value twice, so it applies to a bare column only: `last4`
+reached through a scalar subquery, which would run twice, renders
+`'[redacted]'::text || left((expr)::text, 0)`, redacted whatever its length, NULL
+staying NULL and its `$n` kept once.
 A computed value masked `full` keeps the expression and discards its value,
 `concat('[redacted]'::text, left((expr)::text, 0))`, so its `$n` parameters stay
 in place and an aggregate still returns one row. A masked column becomes `text`. `ORDER BY` / `GROUP BY` items that referred to a
@@ -446,7 +453,7 @@ Postgres masks return for the same text (NULL stays NULL except under `full`):
 | Style | Expression (`x` = `(CONVERT((col) USING utf8mb4) COLLATE utf8mb4_bin)`) |
 |---|---|
 | `full` | `'[redacted]'` (a computed value: `CONCAT('[redacted]', COALESCE(LEFT(x, 0), ''))`) |
-| `last4` | `CONCAT('****', RIGHT(x, 4))` |
+| `last4` | `CASE WHEN CHAR_LENGTH(x) <= 8 THEN '[redacted]' ELSE CONCAT('****', RIGHT(x, 4)) END` (through a scalar subquery: `CONCAT('[redacted]', LEFT(x, 0))`) |
 | `email` | `CASE WHEN CHAR_LENGTH(x) = 0 THEN x WHEN LOCATE('@', x, 2) > 0 THEN CONCAT(LEFT(x, 1), '***', SUBSTRING(x, LOCATE('@', x, 2))) ELSE CONCAT(LEFT(x, 1), '***') END` |
 | `hash` | `SHA2(x, 256)` |
 
@@ -493,7 +500,7 @@ the Postgres masks return for the same text (NULL stays NULL except under
 | Style | Expression (`x` = `TO_VARCHAR(col)`) |
 |---|---|
 | `full` | `'[redacted]'` (a computed value or one holding a bind parameter: `CONCAT('[redacted]', COALESCE(LEFT(x, 0), ''))`) |
-| `last4` | `CONCAT('****', RIGHT(x, 4))` |
+| `last4` | `CASE WHEN LENGTH(x) <= 8 THEN '[redacted]' ELSE CONCAT('****', RIGHT(x, 4)) END` (through a scalar subquery: `CONCAT('[redacted]', LEFT(x, 0))`) |
 | `email` | `CASE WHEN LENGTH(x) = 0 THEN x WHEN CHARINDEX('@', x, 2) > 0 THEN CONCAT(LEFT(x, 1), '***', SUBSTR(x, CHARINDEX('@', x, 2))) ELSE CONCAT(LEFT(x, 1), '***') END` |
 | `hash` | `SHA2(x, 256)` |
 
@@ -530,7 +537,7 @@ open the database should also turn the fallback off
 | Style | Expression (`x` = `CAST(col AS TEXT)`) |
 |---|---|
 | `full` | `'[redacted]'` (a computed value or one holding a bind parameter: `'[redacted]' \|\| coalesce(substr(x, 1, 0), '')`) |
-| `last4` | `'****' \|\| substr(x, -4)` |
+| `last4` | `CASE WHEN length(x) <= 8 THEN '[redacted]' ELSE '****' \|\| substr(x, -4) END` (through a scalar subquery: `'[redacted]' \|\| substr(x, 1, 0)`) |
 | `email` | `CASE WHEN length(x) = 0 THEN x WHEN instr(substr(x, 2), '@') > 0 THEN substr(x, 1, 1) \|\| '***' \|\| substr(x, instr(substr(x, 2), '@') + 1) ELSE substr(x, 1, 1) \|\| '***' END` |
 | `hash` | **blocks**: core SQLite has no SHA-256 (it is a loadable extension). Tag the column `block`, or mask it `full`, `last4` or `email`. |
 

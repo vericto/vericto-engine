@@ -851,9 +851,9 @@ const MASK_ARG: &str = "vericto_mask_arg";
 /// `CONVERT`.
 const X: &str = "(CONVERT((vericto_mask_arg) USING utf8mb4) COLLATE utf8mb4_bin)";
 
-static TEMPLATES: std::sync::OnceLock<[Expr; 6]> = std::sync::OnceLock::new();
+static TEMPLATES: std::sync::OnceLock<[Expr; 7]> = std::sync::OnceLock::new();
 
-fn templates() -> &'static [Expr; 6] {
+fn templates() -> &'static [Expr; 7] {
     TEMPLATES.get_or_init(|| {
         let parse = |sql: &str| -> Expr {
             let d = dialect();
@@ -871,7 +871,14 @@ fn templates() -> &'static [Expr; 6] {
         };
         [
             parse("'[redacted]'"),
-            parse(&format!("CONCAT('****', RIGHT({X}, 4))")),
+            // Postgres: '[redacted]' up to LAST4_REDACT_MAX_CHARS characters
+            // (CHAR_LENGTH, not LENGTH, which counts bytes), else
+            // '****' || right(x, 4). NULL stays NULL.
+            parse(&format!(
+                "CASE WHEN CHAR_LENGTH({X}) <= {} THEN '[redacted]' \
+                 ELSE CONCAT('****', RIGHT({X}, 4)) END",
+                super::LAST4_REDACT_MAX_CHARS
+            )),
             // Postgres: regexp_replace(x, '^(.)[^@]*(@.*)?$', '\1***\2').
             // The domain starts at the first `@` AFTER the first character
             // (`(.)` consumes the first one even if it is an `@`); `''` stays
@@ -885,6 +892,9 @@ fn templates() -> &'static [Expr; 6] {
             // `full` over an expression holding `?` (see `mask_expr`).
             parse(&format!("CONCAT('[redacted]', COALESCE(LEFT({X}, 0), ''))")),
             parse("COALESCE(vericto_mask_arg)"),
+            // `last4` over anything but a bare column (see `mask_expr`):
+            // '[redacted]', NULL staying NULL (no COALESCE).
+            parse(&format!("CONCAT('[redacted]', LEFT({X}, 0))")),
         ]
     })
 }
@@ -952,6 +962,14 @@ pub(crate) fn splice(e: &mut Expr, orig: &Expr) {
 /// argument is, hence the `COALESCE`), and every `?` keeps its context, so
 /// the server infers the same parameter types. `email` repeats its argument,
 /// so over an expression with `?` it falls back to that same `full` form.
+///
+/// `last4` repeats its argument too (the length test and the tail), so only a
+/// bare column, which reads the same value twice, gets it. Anything else (a
+/// scalar subquery, with or without `?`) is redacted outright as
+/// `CONCAT('[redacted]', LEFT(x, 0))`: the expression stays once, so each `?`
+/// keeps its position and context, a volatile subquery cannot pass the
+/// length test with one row and give out the tail of another, and NULL stays
+/// NULL as under last4.
 pub(crate) fn mask_expr(style: super::MaskStyle, orig: &Expr) -> Expr {
     use super::MaskStyle::*;
     let t = templates();
@@ -967,6 +985,7 @@ pub(crate) fn mask_expr(style: super::MaskStyle, orig: &Expr) -> Expr {
         Full | Email if params => &t[4],
         Full if !plain => &t[4],
         Full => return t[0].clone(),
+        Last4 if !is_column(orig) => &t[6],
         Last4 => &t[1],
         Email => &t[2],
         Hash => &t[3],
@@ -974,6 +993,17 @@ pub(crate) fn mask_expr(style: super::MaskStyle, orig: &Expr) -> Expr {
     let mut out = base.clone();
     splice(&mut out, orig);
     out
+}
+
+/// A bare (possibly qualified, possibly parenthesized) column reference: the
+/// only argument the `last4` length test may repeat, since every copy reads
+/// the same value of the same row.
+pub(crate) fn is_column(e: &Expr) -> bool {
+    match e {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+        Expr::Nested(x) => is_column(x),
+        _ => false,
+    }
 }
 
 /// `COALESCE(col)`: still the input column, but no longer a bare name that
