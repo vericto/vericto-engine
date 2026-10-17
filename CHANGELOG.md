@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.2] — 2026-10-17
+
+### Fixed
+
+- **The `last4` mask returned short values in clear.** It rendered
+  `'****' || right(x, 4)`, and `right(x, 4)` of a value of four characters or
+  fewer is the whole value: a PIN, a short code, a one-character value or
+  `''` under a `last4` tag came back unmasked (`'1234'` as `'****1234'`), and a
+  value of five to eight characters came back half or more (`'12345678'` as
+  `'****5678'`), while the column was reported as masked. Every dialect that
+  rewrites masks was affected (PostgreSQL, MySQL and its variants, Snowflake,
+  SQLite), for every query that projects a `last4` column, directly or through
+  aliases, CTEs, derived tables and scalar subqueries. `last4` now renders
+  exactly what `full` renders (`'[redacted]'`) for a value of 8 characters or
+  fewer, counted in characters (`char_length`, MySQL's `CHAR_LENGTH`, `length`
+  on Snowflake and SQLite), never bytes, so `'ñandú12'` (7 characters, 9 bytes)
+  is redacted; longer values keep `'****'` and their last four characters. The
+  threshold is a fixed rule of the style, not configuration. NULL stays NULL, as
+  before. The length test names the value twice, which is safe for a column
+  but not for a scalar subquery: run twice, a volatile one could pass the test
+  with one row and give out the tail of another, and on MySQL a repeated `?`
+  would shift the client's bindings. `last4` over anything but a bare column is
+  therefore redacted whatever its length (`'[redacted]'`, NULL staying NULL),
+  with the expression and each of its bind parameters kept once, in order and in
+  the same context, so prepared statements bind as before. Computed values and
+  aggregates were already masked `full` and are unchanged. This narrows what a
+  `last4` mask reveals; it does not change which queries are allowed, flagged
+  or blocked, nor the reported rule, severity or columns. Hosts that compare
+  rewritten text (golden files, caches keyed on the rewrite) see the new mask
+  expression for every `last4` column.
+
 ## [4.1.1] — 2026-10-15
 
 ### Fixed
@@ -1717,7 +1748,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.1.1...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.1.2...HEAD
+[4.1.2]: https://github.com/vericto/vericto-engine/compare/v4.1.1...v4.1.2
 [4.1.1]: https://github.com/vericto/vericto-engine/compare/v4.1.0...v4.1.1
 [4.1.0]: https://github.com/vericto/vericto-engine/compare/v4.0.0...v4.1.0
 [4.0.0]: https://github.com/vericto/vericto-engine/compare/v3.9.0...v4.0.0

@@ -28,7 +28,14 @@ INSERT INTO customers VALUES
   (2, 'bob',  'bob.smith@mail.org', '5500000000000004', '987-65-4321', '2024-02-01'),
   (3, 'Zed',  NULL,                 '1234',             NULL,          '2024-03-01'),
   (4, 'noat', 'plainvalue',         '378282246310005',  'a\b',         '2024-04-01'),
-  (5, 'dup',  'ann@example.com',    '12',               '123-45-6789', NULL);
+  (5, 'dup',  'ann@example.com',    '12',               '123-45-6789', NULL),
+  (6, 'e0',   'e0@x.io',            '',                 's6',          '2024-06-01'),
+  (7, 'e1',   'e1@x.io',            '9',                's7',          '2024-07-01'),
+  (8, 'e8',   'e8@x.io',            '12345678',         's8',          '2024-08-01'),
+  (9, 'e9',   'e9@x.io',            '123456789',        's9',          '2024-09-01'),
+  (10, 'mb7', 'mb7@x.io',           'ñandú12',          's10',         '2024-10-01'),
+  (11, 'mb9', 'mb9@x.io',           'ñandú1234',        's11',         '2024-11-01'),
+  (12, 'nul', 'nul@x.io',           NULL,               's12',         '2024-12-01');
 CREATE TABLE orders (id int, customer_id int, total int, email text);
 INSERT INTO orders VALUES (10, 1, 100, 'o1@x.io'), (11, 2, 250, 'o2@x.io'), (12, 1, 75, 'o3@x.io');
 "#;
@@ -101,8 +108,14 @@ const CASES: &[Case] = &[
         &[("email", MaskStyle::Email)],
     ),
     (
-        "SELECT c.id, (SELECT c2.card FROM customers c2 WHERE c2.id = c.id) AS card \
-         FROM customers c ORDER BY 1",
+        "SELECT id, card FROM customers WHERE id >= $1 ORDER BY id",
+        Some("(3)"),
+        &[("card", MaskStyle::Last4)],
+    ),
+    (
+        // A grouped last4 column: the mask reads only the grouped column, and
+        // the aggregate beside it still counts per group.
+        "SELECT card, count(*) AS n FROM customers GROUP BY card ORDER BY card",
         None,
         &[("card", MaskStyle::Last4)],
     ),
@@ -238,16 +251,24 @@ fn parse_csv(text: &str) -> Vec<Vec<String>> {
     rows
 }
 
+/// What `last4` must return for a non-NULL text: `[redacted]` up to 8
+/// characters (counted as characters, not bytes), `****` and the last four
+/// above.
+fn last4(orig: &str) -> String {
+    let chars: Vec<char> = orig.chars().collect();
+    if chars.len() <= 8 {
+        return "[redacted]".into();
+    }
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("****{tail}")
+}
+
 fn check_masked(style: MaskStyle, orig: &str, got: &str) -> bool {
     const NULL: &str = "<NULL>";
     match style {
         MaskStyle::Full => got == "[redacted]",
         _ if orig == NULL => got == NULL,
-        MaskStyle::Last4 => {
-            let chars: Vec<char> = orig.chars().collect();
-            let tail: String = chars[chars.len().saturating_sub(4)..].iter().collect();
-            got == format!("****{tail}")
-        }
+        MaskStyle::Last4 => got == last4(orig),
         MaskStyle::Email => {
             // `^(.)[^@]*(@.*)?$` → first character, `***`, then everything from
             // the first `@` (nothing when there is none).
@@ -313,5 +334,65 @@ fn rewritten_queries_return_the_same_rows_with_masked_values() {
             }
         }
         eprintln!("ok: {sql}\n    → {rw}");
+    }
+}
+
+/// `last4` on a real Postgres, value by value: a value of 8 characters or
+/// fewer used to come back whole or nearly (`'1234'` → `'****1234'`).
+#[test]
+fn last4_reveals_nothing_of_short_values_on_postgres() {
+    let Ok(cmd) = std::env::var("VERICTO_EQUIV_PSQL") else {
+        eprintln!("VERICTO_EQUIV_PSQL not set: skipping the database half");
+        return;
+    };
+    let db = format!("vericto_mask_last4_{}", std::process::id());
+    let psql = Psql {
+        cmd,
+        db: db.clone(),
+    };
+    psql.run("postgres", &format!("CREATE DATABASE {db}"));
+    psql.run(&db, FIXTURE);
+    // (id, card, what last4 returns): lengths 0, 1, 2, 4, 8, 9, 15, 16,
+    // multibyte text of 7 characters (9 bytes) and 9 characters, NULL.
+    let want: &[(&str, &str)] = &[
+        ("1", "****1111"),
+        ("2", "****0004"),
+        ("3", "[redacted]"),
+        ("4", "****0005"),
+        ("5", "[redacted]"),
+        ("6", "[redacted]"),
+        ("7", "[redacted]"),
+        ("8", "[redacted]"),
+        ("9", "****6789"),
+        ("10", "[redacted]"),
+        ("11", "****1234"),
+        ("12", "<NULL>"),
+    ];
+    let rw = rewritten("SELECT id, card FROM customers ORDER BY id");
+    let (_, rows) = psql.run(&db, &format!("{rw};"));
+    let got: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|r| (r[0].as_str(), r[1].as_str()))
+        .collect();
+    assert_eq!(got, want, "{rw}");
+
+    // A scalar subquery is redacted outright (it would run twice under the
+    // length test), NULL staying NULL; its `$1` is kept, once.
+    let sql = "SELECT (SELECT card FROM customers WHERE id = $1) AS c";
+    let rw = rewritten(sql);
+    for (id, want) in [("1", "[redacted]"), ("3", "[redacted]"), ("12", "<NULL>")] {
+        let (h, rows) = psql.run(&db, &format!("PREPARE p AS {rw};\nEXECUTE p({id});"));
+        assert_eq!(h, ["c"], "{rw}");
+        assert_eq!(rows, [[want]], "{rw} with $1 = {id}");
+    }
+    let rw = rewritten(
+        "SELECT c.id, (SELECT c2.card FROM customers c2 WHERE c2.id = c.id) AS card \
+         FROM customers c ORDER BY 1",
+    );
+    let (_, rows) = psql.run(&db, &format!("{rw};"));
+    assert_eq!(rows.len(), want.len(), "{rw}");
+    for (row, (id, _)) in rows.iter().zip(want) {
+        let expect = if *id == "12" { "<NULL>" } else { "[redacted]" };
+        assert_eq!((row[0].as_str(), row[1].as_str()), (*id, expect), "{rw}");
     }
 }

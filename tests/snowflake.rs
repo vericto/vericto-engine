@@ -1459,7 +1459,7 @@ fn vericto_085_snowflake_golden_rewrites() {
         ),
         (
             "SELECT card, ssn, note FROM customers WHERE id = ?",
-            "SELECT CONCAT('****', RIGHT(TO_VARCHAR(card), 4)) AS card, SHA2(TO_VARCHAR(ssn), 256) AS ssn, '[redacted]' AS note FROM customers WHERE id = ?".to_string(),
+            "SELECT CASE WHEN LENGTH(TO_VARCHAR(card)) <= 8 THEN '[redacted]' ELSE CONCAT('****', RIGHT(TO_VARCHAR(card), 4)) END AS card, SHA2(TO_VARCHAR(ssn), 256) AS ssn, '[redacted]' AS note FROM customers WHERE id = ?".to_string(),
         ),
         // The client's alias, and a quoted name, are kept as written.
         (

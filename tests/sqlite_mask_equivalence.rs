@@ -37,6 +37,13 @@ const VALUES: &[(i64, Option<&str>)] = &[
     (10, Some("4111111111111111")),
     (11, Some("line one\nline@two")),
     (12, Some("x@")),
+    // last4 around its threshold: 4, 8 and 9 characters, multibyte text of
+    // 7 characters (9 bytes) and of 9 characters.
+    (13, Some("1234")),
+    (14, Some("12345678")),
+    (15, Some("123456789")),
+    (16, Some("ñandú12")),
+    (17, Some("ñandú1234")),
 ];
 
 /// Postgres's `regexp_replace(x, '^(.)[^@]*(@.*)?$', '\1***\2')`.
@@ -53,10 +60,14 @@ fn pg_email(x: &str) -> String {
     }
 }
 
-/// Postgres's `'****' || right(x, 4)`.
+/// What `last4` returns on every dialect: `[redacted]` up to 8 characters
+/// (characters, not bytes), `****` and the last four above.
 fn pg_last4(x: &str) -> String {
     let chars: Vec<char> = x.chars().collect();
-    let tail: String = chars[chars.len().saturating_sub(4)..].iter().collect();
+    if chars.len() <= 8 {
+        return "[redacted]".to_string();
+    }
+    let tail: String = chars[chars.len() - 4..].iter().collect();
     format!("****{tail}")
 }
 
@@ -169,6 +180,41 @@ fn sqlite_masks_match_the_postgres_masks() {
             "note of {v:?}"
         );
     }
+
+    // Pinned outputs, so the reference above cannot drift with the masks.
+    let card = |id: i64| text(&rows[id as usize - 1]["card"]);
+    for (id, want) in [
+        (1, None),
+        (2, Some("[redacted]")),
+        (3, Some("[redacted]")),
+        (13, Some("[redacted]")),
+        (14, Some("[redacted]")),
+        (15, Some("****6789")),
+        (16, Some("[redacted]")),
+        (17, Some("****1234")),
+    ] {
+        assert_eq!(card(id).as_deref(), want, "card of row {id}");
+    }
+
+    // last4 over a scalar subquery: redacted outright (the length test
+    // would run it twice), NULL staying NULL. A grouped last4 column still
+    // groups.
+    let rows = run(
+        &bin,
+        &masked(
+            "SELECT id, (SELECT c2.card FROM customers c2 WHERE c2.id = customers.id) AS k FROM customers ORDER BY id",
+        ),
+    );
+    for (row, (_, v)) in rows.iter().zip(VALUES) {
+        let want = v.map(|_| "[redacted]".to_string());
+        assert_eq!(text(&row["k"]), want, "subquery of {v:?}");
+    }
+    let rows = run(
+        &bin,
+        &masked("SELECT card AS k, count(*) AS n FROM customers GROUP BY card ORDER BY card"),
+    );
+    assert_eq!(rows.len(), VALUES.len());
+    assert!(rows.iter().all(|r| r["n"] == serde_json::json!(1)));
 
     // Output names are the client's.
     let rows = run(

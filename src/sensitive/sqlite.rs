@@ -42,9 +42,9 @@ const X: &str = "CAST(vericto_mask_arg AS TEXT)";
 /// Why a `hash` mask is refused on SQLite.
 pub(crate) const NO_HASH: &str = "the hash mask needs SHA-256, which core SQLite does not have; tag the column block, or mask it full, last4 or email";
 
-static TEMPLATES: std::sync::OnceLock<[Expr; 4]> = std::sync::OnceLock::new();
+static TEMPLATES: std::sync::OnceLock<[Expr; 5]> = std::sync::OnceLock::new();
 
-fn templates() -> &'static [Expr; 4] {
+fn templates() -> &'static [Expr; 5] {
     TEMPLATES.get_or_init(|| {
         let parse = |sql: &str| -> Expr {
             let mut st = Parser::parse_sql(&SQLiteDialect {}, &format!("SELECT {sql}"))
@@ -62,9 +62,13 @@ fn templates() -> &'static [Expr; 4] {
         };
         [
             parse("'[redacted]'"),
-            // `substr(x, -4)` is the last four characters, or all of a
-            // shorter value (Postgres `right(x, 4)`); NULL stays NULL.
-            parse(&format!("'****' || substr({X}, -4)")),
+            // Postgres: '[redacted]' up to LAST4_REDACT_MAX_CHARS characters
+            // (`length` of text counts characters), else the last four:
+            // `substr(x, -4)` is Postgres `right(x, 4)`. NULL stays NULL.
+            parse(&format!(
+                "CASE WHEN length({X}) <= {} THEN '[redacted]' ELSE '****' || substr({X}, -4) END",
+                super::LAST4_REDACT_MAX_CHARS
+            )),
             // The first character, then the domain from the first `@` after
             // it; `''` stays `''`, NULL stays NULL. `instr` over the text from
             // the second character: the position in `x` is one more.
@@ -78,6 +82,9 @@ fn templates() -> &'static [Expr; 4] {
             // and its value discarded. `||` is NULL if an operand is, hence
             // the coalesce: `'[redacted]'` for every value and for NULL.
             parse(&format!("'[redacted]' || coalesce(substr({X}, 1, 0), '')")),
+            // `last4` over anything but a bare column: '[redacted]', NULL
+            // staying NULL (see `super::mysql::mask_expr`).
+            parse(&format!("'[redacted]' || substr({X}, 1, 0)")),
         ]
     })
 }
@@ -88,7 +95,9 @@ fn templates() -> &'static [Expr; 4] {
 /// anything else, or with a bind parameter, the expression stays in place
 /// and its value is discarded at run time. `email` repeats its argument, so
 /// over an expression with a parameter it falls back to that same `full`
-/// form.
+/// form. `last4` repeats it as well, so only a bare column gets its length
+/// test; anything else is redacted outright, kept once, NULL staying NULL (the
+/// reasons are on [`super::mysql::mask_expr`]).
 pub(crate) fn mask_expr(style: MaskStyle, orig: &Expr) -> Result<Expr, String> {
     use MaskStyle::*;
     let t = templates();
@@ -102,6 +111,7 @@ pub(crate) fn mask_expr(style: MaskStyle, orig: &Expr) -> Result<Expr, String> {
         Full | Email if params => &t[3],
         Full if !plain => &t[3],
         Full => return Ok(t[0].clone()),
+        Last4 if !super::mysql::is_column(orig) => &t[4],
         Last4 => &t[1],
         Email => &t[2],
     };

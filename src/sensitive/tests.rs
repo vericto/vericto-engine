@@ -364,7 +364,10 @@ fn nested_ctes_are_followed_through_every_level() {
     // Pass-through of bare references stays direct: the tag's style applies.
     let rw = rewrite(sql, vec![masked("customers", "email", Last4)]);
     assert!(
-        rw.ends_with("SELECT '****' || \"right\"(x::text, 4) AS x FROM b"),
+        rw.ends_with(
+            "SELECT CASE WHEN char_length(x::text) <= 8 THEN '[redacted]'::text \
+             ELSE '****' || \"right\"(x::text, 4) END AS x FROM b"
+        ),
         "{rw}"
     );
 }
@@ -584,7 +587,7 @@ fn strictest_policy_wins() {
     let rw = o.rewritten_query.unwrap();
     assert!(rw.contains("email,"), "the flagged column passes: {rw}");
     assert!(
-        rw.contains("'****' || \"right\"(card::text, 4) AS card"),
+        rw.contains("ELSE '****' || \"right\"(card::text, 4) END AS card"),
         "{rw}"
     );
 
@@ -822,7 +825,8 @@ fn each_mask_style_produces_the_design_expression() {
         ),
         (
             Last4,
-            "SELECT id, '****' || \"right\"(email::text, 4) AS email FROM customers",
+            "SELECT id, CASE WHEN char_length(email::text) <= 8 THEN '[redacted]'::text \
+             ELSE '****' || \"right\"(email::text, 4) END AS email FROM customers",
         ),
         (
             Email,
@@ -1453,4 +1457,114 @@ fn a_kept_parameter_is_in_a_no_op_that_reveals_nothing() {
         vec![masked("customers", "card", Full)],
     );
     assert_eq!(rw, "SELECT '[redacted]'::text AS p FROM customers");
+}
+
+// ── last4 over short values ────────────────────────────────────────────────
+
+/// The rewrite of `sql` on a sqlparser dialect (MySQL, SQLite, Snowflake).
+#[track_caller]
+fn rewrite_on(sql: &str, dialect: Dialect, tags: Vec<SensitiveColumn>) -> String {
+    let o = eval_on(sql, dialect, tags);
+    assert_eq!(o.decision, Decision::Flag, "{dialect:?} {sql}: {o:?}");
+    o.rewritten_query
+        .unwrap_or_else(|| panic!("{dialect:?} {sql}: no rewrite: {:?}", o.ast_node_path))
+}
+
+#[test]
+fn last4_reveals_nothing_of_a_value_of_eight_characters_or_fewer() {
+    // `'****' || right(x, 4)` of a value of four characters or fewer (a PIN,
+    // a short code, '' or one character) is the whole value: the column came
+    // back in clear under a mask. Up to LAST4_REDACT_MAX_CHARS characters the
+    // style renders what `full` renders; above it, the last four.
+    assert_eq!(super::LAST4_REDACT_MAX_CHARS, 8);
+    let t = || vec![masked("customers", "card", Last4)];
+    let sql = "SELECT id, card FROM customers";
+    assert_eq!(
+        rewrite(sql, t()),
+        "SELECT id, CASE WHEN char_length(card::text) <= 8 THEN '[redacted]'::text \
+         ELSE '****' || \"right\"(card::text, 4) END AS card FROM customers"
+    );
+    let x = "(CONVERT((card) USING utf8mb4) COLLATE utf8mb4_bin)";
+    assert_eq!(
+        rewrite_on(sql, Dialect::Mysql, t()),
+        format!(
+            "SELECT id, CASE WHEN CHAR_LENGTH({x}) <= 8 THEN '[redacted]' \
+             ELSE CONCAT('****', RIGHT({x}, 4)) END AS `card` FROM customers"
+        )
+    );
+    let x = "CAST(card AS TEXT)";
+    assert_eq!(
+        rewrite_on(sql, Dialect::Sqlite, t()),
+        format!(
+            "SELECT id, CASE WHEN length({x}) <= 8 THEN '[redacted]' \
+             ELSE '****' || SUBSTR({x}, -4) END AS card FROM customers"
+        )
+    );
+    let x = "TO_VARCHAR(card)";
+    assert_eq!(
+        rewrite_on(sql, Dialect::Snowflake, t()),
+        format!(
+            "SELECT id, CASE WHEN LENGTH({x}) <= 8 THEN '[redacted]' \
+             ELSE CONCAT('****', RIGHT({x}, 4)) END AS card FROM customers"
+        )
+    );
+}
+
+#[test]
+fn last4_of_a_grouped_column_still_groups() {
+    // The CASE reads only the grouped column: valid under GROUP BY (and
+    // MySQL's ONLY_FULL_GROUP_BY), and the aggregate still aggregates.
+    let t = || vec![masked("customers", "card", Last4)];
+    let rw = rewrite(
+        "SELECT card, count(*) AS n FROM customers GROUP BY card",
+        t(),
+    );
+    assert!(
+        rw.starts_with("SELECT CASE WHEN char_length(card::text) <= 8")
+            && rw.ends_with("AS card, count(*) AS n FROM customers GROUP BY card"),
+        "{rw}"
+    );
+    let rw = rewrite_on(
+        "SELECT card, COUNT(*) AS n FROM customers GROUP BY card",
+        Dialect::Mysql,
+        t(),
+    );
+    assert!(
+        rw.starts_with("SELECT CASE WHEN CHAR_LENGTH(") && rw.ends_with("GROUP BY card"),
+        "{rw}"
+    );
+}
+
+#[test]
+fn last4_over_a_subquery_evaluates_it_once_and_keeps_its_parameters() {
+    // The length test repeats its argument. A repeated column reads the same
+    // value twice; a repeated scalar subquery runs twice, and a volatile one
+    // (`ORDER BY random() LIMIT 1` over a long and a short value) could pass
+    // the length test on one row and hand out four characters of another,
+    // and with a parameter the copy would also repeat the `?` and shift
+    // MySQL's positional bindings. Anything but a bare column is therefore
+    // redacted outright, NULL staying NULL as under last4, with the
+    // expression (and every parameter, once, in order) kept in place.
+    let t = || vec![masked("customers", "card", Last4)];
+    let sql = "SELECT (SELECT card FROM customers WHERE id = $1) AS c";
+    let rw = rewrite(sql, t());
+    assert_eq!(params(sql), params(&rw), "{rw}");
+    assert_eq!(rw.matches("$1").count(), 1, "{rw}");
+    assert_eq!(
+        rw,
+        "SELECT '[redacted]'::text || \"left\"((SELECT card FROM customers WHERE id = $1)::text, 0) AS c"
+    );
+    let rw = rewrite("SELECT (SELECT card FROM customers LIMIT 1) AS c", t());
+    assert_eq!(rw.matches("SELECT card").count(), 1, "{rw}");
+
+    let sql = "SELECT id, (SELECT card FROM customers c2 WHERE c2.id = ?) AS c FROM customers WHERE id < ?";
+    for d in [Dialect::Mysql, Dialect::Sqlite, Dialect::Snowflake] {
+        let rw = rewrite_on(sql, d, t());
+        assert_eq!(rw.matches('?').count(), 2, "{d:?}: {rw}");
+        assert_eq!(rw.matches("SELECT card").count(), 1, "{d:?}: {rw}");
+        assert!(
+            rw.contains("'[redacted]'") && !rw.contains("'****'"),
+            "{d:?}: {rw}"
+        );
+    }
 }
