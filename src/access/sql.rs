@@ -75,7 +75,9 @@ pub(crate) fn fold_snowflake(sql: &str, fold_quoted: bool) -> Option<Vec<Stateme
     let before = sqlparser::parser::Parser::parse_sql(&dialect, sql)
         .ok()?
         .len();
-    let folded = sqlparser::parser::Parser::parse_sql(&dialect, &text).ok()?;
+    let mut folded = sqlparser::parser::Parser::parse_sql(&dialect, &text).ok()?;
+    // Read `ORDER BY ALL` as the parse did (temporary, see the function).
+    crate::parser::resolve_snowflake_order_by_all(&mut folded);
     (folded.len() == before).then_some(folded)
 }
 

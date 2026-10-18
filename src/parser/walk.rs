@@ -7,8 +7,8 @@
 
 use crate::error::{MAX_AST_DEPTH, ProxyError, Result, guard_nesting_depth};
 use crate::parser::{
-    AlterTableKind, Dialect, DropObjectKind, ParsedQuery, SnowflakeRisk, SqliteRisk, StatementInfo,
-    StatementKind, WherePresence,
+    AlterTableKind, CmpOp, Const, Dialect, DropObjectKind, ParsedQuery, SnowflakeRisk, SqliteRisk,
+    StatementInfo, StatementKind, Truth, WherePresence, compare,
 };
 
 use std::ops::ControlFlow;
@@ -47,8 +47,12 @@ pub(crate) fn parse_text<D: SqlDialect>(
     // `guard_nesting_depth`.
     guard_nesting_depth(sql)?;
 
-    let statements =
+    let mut statements =
         SqlAstParser::parse_sql(dialect, sql).map_err(|e| ProxyError::ParseError(e.to_string()))?;
+    if which == Dialect::Snowflake {
+        // Temporary, until sqlparser reads it (see the function).
+        crate::parser::resolve_snowflake_order_by_all(&mut statements);
+    }
     from_statements(statements, which, original)
 }
 
@@ -1845,33 +1849,49 @@ fn where_presence(selection: Option<&Expr>, sqlite: bool) -> WherePresence {
 /// numeric prefix is true; so is a double-quoted name spelling one, which
 /// SQLite takes for a string when no column has that name (its
 /// double-quoted-string fallback).
+///
+/// The literal comparisons themselves are [`crate::parser::compare`], shared
+/// with the pg_query walker, under three-valued logic: a comparison with NULL
+/// (`NULL = NULL`, `NOT (NULL = 1)`) or a string ordering is
+/// [`Truth::Unknown`], and so is its `NOT`.
 fn is_always_true(expr: &Expr, sqlite: bool) -> bool {
+    truth(expr, sqlite) == Truth::True
+}
+
+/// The truth value of a predicate without a row (see `is_always_true` for the
+/// forms). `NOT x` is true only when `x` is provably false; anything undecided
+/// is [`Truth::Unknown`], *not* false. `AND` / `OR` keep only a provably true
+/// result ([`Truth::true_or_unknown`]), as these walkers always have.
+fn truth(expr: &Expr, sqlite: bool) -> Truth {
     use sqlparser::ast::{BinaryOperator, UnaryOperator};
-    if sqlite && sqlite_text_truth(expr) == Some(true) {
-        return true;
+    if sqlite {
+        if let Some(b) = sqlite_text_truth(expr) {
+            return Truth::from_bool(b);
+        }
     }
     match expr {
-        Expr::Value(ValueWithSpan {
-            value: Value::Boolean(true),
-            ..
-        }) => true,
         // Since sqlparser 0.53 the MS SQL dialect reads `true`/`false` as
         // identifiers (T-SQL has no boolean literals). `WHERE true` was a
         // tautology to the engine before the upgrade and stays one: T-SQL
         // rejects it as a predicate anyway, so blocking it costs nothing.
         Expr::Identifier(i) if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("true") => {
-            true
+            Truth::True
         }
-        // Bare truthy numeric literal: `WHERE 1`.
-        Expr::Value(ValueWithSpan {
-            value: Value::Number(n, _),
+        Expr::Identifier(i) if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("false") => {
+            Truth::False
+        }
+        // A bare literal: `WHERE 1`, `WHERE -1`, `WHERE TRUE`, `WHERE NULL`.
+        Expr::Value(_)
+        | Expr::UnaryOp {
+            op: UnaryOperator::Minus,
             ..
-        }) => n.parse::<f64>().map(|v| v != 0.0).unwrap_or(false),
-        Expr::Nested(inner) => is_always_true(inner, sqlite),
+        } => constant(expr).map_or(Truth::Unknown, |c| c.truth()),
+        Expr::Nested(inner) => truth(inner, sqlite),
+        // SQL `NOT`: an undecided operand stays undecided.
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr: inner,
-        } => is_always_false(inner, sqlite),
+        } => truth(inner, sqlite).not(),
 
         // `<const> IN (<const>, …)`. Only the positive form: `NOT IN` is not the
         // negation of `IN` under three-valued logic — with a NULL in the list the
@@ -1881,7 +1901,7 @@ fn is_always_true(expr: &Expr, sqlite: bool) -> bool {
             expr,
             list,
             negated: false,
-        } => const_in_list_true(expr, list),
+        } => Truth::true_or_unknown(const_in_list_true(expr, list)),
 
         // `<const> BETWEEN <const> AND <const>`, numeric bounds only.
         Expr::Between {
@@ -1889,7 +1909,7 @@ fn is_always_true(expr: &Expr, sqlite: bool) -> bool {
             negated: false,
             low,
             high,
-        } => const_between_true(expr, low, high),
+        } => Truth::true_or_unknown(const_between_true(expr, low, high)),
 
         // `<const> LIKE '%'` — the match-everything pattern. `any: false` keeps
         // this off Snowflake's `LIKE ANY (…)` form, whose semantics differ.
@@ -1899,60 +1919,35 @@ fn is_always_true(expr: &Expr, sqlite: bool) -> bool {
             expr,
             pattern,
             escape_char: None,
-        } => const_like_matches_all(expr, pattern),
+        } => Truth::true_or_unknown(const_like_matches_all(expr, pattern)),
 
-        Expr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::Eq if same_column(left, right) => true,
-            BinaryOperator::Eq
-            | BinaryOperator::NotEq
-            | BinaryOperator::Lt
-            | BinaryOperator::LtEq
-            | BinaryOperator::Gt
-            | BinaryOperator::GtEq => const_cmp_true(left, op, right),
-            BinaryOperator::Or => is_always_true(left, sqlite) || is_always_true(right, sqlite),
-            BinaryOperator::And => is_always_true(left, sqlite) && is_always_true(right, sqlite),
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-/// Dual of `is_always_true` for evaluating `NOT (…)`. Conservative.
-fn is_always_false(expr: &Expr, sqlite: bool) -> bool {
-    use sqlparser::ast::{BinaryOperator, UnaryOperator};
-    if sqlite && sqlite_text_truth(expr) == Some(false) {
-        return true;
-    }
-    match expr {
-        Expr::Value(ValueWithSpan {
-            value: Value::Boolean(false),
-            ..
-        }) => true,
-        // MS SQL: see `is_always_true`.
-        Expr::Identifier(i) if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("false") => {
-            true
-        }
-        Expr::Value(ValueWithSpan {
-            value: Value::Number(n, _),
-            ..
-        }) => n.parse::<f64>().map(|v| v == 0.0).unwrap_or(false),
-        Expr::Nested(inner) => is_always_false(inner, sqlite),
-        Expr::UnaryOp {
-            op: UnaryOperator::Not,
-            expr: inner,
-        } => is_always_true(inner, sqlite),
-        Expr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::Eq
-            | BinaryOperator::NotEq
-            | BinaryOperator::Lt
-            | BinaryOperator::LtEq
-            | BinaryOperator::Gt
-            | BinaryOperator::GtEq => {
-                is_literal(left) && is_literal(right) && !const_cmp_true(left, op, right)
+        Expr::BinaryOp { left, op, right } => {
+            let cmp = match op {
+                BinaryOperator::Eq if same_column(left, right) => return Truth::True,
+                BinaryOperator::Eq => CmpOp::Eq,
+                BinaryOperator::NotEq => CmpOp::NotEq,
+                BinaryOperator::Lt => CmpOp::Lt,
+                BinaryOperator::LtEq => CmpOp::LtEq,
+                BinaryOperator::Gt => CmpOp::Gt,
+                BinaryOperator::GtEq => CmpOp::GtEq,
+                BinaryOperator::Or => {
+                    return Truth::true_or_unknown(
+                        is_always_true(left, sqlite) || is_always_true(right, sqlite),
+                    );
+                }
+                BinaryOperator::And => {
+                    return Truth::true_or_unknown(
+                        is_always_true(left, sqlite) && is_always_true(right, sqlite),
+                    );
+                }
+                _ => return Truth::Unknown,
+            };
+            match (constant(left), constant(right)) {
+                (Some(a), Some(b)) => compare(&a, cmp, &b),
+                _ => Truth::Unknown,
             }
-            _ => false,
-        },
-        _ => false,
+        }
+        _ => Truth::Unknown,
     }
 }
 
@@ -1977,14 +1972,42 @@ fn same_column(left: &Expr, right: &Expr) -> bool {
     }
 }
 
-fn is_literal(expr: &Expr) -> bool {
-    matches!(unwrap_nested(expr), Expr::Value(_))
-}
-
 fn unwrap_nested(expr: &Expr) -> &Expr {
     match expr {
         Expr::Nested(inner) => unwrap_nested(inner),
         other => other,
+    }
+}
+
+/// The literal behind an expression, as the shared comparison reads it: a
+/// value, or a unary minus over one, folded by the shared [`Const::negated`]
+/// (sqlparser reads `-1` as `UnaryOp(Minus, 1)` where libpg_query folds it;
+/// with the same fold, both walkers decide `-1 < 0` alike).
+///
+/// Compares the values, not the nodes: since sqlparser 0.55 a literal node
+/// carries its source span, so two equal literals at different positions
+/// would never compare equal. A bind parameter is not a constant: `? = ?`
+/// names two values the engine does not see (the pg_query walker reads `$1`
+/// as a parameter, not a constant, too).
+fn constant(expr: &Expr) -> Option<Const> {
+    use sqlparser::ast::UnaryOperator;
+    match unwrap_nested(expr) {
+        Expr::Value(ValueWithSpan { value, .. }) => Some(match value {
+            Value::Null => Const::Null,
+            Value::Number(n, _) => Const::number(n),
+            Value::Boolean(b) => Const::Bool(*b),
+            Value::SingleQuotedString(s) => Const::Text(s.clone()),
+            Value::Placeholder(_) => return None,
+            // `"x"` included: MySQL reads it as a string, or as the column `x`
+            // under ANSI_QUOTES, so it only equals itself. So does `N'x'`,
+            // which libpg_query reads as a cast, not a constant.
+            other => Const::Opaque(format!("{other:?}")),
+        }),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => constant(expr)?.negated(),
+        _ => None,
     }
 }
 
@@ -1993,14 +2016,8 @@ fn unwrap_nested(expr: &Expr) -> &Expr {
 /// NULL is excluded deliberately: no comparison against NULL is *true*, it is
 /// NULL, which matches no row. Admitting it is how `NOT IN (…, NULL)` would be
 /// mistaken for a tautology.
-fn non_null_literal(expr: &Expr) -> Option<&Value> {
-    match unwrap_nested(expr) {
-        Expr::Value(ValueWithSpan {
-            value: Value::Null, ..
-        }) => None,
-        Expr::Value(v) => Some(&v.value),
-        _ => None,
-    }
+fn non_null_constant(expr: &Expr) -> Option<Const> {
+    constant(expr).filter(|c| *c != Const::Null)
 }
 
 /// `<const> IN (<const>, …)` — true when the left literal equals at least one
@@ -2008,23 +2025,23 @@ fn non_null_literal(expr: &Expr) -> Option<&Value> {
 /// anywhere makes the result row-dependent, and `1 IN (1, col)` would need the
 /// column's domain to decide.
 fn const_in_list_true(expr: &Expr, list: &[Expr]) -> bool {
-    let Some(needle) = non_null_literal(expr) else {
+    let Some(needle) = non_null_constant(expr) else {
         return false;
     };
-    if list.is_empty() || !list.iter().all(|e| non_null_literal(e).is_some()) {
+    if list.is_empty() || !list.iter().all(|e| non_null_constant(e).is_some()) {
         return false;
     }
     list.iter()
-        .filter_map(non_null_literal)
-        .any(|item| value_eq(needle, item))
+        .filter_map(non_null_constant)
+        .any(|item| compare(&needle, CmpOp::Eq, &item) == Truth::True)
 }
 
 /// `<const> BETWEEN <lo> AND <hi>` — true when all three are numeric literals and
 /// `lo <= x <= hi`. Numeric only: string `BETWEEN` depends on the database's
 /// collation, which is not knowable here.
 fn const_between_true(expr: &Expr, low: &Expr, high: &Expr) -> bool {
-    let num = |e: &Expr| match non_null_literal(e) {
-        Some(Value::Number(n, _)) => n.parse::<f64>().ok(),
+    let num = |e: &Expr| match non_null_constant(e) {
+        Some(Const::Num(x)) => Some(x),
         _ => None,
     };
     let (Some(x), Some(lo), Some(hi)) = (num(expr), num(low), num(high)) else {
@@ -2038,60 +2055,8 @@ fn const_between_true(expr: &Expr, low: &Expr, high: &Expr) -> bool {
 /// which is more bug surface than the case is worth. The left side must be a
 /// literal, since `col LIKE '%'` drops NULL rows and is a real filter.
 fn const_like_matches_all(expr: &Expr, pattern: &Expr) -> bool {
-    if non_null_literal(expr).is_none() {
-        return false;
-    }
-    matches!(
-        non_null_literal(pattern),
-        Some(Value::SingleQuotedString(s)) if s == "%"
-    )
-}
-
-/// Equality between two non-NULL literals: numerically when both are numbers,
-/// otherwise by the same debug-string identity `const_cmp_true` uses.
-fn value_eq(a: &Value, b: &Value) -> bool {
-    if let (Value::Number(x, _), Value::Number(y, _)) = (a, b) {
-        if let (Ok(x), Ok(y)) = (x.parse::<f64>(), y.parse::<f64>()) {
-            return x == y;
-        }
-    }
-    format!("{a:?}") == format!("{b:?}")
-}
-
-/// Statically evaluate `<const> <op> <const>`. Numbers compare numerically;
-/// other literals only by `=`/`<>` identity. `false` for any non-constant
-/// operand (never a false positive on a real predicate).
-fn const_cmp_true(left: &Expr, op: &sqlparser::ast::BinaryOperator, right: &Expr) -> bool {
-    use sqlparser::ast::BinaryOperator;
-    let (l, r) = (unwrap_nested(left), unwrap_nested(right));
-    // Compare the values, not the nodes: since sqlparser 0.55 a literal node
-    // carries its source span, so two equal literals at different positions
-    // would never have the same debug string and `'a' = 'a'` would stop being
-    // a tautology.
-    let (Expr::Value(ValueWithSpan { value: a, .. }), Expr::Value(ValueWithSpan { value: b, .. })) =
-        (l, r)
-    else {
-        return false;
-    };
-    if let (Value::Number(x, _), Value::Number(y, _)) = (a, b) {
-        if let (Ok(x), Ok(y)) = (x.parse::<f64>(), y.parse::<f64>()) {
-            return match op {
-                BinaryOperator::Eq => x == y,
-                BinaryOperator::NotEq => x != y,
-                BinaryOperator::Lt => x < y,
-                BinaryOperator::LtEq => x <= y,
-                BinaryOperator::Gt => x > y,
-                BinaryOperator::GtEq => x >= y,
-                _ => false,
-            };
-        }
-    }
-    let eq = format!("{a:?}") == format!("{b:?}");
-    match op {
-        BinaryOperator::Eq => eq,
-        BinaryOperator::NotEq => !eq,
-        _ => false,
-    }
+    non_null_constant(expr).is_some()
+        && matches!(non_null_constant(pattern), Some(Const::Text(s)) if s == "%")
 }
 
 /// Returns true if `expr` contains a tautological OR branch at any depth —

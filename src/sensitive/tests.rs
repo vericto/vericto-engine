@@ -1568,3 +1568,291 @@ fn last4_over_a_subquery_evaluates_it_once_and_keeps_its_parameters() {
         );
     }
 }
+
+// ── The sqlparser walker (`sql.rs`) on the statement forms above ───────────
+//
+// The cases above run on PostgreSQL, i.e. through `pg.rs`. The same forms
+// reach `sql.rs` on MySQL, SQLite, Snowflake, SQL Server and Oracle, and
+// CLAUDE.md's both-walkers rule applies: each must derive the same reads.
+
+#[track_caller]
+fn assert_reads_on(dialect: Dialect, sql: &str, col: &str) {
+    let o = eval_on(sql, dialect, vec![tag("customers", col, Block)]);
+    assert_eq!(
+        o.decision,
+        Decision::Block,
+        "{dialect:?} {sql} must read {col}: {o:?}"
+    );
+    assert_eq!(o.rule_code.as_deref(), Some("VERICTO-085"), "{sql}");
+    assert_eq!(read(&o), vec![col], "{dialect:?} {sql}");
+}
+
+#[track_caller]
+fn assert_not_read_on(dialect: Dialect, sql: &str, col: &str) {
+    let o = eval_on(sql, dialect, vec![tag("customers", col, Block)]);
+    assert_eq!(
+        o.decision,
+        Decision::Allow,
+        "{dialect:?} {sql} must NOT read {col}: {o:?}"
+    );
+    assert!(o.sensitive_columns.is_empty(), "{sql}: {:?}", read(&o));
+}
+
+/// The reason a `mask` tag on `customers.email` blocks `sql` on `dialect`.
+#[track_caller]
+fn mask_refusal_on(dialect: Dialect, sql: &str) -> String {
+    let o = eval_on(sql, dialect, vec![masked("customers", "email", Email)]);
+    assert_eq!(o.decision, Decision::Block, "{dialect:?} {sql}: {o:?}");
+    assert!(o.rewritten_query.is_none(), "{sql}");
+    o.ast_node_path.unwrap_or_default()
+}
+
+#[test]
+fn returning_and_output_are_client_visible_on_sqlite_and_sql_server() {
+    use Dialect::*;
+    for (d, sql) in [
+        (
+            Sqlite,
+            "INSERT INTO customers (id) VALUES (1) RETURNING email",
+        ),
+        (Sqlite, "DELETE FROM customers WHERE id = 1 RETURNING email"),
+        (
+            Sqlite,
+            "UPDATE customers SET name = 'x' WHERE id = 1 RETURNING email",
+        ),
+        // SQL Server's OUTPUT: `inserted.*` / `deleted.*` are the target's rows.
+        (
+            MsSql,
+            "INSERT INTO customers (id) OUTPUT inserted.email VALUES (1)",
+        ),
+        (
+            MsSql,
+            "DELETE FROM customers OUTPUT deleted.email WHERE id = 1",
+        ),
+        (
+            MsSql,
+            "UPDATE customers SET name = 'x' OUTPUT inserted.email WHERE id = 1",
+        ),
+        (
+            MsSql,
+            "UPDATE customers SET name = 'x' OUTPUT deleted.email WHERE id = 1",
+        ),
+        (
+            MsSql,
+            "MERGE INTO customers AS t USING src AS s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET t.name = s.name OUTPUT inserted.email;",
+        ),
+    ] {
+        assert_reads_on(d, sql, "email");
+    }
+    for (d, sql) in [
+        (Sqlite, "DELETE FROM customers WHERE id = 1 RETURNING id"),
+        (
+            MsSql,
+            "INSERT INTO customers (id) OUTPUT inserted.id VALUES (1)",
+        ),
+        (
+            MsSql,
+            "DELETE FROM customers OUTPUT deleted.id WHERE id = 1",
+        ),
+    ] {
+        assert_not_read_on(d, sql, "email");
+    }
+}
+
+#[test]
+fn a_mask_tag_blocks_output_on_sql_server_whatever_the_sink() {
+    // SQL Server has no mask rewrite: a `mask` tag cannot be honoured, so the
+    // statement blocks with the reason, whether OUTPUT returns the rows to the
+    // client or copies them INTO a table.
+    for sql in [
+        "INSERT INTO customers (id) OUTPUT inserted.email VALUES (1)",
+        "INSERT INTO customers (id) OUTPUT inserted.email INTO audit VALUES (1)",
+    ] {
+        let path = mask_refusal_on(Dialect::MsSql, sql);
+        assert!(path.contains("no rewrite for mssql yet"), "{sql}: {path}");
+    }
+    // Where a rewrite exists, a copy is still refused: masking it would
+    // change stored data.
+    let path = mask_refusal_on(
+        Dialect::Mysql,
+        "INSERT INTO archive SELECT email FROM customers",
+    );
+    assert!(path.contains("copied into another relation"), "{path}");
+}
+
+#[test]
+fn copies_are_reads_on_the_sqlparser_dialects() {
+    use Dialect::*;
+    for (d, sql) in [
+        // UPDATE … FROM copies a source column into the target.
+        (
+            Sqlite,
+            "UPDATE orders SET note = c.email FROM customers c WHERE c.id = orders.cid",
+        ),
+        (
+            Snowflake,
+            "UPDATE orders SET note = c.email FROM customers c WHERE c.id = orders.cid",
+        ),
+        // An upsert stores the value like UPDATE … SET.
+        (
+            Sqlite,
+            "INSERT INTO archive (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET note = (SELECT email FROM customers LIMIT 1)",
+        ),
+        // MERGE: both the INSERT values and the UPDATE assignments.
+        (
+            Snowflake,
+            "MERGE INTO archive a USING customers c ON a.id = c.id \
+             WHEN NOT MATCHED THEN INSERT (id, note) VALUES (c.id, c.email)",
+        ),
+        (
+            Snowflake,
+            "MERGE INTO archive a USING customers c ON a.id = c.id \
+             WHEN MATCHED THEN UPDATE SET a.note = c.email",
+        ),
+        (
+            MsSql,
+            "MERGE INTO archive AS a USING customers AS c ON a.id = c.id \
+             WHEN NOT MATCHED THEN INSERT (id, note) VALUES (c.id, c.email);",
+        ),
+        (
+            Oracle,
+            "MERGE INTO archive a USING customers c ON (a.id = c.id) \
+             WHEN MATCHED THEN UPDATE SET a.note = c.email",
+        ),
+        // Views and CREATE TABLE AS store the projection.
+        (Sqlite, "CREATE VIEW v AS SELECT email FROM customers"),
+        (Sqlite, "CREATE TABLE t2 AS SELECT email FROM customers"),
+        (Snowflake, "CREATE VIEW v AS SELECT email FROM customers"),
+        (Mysql, "CREATE VIEW v AS SELECT email FROM customers"),
+        // A session variable is read freely by the next statement.
+        (Mysql, "SET @v = (SELECT email FROM customers LIMIT 1)"),
+        // EXPLAIN returns a plan, but the copy inside still counts.
+        (Mysql, "EXPLAIN INSERT INTO t SELECT email FROM customers"),
+    ] {
+        assert_reads_on(d, sql, "email");
+    }
+    for (d, sql) in [
+        // Filtering on a tagged column is not a read.
+        (
+            Sqlite,
+            "UPDATE orders SET note = 'x' FROM customers c WHERE c.email = orders.note",
+        ),
+        (
+            Sqlite,
+            "INSERT INTO archive (id) VALUES (1) ON CONFLICT (id) DO NOTHING",
+        ),
+        // Copying only an untagged column.
+        (
+            Snowflake,
+            "MERGE INTO archive a USING customers c ON a.id = c.id \
+             WHEN NOT MATCHED THEN INSERT (id) VALUES (c.id)",
+        ),
+        // A plan, not rows.
+        (Mysql, "EXPLAIN SELECT email FROM customers"),
+        // Deleting rows through a join reads no column.
+        (
+            Mysql,
+            "DELETE customers FROM customers JOIN orders ON orders.cid = customers.id WHERE orders.id = 1",
+        ),
+    ] {
+        assert_not_read_on(d, sql, "email");
+    }
+}
+
+#[test]
+fn mysql_expressions_derive_from_their_inputs() {
+    // Every expression form `sql.rs` models carries its inputs' lineage: a
+    // projection over any of them is a read of the tagged column.
+    for sql in [
+        "SELECT TRIM(email) FROM customers",
+        "SELECT TRIM(LEADING 'x' FROM email) FROM customers",
+        "SELECT POSITION('a' IN email) FROM customers",
+        "SELECT CONVERT(email USING utf8mb4) FROM customers",
+        "SELECT CAST(email AS CHAR) FROM customers",
+        "SELECT email COLLATE utf8mb4_bin FROM customers",
+        "SELECT SUBSTRING(email, 1, 3) FROM customers",
+        "SELECT EXTRACT(YEAR FROM email) FROM customers",
+        "SELECT email + INTERVAL 1 DAY FROM customers",
+        "SELECT email IS NULL FROM customers",
+        "SELECT email BETWEEN 'a' AND 'b' FROM customers",
+        "SELECT email LIKE 'a%' FROM customers",
+        "SELECT email RLIKE 'a' FROM customers",
+        "SELECT (id, email) = (1, 'a') FROM customers",
+        "SELECT MATCH(email) AGAINST ('x') FROM customers",
+        "SELECT 'a' MEMBER OF (email) FROM customers",
+        "SELECT CASE WHEN id = 1 THEN email END FROM customers",
+        "SELECT GROUP_CONCAT(email ORDER BY id SEPARATOR ',') FROM customers",
+        "SELECT email->>'$.a' FROM customers",
+        "SELECT j.x FROM customers c, JSON_TABLE(c.email, '$[*]' COLUMNS (x INT PATH '$')) AS j",
+        "SELECT email FROM customers NATURAL JOIN orders",
+        "SELECT c.email FROM (customers c JOIN orders o ON o.cid = c.id)",
+        "SELECT email FROM customers GROUP BY email WITH ROLLUP",
+        "SELECT email FROM customers ORDER BY 1",
+    ] {
+        assert_reads_on(Dialect::Mysql, sql, "email");
+    }
+    // A named window ordering by the column is not a projection of it.
+    assert_not_read_on(
+        Dialect::Mysql,
+        "SELECT ROW_NUMBER() OVER w FROM customers WINDOW w AS (ORDER BY email)",
+        "email",
+    );
+}
+
+#[test]
+fn snowflake_oracle_and_sql_server_relations_derive_from_their_input() {
+    use Dialect::*;
+    for (d, sql) in [
+        // Reshaping relations: any output may derive from any input.
+        (
+            Snowflake,
+            "SELECT * FROM customers PIVOT (MAX(email) FOR id IN (1, 2)) AS p",
+        ),
+        (
+            Snowflake,
+            "SELECT p.* FROM (SELECT id, email FROM customers) UNPIVOT (v FOR k IN (email)) p",
+        ),
+        (
+            Snowflake,
+            "SELECT * FROM customers MATCH_RECOGNIZE (ORDER BY id PATTERN (a) DEFINE a AS TRUE) m",
+        ),
+        (
+            Snowflake,
+            "SELECT f.value FROM customers c, LATERAL FLATTEN(input => c.email) f",
+        ),
+        (
+            Snowflake,
+            "SELECT email FROM customers c CROSS JOIN orders o",
+        ),
+        (
+            MsSql,
+            "SELECT c.email FROM customers c CROSS APPLY (SELECT 1 AS x) o",
+        ),
+        (MsSql, "SELECT TOP 1 email FROM customers"),
+        (MsSql, "DECLARE c CURSOR FOR SELECT email FROM customers"),
+        (
+            Oracle,
+            "SELECT email FROM customers START WITH id = 1 CONNECT BY PRIOR id = parent",
+        ),
+        (
+            Oracle,
+            "SELECT email FROM customers FETCH FIRST 1 ROWS ONLY",
+        ),
+    ] {
+        assert_reads_on(d, sql, "email");
+    }
+    for (d, sql) in [
+        // Ordering, joining and filtering by the column read nothing out.
+        (
+            Snowflake,
+            "SELECT id FROM customers QUALIFY ROW_NUMBER() OVER (ORDER BY email) = 1",
+        ),
+        (
+            Snowflake,
+            "SELECT c.id FROM customers c ASOF JOIN orders o MATCH_CONDITION (c.email >= o.ts) ON c.id = o.cid",
+        ),
+    ] {
+        assert_not_read_on(d, sql, "email");
+    }
+}

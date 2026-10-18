@@ -500,3 +500,344 @@ pub(crate) fn is_sleep_function(name: &str) -> bool {
         "sleep" | "pg_sleep" | "pg_sleep_for" | "pg_sleep_until" | "system$wait"
     )
 }
+
+// ---------------------------------------------------------------------------
+// Constant predicates, shared by both walkers
+// ---------------------------------------------------------------------------
+//
+// `is_always_true` and its `truth` exist once per walker because they walk
+// two different ASTs, but what a literal comparison *means* does not depend on
+// the parser. That part lives here, once: each walker only turns its own
+// literal nodes into a [`Const`] and asks [`compare`]. Two copies of the
+// comparison already drifted (a negative literal was decided on PostgreSQL
+// only, because libpg_query folds `-1` and sqlparser does not), and both
+// copies compared NULL like any value.
+
+/// The truth value of a predicate the engine evaluates without a row, under
+/// SQL's three-valued logic.
+///
+/// `Unknown` covers SQL's UNKNOWN (any comparison with NULL) and "the engine
+/// cannot decide it" (a string ordering, which depends on the collation). For
+/// a blocking rule the two are the same: neither is *always true*, and the
+/// NOT of either is not always true either. Only [`Truth::True`] makes a
+/// tautology; reading "not decided" as "false" is how `NOT ('a' < 'b')` was
+/// once taken for one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Truth {
+    True,
+    False,
+    Unknown,
+}
+
+impl Truth {
+    pub(crate) fn from_bool(b: bool) -> Self {
+        if b { Truth::True } else { Truth::False }
+    }
+
+    /// SQL `NOT`: true and false swap, unknown stays unknown.
+    pub(crate) fn not(self) -> Self {
+        match self {
+            Truth::True => Truth::False,
+            Truth::False => Truth::True,
+            Truth::Unknown => Truth::Unknown,
+        }
+    }
+
+    /// `AND` / `OR` as the walkers read them: only a provably true result is
+    /// kept. Kleene logic would also make `1 = 2 AND x` provably false, which
+    /// would widen what `NOT (…)` reports; the walkers deliberately do not
+    /// decide that (narrow scope on a blocking rule), so a non-true result is
+    /// `Unknown`.
+    pub(crate) fn true_or_unknown(b: bool) -> Self {
+        if b { Truth::True } else { Truth::Unknown }
+    }
+}
+
+/// A literal operand, as both walkers read it for constant comparisons.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Const {
+    /// `NULL`.
+    Null,
+    /// A number literal, its sign folded in by [`Const::negated`].
+    Num(f64),
+    /// `TRUE` / `FALSE`.
+    Bool(bool),
+    /// The text of a string literal.
+    Text(String),
+    /// Any other literal (a bit or hex string, a number that does not read
+    /// as a finite `f64`, a `"…"` that MySQL may take for a string or, under
+    /// `ANSI_QUOTES`, for a column), by an identity key: equal to itself,
+    /// undecided against anything else.
+    Opaque(String),
+}
+
+impl Const {
+    /// A number literal's text: a finite number, or an opaque literal.
+    pub(crate) fn number(text: &str) -> Const {
+        match text.parse::<f64>() {
+            Ok(x) if x.is_finite() => Const::Num(x),
+            _ => Const::Opaque(text.to_string()),
+        }
+    }
+
+    /// Unary minus over a literal: the one fold both walkers use.
+    ///
+    /// libpg_query already folds `-1` into a negative constant; sqlparser
+    /// reads it as `UnaryOp(Minus, 1)`. Without this fold `-1 < 0` was a
+    /// tautology on PostgreSQL and a real filter on every other dialect.
+    /// Only a number negates: `-'1'` and `-TRUE` are left undecided (their
+    /// coercion is the dialect's).
+    pub(crate) fn negated(self) -> Option<Const> {
+        match self {
+            Const::Num(x) => Some(Const::Num(-x)),
+            _ => None,
+        }
+    }
+
+    /// The literal as a bare predicate: `WHERE 1`, `WHERE 0`, `WHERE TRUE`.
+    /// A string is undecided here (SQLite's reading of text as a number is
+    /// the sqlparser walker's, behind its `sqlite` flag), and `WHERE NULL`
+    /// matches no row, so it is never true.
+    pub(crate) fn truth(&self) -> Truth {
+        match self {
+            Const::Num(x) => Truth::from_bool(*x != 0.0),
+            Const::Bool(b) => Truth::from_bool(*b),
+            _ => Truth::Unknown,
+        }
+    }
+}
+
+/// A comparison operator between two constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CmpOp {
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+impl CmpOp {
+    /// PostgreSQL's operator name (`A_Expr.name`).
+    pub(crate) fn from_symbol(op: &str) -> Option<CmpOp> {
+        Some(match op {
+            "=" => CmpOp::Eq,
+            "<>" | "!=" => CmpOp::NotEq,
+            "<" => CmpOp::Lt,
+            "<=" => CmpOp::LtEq,
+            ">" => CmpOp::Gt,
+            ">=" => CmpOp::GtEq,
+            _ => return None,
+        })
+    }
+
+    fn holds(self, o: std::cmp::Ordering) -> bool {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        match self {
+            CmpOp::Eq => o == Equal,
+            CmpOp::NotEq => o != Equal,
+            CmpOp::Lt => o == Less,
+            CmpOp::LtEq => o != Greater,
+            CmpOp::Gt => o == Greater,
+            CmpOp::GtEq => o != Less,
+        }
+    }
+}
+
+/// `<a> <op> <b>` over two literals, under three-valued logic.
+///
+/// - Any comparison with NULL is UNKNOWN, never true: `NULL = NULL` and
+///   `NULL <> 1` match no row (the IN-list readings already excluded NULL).
+/// - Numbers compare numerically, under every operator.
+/// - Strings and booleans decide only `=` and `<>`; an ordering between
+///   strings depends on the collation and stays undecided, so its `NOT` does
+///   too.
+/// - Literals of different kinds (`1 = '1'`, `TRUE = 1`) are undecided: whether
+///   and how they coerce is the dialect's call, and `1 = '1'` is true on
+///   PostgreSQL and MySQL, so reading it as false made `NOT (1 = '1')` a
+///   tautology.
+pub(crate) fn compare(a: &Const, op: CmpOp, b: &Const) -> Truth {
+    let eq = match (a, b) {
+        (Const::Null, _) | (_, Const::Null) => return Truth::Unknown,
+        (Const::Num(x), Const::Num(y)) => {
+            return x
+                .partial_cmp(y)
+                .map_or(Truth::Unknown, |o| Truth::from_bool(op.holds(o)));
+        }
+        (Const::Bool(x), Const::Bool(y)) => Truth::from_bool(x == y),
+        (Const::Text(x), Const::Text(y)) => text_equality(x, y),
+        (Const::Opaque(x), Const::Opaque(y)) if x == y => Truth::True,
+        _ => Truth::Unknown,
+    };
+    match op {
+        CmpOp::Eq => eq,
+        CmpOp::NotEq => eq.not(),
+        _ => Truth::Unknown,
+    }
+}
+
+/// Equality of two string literals, as far as it holds under any collation
+/// the dialects ship.
+///
+/// Identical text is equal under every collation (`'a' = 'a'`). Different
+/// text is *provably* different only when nothing a collation may ignore
+/// separates it: case- and accent-insensitive collations are the defaults on
+/// MySQL and SQL Server (`'a' = 'A'` is true there), PAD SPACE ones ignore
+/// trailing spaces, and Snowflake's collation specifiers can ignore case,
+/// accents, punctuation and leading or trailing spaces. So two strings are
+/// different only when both are non-empty ASCII letters and digits and they
+/// differ beyond case (`'a'` and `'b'`); anything else is undecided.
+fn text_equality(x: &str, y: &str) -> Truth {
+    if x == y {
+        return Truth::True;
+    }
+    let plain = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric());
+    if plain(x) && plain(y) && !x.eq_ignore_ascii_case(y) {
+        Truth::False
+    } else {
+        Truth::Unknown
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Snowflake `ORDER BY ALL`
+// ---------------------------------------------------------------------------
+
+/// Snowflake's `ORDER BY ALL`, which sqlparser 0.63 does not read: its
+/// Snowflake dialect leaves `supports_order_by_all` false, so `ALL` comes
+/// back as an ORDER BY item naming a column `ALL`. Every query in the tree
+/// whose ORDER BY is exactly one bare, unquoted `ALL` (any case, with its
+/// `ASC`/`DESC` and `NULLS FIRST/LAST`) is set to [`OrderByKind::All`], which
+/// is what the dialects that do read it produce.
+///
+/// The one place that reading happens, for every Snowflake tree the engine
+/// walks: the parse (`walk::parse_text`), the access analysis's folded text
+/// (`access::sql::fold_snowflake`) and the mask rewrite's re-parse
+/// (`sensitive::snowflake::render`). The sensitive and access walkers then
+/// take it as ordering by every output, as they already do for
+/// `OrderByKind::All`: a mask rewrite is refused when any output is masked,
+/// and an allowlist sees no column beyond the outputs.
+///
+/// Why only this shape: `ALL` is a reserved word in Snowflake, so an
+/// unquoted `ALL` can never be a column, while a quoted `"ALL"` is one and
+/// stays one. Snowflake does not combine `ALL` with other items; such a list
+/// is left as parsed (the server rejects it). No other dialect Vericto
+/// supports has `ORDER BY ALL` (PostgreSQL, MySQL, SQL Server, Oracle and
+/// SQLite reject it), so this runs on Snowflake trees only.
+///
+/// Temporary: upstream fixed the parse in apache/datafusion-sqlparser-rs#2502
+/// (Snowflake's `supports_order_by_all`), which is not in 0.63.0. Remove this
+/// and its three calls when the engine moves to a sqlparser release that
+/// contains it; the tests that pin `"ALL"` and `all_col` as columns stay, as
+/// the regression check for that upgrade.
+///
+/// [`OrderByKind::All`]: sqlparser::ast::OrderByKind::All
+pub(crate) fn resolve_snowflake_order_by_all(statements: &mut [sqlparser::ast::Statement]) {
+    use sqlparser::ast::{Expr, OrderByKind, Query, VisitMut, VisitorMut};
+    use std::ops::ControlFlow;
+
+    struct OrderByAll;
+    impl VisitorMut for OrderByAll {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<()> {
+            let Some(ob) = q.order_by.as_mut() else {
+                return ControlFlow::Continue(());
+            };
+            if let OrderByKind::Expressions(items) = &ob.kind {
+                if let [item] = &items[..] {
+                    let bare_all = matches!(
+                        &item.expr,
+                        Expr::Identifier(id)
+                            if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("ALL")
+                    );
+                    if bare_all && item.with_fill.is_none() {
+                        ob.kind = OrderByKind::All(item.options.clone());
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    for s in statements.iter_mut() {
+        let _ = s.visit(&mut OrderByAll);
+    }
+}
+
+#[cfg(test)]
+mod constant_tests {
+    use super::{CmpOp, Const, Truth, compare};
+
+    #[test]
+    fn null_is_never_compared() {
+        for op in [
+            CmpOp::Eq,
+            CmpOp::NotEq,
+            CmpOp::Lt,
+            CmpOp::LtEq,
+            CmpOp::Gt,
+            CmpOp::GtEq,
+        ] {
+            assert_eq!(compare(&Const::Null, op, &Const::Null), Truth::Unknown);
+            assert_eq!(compare(&Const::Null, op, &Const::Num(1.0)), Truth::Unknown);
+            assert_eq!(compare(&Const::Num(1.0), op, &Const::Null), Truth::Unknown);
+        }
+    }
+
+    #[test]
+    fn numbers_compare_and_strings_only_by_equality() {
+        let n = |x: f64| Const::Num(x);
+        let t = |s: &str| Const::Text(s.to_string());
+        assert_eq!(compare(&n(-1.0), CmpOp::Lt, &n(0.0)), Truth::True);
+        assert_eq!(compare(&n(1.0), CmpOp::GtEq, &n(2.0)), Truth::False);
+        assert_eq!(compare(&n(1.0), CmpOp::LtEq, &n(1.0)), Truth::True);
+        assert_eq!(compare(&t("a"), CmpOp::Eq, &t("a")), Truth::True);
+        assert_eq!(compare(&t("a"), CmpOp::NotEq, &t("b")), Truth::True);
+        assert_eq!(compare(&t("a"), CmpOp::Lt, &t("b")), Truth::Unknown);
+        // Collations may ignore case, trailing spaces, accents, punctuation.
+        for (x, y) in [
+            ("a", "A"),
+            ("a", "a "),
+            ("e", "é"),
+            ("a-b", "ab"),
+            ("", "a"),
+        ] {
+            assert_eq!(compare(&t(x), CmpOp::Eq, &t(y)), Truth::Unknown, "{x} {y}");
+            assert_eq!(
+                compare(&t(x), CmpOp::NotEq, &t(y)),
+                Truth::Unknown,
+                "{x} {y}"
+            );
+        }
+        // Different kinds coerce per dialect.
+        assert_eq!(compare(&n(1.0), CmpOp::Eq, &t("1")), Truth::Unknown);
+        assert_eq!(
+            compare(&Const::Bool(true), CmpOp::Eq, &n(1.0)),
+            Truth::Unknown
+        );
+        assert_eq!(
+            compare(&Const::Bool(true), CmpOp::NotEq, &Const::Bool(false)),
+            Truth::True
+        );
+        assert_eq!(
+            compare(&Const::Bool(true), CmpOp::Gt, &Const::Bool(false)),
+            Truth::Unknown
+        );
+        let o = |s: &str| Const::Opaque(s.to_string());
+        assert_eq!(compare(&o("x"), CmpOp::Eq, &o("x")), Truth::True);
+        assert_eq!(compare(&o("x"), CmpOp::NotEq, &o("y")), Truth::Unknown);
+    }
+
+    #[test]
+    fn only_numbers_negate_and_truth_survives_not() {
+        assert_eq!(Const::Num(1.0).negated(), Some(Const::Num(-1.0)));
+        assert_eq!(Const::Text("1".into()).negated(), None);
+        assert_eq!(Const::number("1e999"), Const::Opaque("1e999".into()));
+        assert_eq!(Const::Null.truth(), Truth::Unknown);
+        assert_eq!(Const::Num(-1.0).truth(), Truth::True);
+        assert_eq!(Const::Num(0.0).truth(), Truth::False);
+        assert_eq!(Truth::Unknown.not(), Truth::Unknown);
+        assert_eq!(Truth::False.not(), Truth::True);
+        assert_eq!(Truth::true_or_unknown(false), Truth::Unknown);
+    }
+}

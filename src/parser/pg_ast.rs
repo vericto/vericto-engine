@@ -9,7 +9,8 @@
 
 use crate::error::{MAX_AST_DEPTH, ProxyError, Result, guard_nesting_depth};
 use crate::parser::{
-    AlterTableKind, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, WherePresence,
+    AlterTableKind, CmpOp, Const, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, Truth,
+    WherePresence, compare,
 };
 
 use pg_query::protobuf::node::Node as NodeEnum;
@@ -653,14 +654,29 @@ fn where_presence(where_clause: Option<&Node>) -> WherePresence {
 /// invariant — `id IS NOT NULL` and `name LIKE '%'` read as tautologies but drop
 /// rows where the column is NULL, so classifying them here would be a false
 /// positive on a rule that rejects live traffic.
+///
+/// The literal comparisons themselves are [`crate::parser::compare`], shared
+/// with the sqlparser walker, under three-valued logic: a comparison with
+/// NULL (`NULL = NULL`, `NOT (NULL = 1)`) or a string ordering is
+/// [`Truth::Unknown`], and so is its `NOT`.
 fn is_always_true(node: &NodeEnum) -> bool {
+    truth(node) == Truth::True
+}
+
+/// The truth value of a predicate without a row (see `is_always_true` for the
+/// forms). `NOT x` is true only when `x` is provably false: only a handful of
+/// forms are (`FALSE`, `0`, a false constant comparison), and anything
+/// undecided is [`Truth::Unknown`], *not* false. `AND` / `OR` keep only a
+/// provably true result ([`Truth::true_or_unknown`]), as these walkers always
+/// have.
+fn truth(node: &NodeEnum) -> Truth {
     match node {
-        NodeEnum::AConst(c) => const_is_truthy(c),
+        NodeEnum::AConst(c) => aconst(c).truth(),
         NodeEnum::AExpr(expr) => {
             use pg_query::protobuf::AExprKind;
             let op = operator_name(&expr.name);
             let (Some(l), Some(r)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref()) else {
-                return false;
+                return Truth::Unknown;
             };
 
             // `IN` / `BETWEEN` / `LIKE` are A_Expr nodes distinguished by `kind`,
@@ -677,125 +693,98 @@ fn is_always_true(node: &NodeEnum) -> bool {
                     // `1 NOT IN (2, NULL)` matches no rows at all — verified
                     // against PostgreSQL. Treating it as a tautology would be a
                     // false positive on exactly the input an attacker can shape.
-                    return op.as_deref() == Some("=") && const_in_list_true(l, r);
+                    return Truth::true_or_unknown(
+                        op.as_deref() == Some("=") && const_in_list_true(l, r),
+                    );
                 }
-                Ok(AExprKind::AexprBetween) => return const_between_true(l, r),
+                Ok(AExprKind::AexprBetween) => {
+                    return Truth::true_or_unknown(const_between_true(l, r));
+                }
                 Ok(AExprKind::AexprLike) => {
                     // `~~` is LIKE; `!~~` is NOT LIKE, which is never always-true
                     // for the `%` pattern this recognises.
-                    return op.as_deref() == Some("~~") && const_like_matches_all(l, r);
+                    return Truth::true_or_unknown(
+                        op.as_deref() == Some("~~") && const_like_matches_all(l, r),
+                    );
                 }
                 _ => {}
             }
 
             // Column self-comparison: `id = id`.
             if op.as_deref() == Some("=") && same_column_ref(l, r) {
-                return true;
+                return Truth::True;
             }
             // Constant-vs-constant comparison evaluated at parse time.
-            match op.as_deref() {
-                Some(o @ ("=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")) => const_cmp_true(l, r, o),
-                _ => false,
+            match op.as_deref().and_then(CmpOp::from_symbol) {
+                Some(op) => match (constant(l), constant(r)) {
+                    (Some(a), Some(b)) => compare(&a, op, &b),
+                    _ => Truth::Unknown,
+                },
+                None => Truth::Unknown,
             }
         }
         NodeEnum::BoolExpr(b) => {
             use pg_query::protobuf::BoolExprType;
+            let mut args = b.args.iter().filter_map(|n| n.node.as_ref());
             match BoolExprType::try_from(b.boolop) {
-                Ok(BoolExprType::AndExpr) => {
-                    !b.args.is_empty()
-                        && b.args
-                            .iter()
-                            .filter_map(|n| n.node.as_ref())
-                            .all(is_always_true)
+                Ok(BoolExprType::AndExpr) => Truth::true_or_unknown(
+                    !b.args.is_empty() && args.all(|a| truth(a) == Truth::True),
+                ),
+                Ok(BoolExprType::OrExpr) => {
+                    Truth::true_or_unknown(args.any(|a| truth(a) == Truth::True))
                 }
-                Ok(BoolExprType::OrExpr) => b
-                    .args
-                    .iter()
-                    .filter_map(|n| n.node.as_ref())
-                    .any(is_always_true),
-                // `NOT x` is always true when `x` is always false.
-                Ok(BoolExprType::NotExpr) => b
-                    .args
-                    .iter()
-                    .filter_map(|n| n.node.as_ref())
-                    .all(is_always_false),
-                _ => false,
+                // SQL `NOT`: an undecided operand stays undecided.
+                Ok(BoolExprType::NotExpr) => match (args.next(), args.next()) {
+                    (Some(a), None) => truth(a).not(),
+                    _ => Truth::Unknown,
+                },
+                _ => Truth::Unknown,
             }
         }
-        _ => false,
+        _ => Truth::Unknown,
     }
 }
 
-/// Dual of `is_always_true`, used to evaluate `NOT (…)`. Conservative: only a
-/// handful of provably-false forms qualify (`FALSE`, `0`, a false constant
-/// comparison). Anything unknown is treated as *not* provably false.
-fn is_always_false(node: &NodeEnum) -> bool {
-    match node {
-        NodeEnum::AConst(c) => const_is_falsey(c),
-        NodeEnum::AExpr(expr) => {
-            let op = operator_name(&expr.name);
-            let (Some(l), Some(r)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref()) else {
-                return false;
-            };
-            match op.as_deref() {
-                Some(o @ ("=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")) => {
-                    // `<const> <op> <const>` is false ⇔ the comparison does not hold.
-                    is_const(l) && is_const(r) && !const_cmp_true(l, r, o)
-                }
-                _ => false,
-            }
-        }
-        NodeEnum::BoolExpr(b) => {
-            use pg_query::protobuf::BoolExprType;
-            matches!(BoolExprType::try_from(b.boolop), Ok(BoolExprType::NotExpr))
-                && b.args
-                    .iter()
-                    .filter_map(|n| n.node.as_ref())
-                    .all(is_always_true)
-        }
-        _ => false,
-    }
-}
-
-/// A constant is "truthy" as a bare predicate: boolean `TRUE`, or a non-zero
-/// number (`WHERE 1`).
-fn const_is_truthy(c: &pg_query::protobuf::AConst) -> bool {
+/// An `A_Const` as the shared comparison reads it.
+fn aconst(c: &pg_query::protobuf::AConst) -> Const {
     use pg_query::protobuf::a_const::Val;
+    if c.isnull {
+        return Const::Null;
+    }
     match c.val.as_ref() {
-        Some(Val::Boolval(b)) => b.boolval,
-        Some(Val::Ival(i)) => i.ival != 0,
-        Some(Val::Fval(f)) => f.fval.parse::<f64>().map(|n| n != 0.0).unwrap_or(false),
-        _ => false,
+        None => Const::Null,
+        Some(Val::Ival(i)) => Const::Num(f64::from(i.ival)),
+        Some(Val::Fval(f)) => Const::number(&f.fval),
+        Some(Val::Boolval(b)) => Const::Bool(b.boolval),
+        Some(Val::Sval(s)) => Const::Text(s.sval.clone()),
+        Some(Val::Bsval(b)) => Const::Opaque(b.bsval.clone()),
     }
 }
 
-/// A constant is "falsey" as a bare predicate: boolean `FALSE`, or zero.
-fn const_is_falsey(c: &pg_query::protobuf::AConst) -> bool {
-    use pg_query::protobuf::a_const::Val;
-    match c.val.as_ref() {
-        Some(Val::Boolval(b)) => !b.boolval,
-        Some(Val::Ival(i)) => i.ival == 0,
-        Some(Val::Fval(f)) => f.fval.parse::<f64>().map(|n| n == 0.0).unwrap_or(false),
-        _ => false,
+/// The literal behind a node: an `A_Const`, or a unary minus over one, folded
+/// by the shared [`Const::negated`]. libpg_query folds `-<number>` into the
+/// constant itself, so the second form only reaches here when it did not; the
+/// sqlparser walker folds the same way, so both decide `-1 < 0` alike.
+fn constant(node: &Node) -> Option<Const> {
+    match node.node.as_ref()? {
+        NodeEnum::AConst(c) => Some(aconst(c)),
+        NodeEnum::AExpr(e)
+            if e.lexpr.is_none() && operator_name(&e.name).as_deref() == Some("-") =>
+        {
+            constant(e.rexpr.as_deref()?)?.negated()
+        }
+        _ => None,
     }
 }
 
-/// Is this node a literal constant?
-fn is_const(node: &Node) -> bool {
-    matches!(node.node.as_ref(), Some(NodeEnum::AConst(_)))
-}
-
-/// The `A_Const` behind a node, if it is a non-NULL literal.
+/// The literal behind a node, if it is one and is not NULL.
 ///
 /// A NULL literal (`isnull: true`, `val: None`) is deliberately excluded: no
 /// comparison against NULL is ever *true*, it is NULL, which does not match a
 /// row. Returning it as a comparable constant is how a `NOT IN (…, NULL)` would
 /// be mistaken for a tautology.
-fn non_null_const(node: &Node) -> Option<&pg_query::protobuf::AConst> {
-    match node.node.as_ref() {
-        Some(NodeEnum::AConst(c)) if !c.isnull => Some(c),
-        _ => None,
-    }
+fn non_null_const(node: &Node) -> Option<Const> {
+    constant(node).filter(|c| *c != Const::Null)
 }
 
 /// `<const> IN (<const>, …)` — true when the left literal equals at least one
@@ -822,14 +811,22 @@ fn const_in_list_true(left: &Node, right: &Node) -> bool {
     list.items
         .iter()
         .filter_map(non_null_const)
-        .any(|item| aconst_eq(needle, item))
+        .any(|item| compare(&needle, CmpOp::Eq, &item) == Truth::True)
+}
+
+/// A non-NULL number literal's value.
+fn const_number(node: &Node) -> Option<f64> {
+    match non_null_const(node)? {
+        Const::Num(x) => Some(x),
+        _ => None,
+    }
 }
 
 /// `<const> BETWEEN <lo> AND <hi>` — true when all three are literals and
 /// `lo <= x <= hi` holds. Numeric only: `BETWEEN` over strings depends on the
 /// database's collation, which is not knowable here.
 fn const_between_true(left: &Node, right: &Node) -> bool {
-    let Some(x) = non_null_const(left).and_then(aconst_as_f64) else {
+    let Some(x) = const_number(left) else {
         return false;
     };
     let Some(NodeEnum::List(list)) = right.node.as_ref() else {
@@ -838,10 +835,7 @@ fn const_between_true(left: &Node, right: &Node) -> bool {
     let [lo, hi] = &list.items[..] else {
         return false;
     };
-    let (Some(lo), Some(hi)) = (
-        non_null_const(lo).and_then(aconst_as_f64),
-        non_null_const(hi).and_then(aconst_as_f64),
-    ) else {
+    let (Some(lo), Some(hi)) = (const_number(lo), const_number(hi)) else {
         return false;
     };
     lo <= x && x <= hi
@@ -854,66 +848,8 @@ fn const_between_true(left: &Node, right: &Node) -> bool {
 /// more bug surface than the case is worth. The left side must be a non-NULL
 /// literal: `col LIKE '%'` drops NULL rows and is a real filter.
 fn const_like_matches_all(left: &Node, right: &Node) -> bool {
-    use pg_query::protobuf::a_const::Val;
-    if non_null_const(left).is_none() {
-        return false;
-    }
-    matches!(
-        non_null_const(right).and_then(|c| c.val.as_ref()),
-        Some(Val::Sval(s)) if s.sval == "%"
-    )
-}
-
-/// Equality between two non-NULL literals: numerically when both are numbers,
-/// otherwise by the same debug-string identity `const_cmp_true` uses.
-fn aconst_eq(a: &pg_query::protobuf::AConst, b: &pg_query::protobuf::AConst) -> bool {
-    match (aconst_as_f64(a), aconst_as_f64(b)) {
-        (Some(x), Some(y)) => x == y,
-        _ => format!("{:?}", a.val) == format!("{:?}", b.val),
-    }
-}
-
-/// Compare two literal constants under `op`, returning whether the comparison
-/// is statically true. Returns `false` for any non-constant operand or any
-/// pair whose types we cannot compare (conservative — never a false positive
-/// on a real predicate). Numbers compare numerically; everything else (strings,
-/// booleans) compares by the same debug-string identity used elsewhere.
-fn const_cmp_true(left: &Node, right: &Node, op: &str) -> bool {
-    let (Some(NodeEnum::AConst(a)), Some(NodeEnum::AConst(b))) =
-        (left.node.as_ref(), right.node.as_ref())
-    else {
-        return false;
-    };
-    // Try a numeric comparison first.
-    if let (Some(x), Some(y)) = (aconst_as_f64(a), aconst_as_f64(b)) {
-        return match op {
-            "=" => x == y,
-            "<>" | "!=" => x != y,
-            "<" => x < y,
-            "<=" => x <= y,
-            ">" => x > y,
-            ">=" => x >= y,
-            _ => false,
-        };
-    }
-    // Non-numeric (string/bool): only equality / inequality are decidable by
-    // identity. Ordering comparisons are left undecided (false).
-    let eq = format!("{:?}", a.val) == format!("{:?}", b.val);
-    match op {
-        "=" => eq,
-        "<>" | "!=" => !eq,
-        _ => false,
-    }
-}
-
-/// Numeric value of an integer/float `A_Const`, if it is one.
-fn aconst_as_f64(c: &pg_query::protobuf::AConst) -> Option<f64> {
-    use pg_query::protobuf::a_const::Val;
-    match c.val.as_ref() {
-        Some(Val::Ival(i)) => Some(i.ival as f64),
-        Some(Val::Fval(f)) => f.fval.parse::<f64>().ok(),
-        _ => None,
-    }
+    non_null_const(left).is_some()
+        && matches!(non_null_const(right), Some(Const::Text(s)) if s == "%")
 }
 
 /// True when both nodes are the *same* column reference (`id` and `id`, or

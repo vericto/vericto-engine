@@ -1528,6 +1528,57 @@ fn vericto_085_snowflake_refuses_what_it_cannot_rewrite() {
     }
 }
 
+// Fixed in 4.1.3 (finding F4 of the 0031 tests): `snowflake_order_refusal`
+// refuses `ORDER BY ALL` over masked outputs (Snowflake would sort by the
+// masked values, so the rewrite changes the result order), but sqlparser
+// 0.63's Snowflake dialect does not read `ORDER BY ALL`: it parsed `ALL` as a
+// column, the refusal never ran, and the rewrite was forwarded with
+// `ORDER BY ALL` intact. `parser::resolve_snowflake_order_by_all` now reads a
+// bare `ALL` as `OrderByKind::All` (until sqlparser does, upstream #2502).
+// These cases stay as the regression check for that upgrade.
+#[test]
+fn vericto_085_snowflake_refuses_order_by_all() {
+    for sql in [
+        "SELECT note FROM customers ORDER BY ALL",
+        "SELECT id, note FROM customers ORDER BY all",
+        "SELECT id, email FROM customers ORDER BY All DESC NULLS LAST",
+        "SELECT note FROM customers WHERE id > 1 ORDER BY ALL LIMIT 10",
+    ] {
+        let path = refused(sql);
+        assert!(path.contains("ORDER BY ALL"), "{sql}: {path}");
+        // Same reason style as `ORDER BY note` / `ORDER BY 1`.
+        assert!(
+            path.contains("would order by the masked value"),
+            "{sql}: {path}"
+        );
+    }
+    // A quoted "ALL" is a real column, and so is `all_col`: the rewrite
+    // keeps them as written.
+    assert_eq!(
+        rewrite("SELECT note FROM customers ORDER BY \"ALL\"").as_deref(),
+        Some("SELECT '[redacted]' AS note FROM customers ORDER BY \"ALL\""),
+    );
+    assert_eq!(
+        rewrite("SELECT note FROM customers ORDER BY all_col").as_deref(),
+        Some("SELECT '[redacted]' AS note FROM customers ORDER BY all_col"),
+    );
+    // A derived table's `ORDER BY ALL` is not the client's order; the outer
+    // rewrite parses back with it (the re-parse reads `ALL` the same way).
+    assert_eq!(
+        rewrite("SELECT t.note FROM (SELECT id, note FROM customers ORDER BY ALL) AS t").as_deref(),
+        Some("SELECT '[redacted]' AS note FROM (SELECT id, note FROM customers ORDER BY ALL) AS t"),
+    );
+    // No masked output: nothing to rewrite or refuse.
+    let o = evaluate(
+        "SELECT id FROM customers ORDER BY ALL",
+        Dialect::Snowflake,
+        &[],
+        &masked(TAGS),
+    );
+    assert_eq!(o.decision, Decision::Allow, "{o:?}");
+    assert_eq!(o.rewritten_query, None);
+}
+
 /// The rewrite is parsed back and must be the rewritten tree.
 #[test]
 fn vericto_085_snowflake_rewrite_reparses() {

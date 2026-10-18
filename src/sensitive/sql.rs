@@ -2312,8 +2312,12 @@ impl<'a, 't, 'p, 's> Walker<'a, 't, 'p, 's> {
 fn snowflake_order_refusal(ob: &OrderBy, rw: &[Rewritten], dialect: &str) -> Option<String> {
     let names: Vec<&str> = rw.iter().map(|(_, n, _)| n.as_str()).collect();
     let OrderByKind::Expressions(items) = &ob.kind else {
-        // `ORDER BY ALL` orders by every output, the masked ones included.
-        return Some("ORDER BY ALL orders by the masked output".to_string());
+        // `ORDER BY ALL` orders by every output, the masked ones included
+        // (on Snowflake, `parser::resolve_snowflake_order_by_all` reads it).
+        return Some(format!(
+            "ORDER BY ALL orders by the masked output(s) {}; {dialect} would order by the masked value",
+            names.join(", ")
+        ));
     };
     items
         .iter()

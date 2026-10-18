@@ -33,7 +33,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.1.2" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.1.3" }
 ```
 
 ### Quick example
@@ -243,7 +243,7 @@ then cannot depend on the row, so it filters nothing:
 | Form | Example |
 |---|---|
 | boolean / truthy literal | `WHERE TRUE`, `WHERE 1` |
-| constant comparison | `1=1`, `2 > 1`, `'a'='a'` |
+| constant comparison | `1=1`, `2 > 1`, `-1 < 0`, `'a'='a'` |
 | constant `IN` list | `1 IN (1, 2)` |
 | constant `BETWEEN` | `1 BETWEEN 0 AND 2` |
 | constant `LIKE '%'` | `'x' LIKE '%'` |
@@ -273,6 +273,23 @@ WHERE id IN (1, 2)     -- filters, obviously
 
 Reporting those would be a false positive on rules that reject live traffic, so
 they are correct behaviour rather than gaps.
+
+Constant predicates are read with the same three-valued logic: a predicate is
+always-true only when it is *provably* true, and what the engine cannot decide
+stays undecided through `NOT`:
+
+```sql
+WHERE NULL = NULL          -- NULL, not true: matches no row
+WHERE NOT (NULL = 1)       -- NOT of NULL is NULL
+WHERE NOT ('a' < 'b')      -- string order depends on the collation
+WHERE 'a' <> 'A'           -- equal under case-insensitive collations
+WHERE NOT (1 = '1')        -- how a number and a string compare is the dialect's call
+WHERE ? = ?                -- bind parameters are values the engine does not see
+```
+
+Two string literals are decided equal when they are identical, and different
+only when both are plain ASCII letters and digits that differ beyond case
+(`'a' <> 'b'`).
 
 Two further cases are **deliberate false negatives**, since over-reporting is the
 dangerous direction for a blocking rule:
@@ -521,7 +538,8 @@ is still `EMAIL`, `"Email"` still `Email`). An unaliased expression over a maske
 column has a name Snowflake derives from its text, so it **blocks**: alias it.
 A `VARIANT` path (`v:email`) masks the whole projected value, and `FLATTEN`
 output derived from a masked column is masked `full`. Also blocked: `ORDER BY`,
-`GROUP BY`, `HAVING` or `QUALIFY` naming a masked output (or its position).
+`GROUP BY`, `HAVING` or `QUALIFY` naming a masked output (or its position), and
+`ORDER BY ALL` when any output is masked.
 When a Snowflake masking policy already protects the column, the rewrite runs on
 top of it: harmless, but the client sees the engine's mask of the policy's
 output.

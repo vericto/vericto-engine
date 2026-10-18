@@ -459,6 +459,90 @@ fn text_the_renderer_cannot_reproduce_blocks() {
     assert!(blocked("SELECT HIGH_PRIORITY email FROM customers").contains("reproduced faithfully"));
 }
 
+#[test]
+fn each_unfaithful_form_blocks_with_its_own_reason() {
+    // The reason is what the operator reads in the report: each form must
+    // name the construct that stopped the rewrite.
+    for (sql, why) in [
+        // A plain optimizer hint, which the renderer drops.
+        (
+            "SELECT /*+ NO_INDEX_MERGE(customers) */ email FROM customers",
+            "optimizer hints",
+        ),
+        // `?1` is not MySQL's `?`: the rewrite could not prove the bindings.
+        (
+            "SELECT email FROM customers WHERE id = ?1",
+            "placeholder `?1` is not a MySQL `?`",
+        ),
+        // The escape mode decides where this literal ends.
+        (
+            r"SELECT email FROM customers WHERE name = 'a\'b'",
+            "backslash-escaped quote",
+        ),
+        // HAVING over the masked name would compare the masked value.
+        (
+            "SELECT email FROM customers HAVING email = 'x'",
+            "HAVING uses the masked output",
+        ),
+        (
+            "SELECT LOWER(email) AS le FROM customers ORDER BY LENGTH(le)",
+            "inside an expression",
+        ),
+    ] {
+        let path = blocked(sql);
+        assert!(path.contains(why), "{sql}: {path}");
+    }
+}
+
+#[test]
+fn text_mysql_reads_differently_is_never_rewritten() {
+    // A nested comment is read differently by MySQL: VERICTO-086 blocks
+    // before any rewrite. `--x` is not a comment in MySQL, and sqlparser
+    // cannot parse it either: a parse error, which blocks under a mask tag.
+    for (sql, code) in [
+        ("SELECT email FROM customers /* a /* b */", "VERICTO-086"),
+        ("SELECT email FROM customers --x", "VERICTO-PARSE-ERROR"),
+    ] {
+        let o = my(sql);
+        assert_eq!(o.decision, Decision::Block, "{sql}: {o:?}");
+        assert_eq!(o.rule_code.as_deref(), Some(code), "{sql}");
+        assert!(o.rewritten_query.is_none(), "{sql}");
+    }
+    // `-- ` followed by a space is a comment: masked as usual.
+    rewritten("SELECT email FROM customers -- fine");
+}
+
+#[test]
+fn spellings_mysql_reads_alike_keep_the_rewrite() {
+    // An alias without AS (bare or back-quoted), INNER / OUTER before JOIN
+    // and `LIMIT a, b`: the renderer prints them differently, the
+    // fidelity check accepts them, and the client's alias is the output name.
+    for (sql, tail) in [
+        ("SELECT email e FROM customers", " AS `e` FROM customers"),
+        ("SELECT email `e` FROM customers", " AS `e` FROM customers"),
+        (
+            "SELECT c.email FROM customers c INNER JOIN orders o ON o.cid = c.id",
+            " AS `email` FROM customers c INNER JOIN orders o ON o.cid = c.id",
+        ),
+        (
+            "SELECT c.email FROM customers c LEFT OUTER JOIN orders o ON o.cid = c.id",
+            " AS `email` FROM customers c LEFT OUTER JOIN orders o ON o.cid = c.id",
+        ),
+        (
+            "SELECT email FROM customers LIMIT 1, 2",
+            " AS `email` FROM customers LIMIT 1, 2",
+        ),
+        (
+            "SELECT email FROM customers; SELECT 1",
+            " AS `email` FROM customers; SELECT 1",
+        ),
+    ] {
+        let rw = rewritten(sql);
+        assert!(rw.ends_with(tail), "{sql}: {rw}");
+        assert!(!rw.starts_with("SELECT email"), "{sql}: {rw}");
+    }
+}
+
 /// Forms sqlparser 0.52 misread or rejected, so they blocked, and 0.63 reads
 /// as MySQL does: the bit-value literal (it was `b AS '101'`), index hints and
 /// `WITH ROLLUP` (parse errors). They are now masked like any other query, the
