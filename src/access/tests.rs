@@ -2525,15 +2525,53 @@ fn snowflake_and_oracle_clauses_that_name_columns_are_read() {
     }
 }
 
-// FINDING (reported to the owner, not fixed here): sqlparser 0.63's Snowflake
+// Fixed in 4.1.3 (finding F4 of the 0031 tests): sqlparser 0.63's Snowflake
 // dialect does not read `ORDER BY ALL` (its `supports_order_by_all` is
-// false), so `ALL` comes back as a column named ALL. Under an allowlist that
-// column is denied: an identity granted `customers.id` cannot run
-// `SELECT id FROM customers ORDER BY ALL`, which orders by `id` only. Fails
-// safe (a false positive, not a bypass). The mask half of the same parse is
-// `tests/snowflake.rs::vericto_085_snowflake_refuses_order_by_all`.
+// false), so `ALL` came back as a column named ALL. Under an allowlist that
+// column was denied: an identity granted `customers.id` could not run
+// `SELECT id FROM customers ORDER BY ALL`, which orders by `id` only (failed
+// safe: a false positive, not a bypass). `parser::resolve_snowflake_order_by_all`
+// now reads it as ordering by the outputs, which adds no reference. The mask
+// half of the same parse is
+// `tests/snowflake.rs::vericto_085_snowflake_refuses_order_by_all`; both stay
+// as the regression check for the sqlparser upgrade that reads it upstream.
 #[test]
-#[ignore = "finding: Snowflake ORDER BY ALL is parsed as a column named ALL"]
 fn snowflake_order_by_all_orders_by_the_outputs() {
-    assert_allowed_on(Snowflake, "SELECT id FROM customers ORDER BY ALL", &agent());
+    for sql in [
+        "SELECT id FROM customers ORDER BY ALL",
+        "SELECT id, name FROM customers ORDER BY all DESC",
+        "SELECT id FROM customers UNION SELECT id FROM orders ORDER BY ALL",
+        "SELECT id FROM customers WHERE id IN (SELECT id FROM orders ORDER BY ALL)",
+    ] {
+        assert_allowed_on(Snowflake, sql, &agent());
+    }
+    // The outputs are what it orders by: a denied output is the only denial.
+    assert_denied_exactly_on(
+        Snowflake,
+        "SELECT email FROM customers ORDER BY ALL",
+        &["CUSTOMERS.EMAIL:read"],
+    );
+    // A quoted "ALL" is a real column, and `all_col` is untouched.
+    assert_denied_exactly_on(
+        Snowflake,
+        "SELECT id FROM customers ORDER BY \"ALL\"",
+        &["CUSTOMERS.ALL:read"],
+    );
+    assert_denied_exactly_on(
+        Snowflake,
+        "SELECT id FROM customers ORDER BY all_col",
+        &["CUSTOMERS.ALL_COL:read"],
+    );
+}
+
+// No other dialect Vericto supports reads `ORDER BY ALL` (sqlparser enables
+// it only for DuckDB and ClickHouse; PostgreSQL, MySQL, SQL Server, Oracle and
+// SQLite reject it), so the resolution is Snowflake's only: elsewhere `ALL` is
+// still read as a column, which fails safe under an allowlist.
+#[test]
+fn order_by_all_stays_a_column_outside_snowflake() {
+    for d in [Mysql, Oracle, MsSql, Sqlite] {
+        let o = eval(d, "SELECT id FROM customers ORDER BY ALL", &agent());
+        assert_eq!(o.decision, Decision::Block, "{d:?}: {o:?}");
+    }
 }

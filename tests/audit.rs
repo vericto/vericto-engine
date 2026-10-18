@@ -1241,21 +1241,41 @@ fn constant_comparison_or_branches_are_injections_on_every_dialect() {
     }
 }
 
-// FINDING (reported to the owner, not fixed here): a comparison with a NULL
-// literal is NULL, never true, so it matches no row (the walkers already apply
-// this rule to `IN` lists, see `non_null_literal`). `const_cmp_true` in both
-// walkers compares NULL like any literal: `NULL = NULL` is "equal" and
-// `NULL <> 1` "different", so a DELETE that removes nothing is reported, and
-// blocked, as an always-true WHERE. The NOT form goes through
-// `is_always_false`, which takes any literal comparison that is not provably
-// true as provably false.
+/// Whether `sql` trips VERICTO-090 (a tautological OR branch) on `d`.
+fn fires_090(sql: &str, d: Dialect) -> bool {
+    matching_codes(sql, d, &ruleset(), &EnforcementPolicy::default())
+        .contains(&"VERICTO-090".to_string())
+}
+
+/// The dialects on which `sql` trips VERICTO-090.
+fn dialects_firing_090(sql: &str) -> Vec<Dialect> {
+    EVERY_DIALECT
+        .into_iter()
+        .filter(|d| fires_090(sql, *d))
+        .collect()
+}
+
+// Fixed in 4.1.3 (finding F1 of the 0031 tests): a comparison with a NULL
+// literal is NULL, never true, so it matches no row (the walkers already
+// applied this to `IN` lists). Both walkers compared NULL like any literal:
+// `NULL = NULL` was "equal" and `NULL <> 1` "different", so a DELETE that
+// removes nothing was reported, and blocked, as an always-true WHERE, and the
+// NOT form took "not provably true" for "provably false". The shared
+// `parser::compare` now reads any comparison with NULL as UNKNOWN, and so is
+// its NOT.
 #[test]
-#[ignore = "finding: NULL comparisons are taken as constant-true by both walkers"]
 fn null_comparisons_are_not_tautologies() {
     for sql in [
         "DELETE FROM users WHERE NULL = NULL",
         "DELETE FROM users WHERE NULL <> 1",
         "DELETE FROM users WHERE NOT (NULL = 1)",
+        "DELETE FROM users WHERE NULL < 1",
+        "DELETE FROM users WHERE NOT (NULL <> NULL)",
+        "DELETE FROM users WHERE NULL",
+        "DELETE FROM users WHERE NOT NULL",
+        // A column compared with NULL is never true either.
+        "DELETE FROM users WHERE id = NULL",
+        "DELETE FROM users WHERE NOT (id = NULL)",
     ] {
         assert_eq!(
             dialects_firing_003(sql),
@@ -1263,45 +1283,164 @@ fn null_comparisons_are_not_tautologies() {
             "`{sql}` matches no row and must NOT trip VERICTO-003"
         );
     }
-}
-
-// FINDING (reported to the owner, not fixed here): `const_cmp_true` leaves an
-// ordering between strings undecided (it returns false), and
-// `is_always_false` reads that as "provably false", so `NOT (<a> < <b>)` is
-// taken as always true in both walkers. `NOT ('b' > 'a')` and `NOT ('a' > 'b')`
-// both trip VERICTO-003, although one of them matches no row under any
-// collation.
-#[test]
-#[ignore = "finding: NOT over an undecided string ordering is taken as constant-true"]
-fn negated_string_orderings_are_undecidable() {
     for sql in [
-        "DELETE FROM users WHERE NOT ('a' < 'b')",
-        "DELETE FROM users WHERE NOT ('b' > 'a')",
+        "SELECT * FROM users WHERE id = 5 OR NULL = NULL",
+        "SELECT * FROM users WHERE id = 5 OR NOT (NULL = 1)",
+        "SELECT * FROM users WHERE id = 5 OR id = NULL",
     ] {
         assert_eq!(
-            dialects_firing_003(sql),
+            dialects_firing_090(sql),
             Vec::<Dialect>::new(),
-            "`{sql}` depends on the collation and must NOT trip VERICTO-003"
+            "`{sql}`: the NULL branch matches no row and must NOT trip VERICTO-090"
         );
     }
-}
-
-// FINDING (reported to the owner, not fixed here): walker drift. libpg_query
-// folds `-1` into one negative constant, so `pg_ast.rs` decides `-1 < 0`;
-// sqlparser reads it as `UnaryOp(Minus, 1)`, which `walk.rs`'s
-// `const_cmp_true` does not accept as a literal. The same DELETE trips
-// VERICTO-003 (and `OR -1 < 0` trips VERICTO-090) on PostgreSQL only.
-#[test]
-#[ignore = "finding: negative literals are decided by pg_ast.rs only (walker drift)"]
-fn negative_literal_comparisons_agree_across_walkers() {
+    // Still tautologies on every dialect: true comparisons that do not
+    // involve NULL, also next to one.
     for sql in [
-        "DELETE FROM users WHERE -1 < 0",
-        "DELETE FROM users WHERE 0 > -1",
+        "DELETE FROM users WHERE 1 = 1",
+        "DELETE FROM users WHERE 'a' = 'a'",
+        "DELETE FROM users WHERE NULL = 1 OR 1 = 1",
+        "DELETE FROM users WHERE NOT (NULL = 1) OR 1 = 1",
     ] {
         assert_eq!(
             dialects_firing_003(sql),
             EVERY_DIALECT,
             "`{sql}` is constant-true and must trip VERICTO-003 on every dialect"
         );
+    }
+    for sql in [
+        "SELECT * FROM users WHERE id = 5 OR 1 = 1",
+        "SELECT * FROM users WHERE id = 5 OR 'a' = 'a'",
+    ] {
+        assert_eq!(
+            dialects_firing_090(sql),
+            EVERY_DIALECT,
+            "`{sql}` must trip VERICTO-090 on every dialect"
+        );
+    }
+}
+
+// Fixed in 4.1.3 (finding F2 of the 0031 tests): an ordering between strings
+// depends on the collation, so the engine cannot decide it; both walkers then
+// read "not decided" as "false", which made `NOT ('a' < 'b')` and
+// `NOT ('b' > 'a')` always true, although one of them matches no row under
+// any collation. The shared comparison is three-valued: undecided stays
+// undecided through NOT, and only a provably true predicate is a tautology.
+// The same applies to string equality a collation can decide either way
+// (`'a' = 'A'` is true under MySQL's and SQL Server's default collations)
+// and to literals of different kinds (`1 = '1'` is true on PostgreSQL and
+// MySQL).
+#[test]
+fn negated_string_orderings_are_undecidable() {
+    for sql in [
+        "DELETE FROM users WHERE NOT ('a' < 'b')",
+        "DELETE FROM users WHERE NOT ('b' > 'a')",
+        "DELETE FROM users WHERE NOT ('a' <= 'b')",
+        "DELETE FROM users WHERE NOT ('a' >= 'b')",
+        "DELETE FROM users WHERE NOT (NOT ('a' > 'b'))",
+        // Equal or not depending on the collation.
+        "DELETE FROM users WHERE 'a' <> 'A'",
+        "DELETE FROM users WHERE NOT ('a' = 'A')",
+        "DELETE FROM users WHERE 'a' <> 'a '",
+        // Different kinds: the coercion is the dialect's.
+        "DELETE FROM users WHERE 1 <> '1'",
+        "DELETE FROM users WHERE NOT (1 = '1')",
+    ] {
+        assert_eq!(
+            dialects_firing_003(sql),
+            Vec::<Dialect>::new(),
+            "`{sql}` depends on the collation or the dialect and must NOT trip VERICTO-003"
+        );
+    }
+    let sql = "SELECT * FROM users WHERE id = 5 OR NOT ('a' < 'b')";
+    assert_eq!(dialects_firing_090(sql), Vec::<Dialect>::new(), "`{sql}`");
+    // Identical string literals stay decidable, as do distinct plain ones.
+    for sql in [
+        "DELETE FROM users WHERE 'a' = 'a'",
+        "DELETE FROM users WHERE NOT ('a' <> 'a')",
+        "DELETE FROM users WHERE 'a' <> 'b'",
+        "DELETE FROM users WHERE NOT ('a' = 'b')",
+    ] {
+        assert_eq!(
+            dialects_firing_003(sql),
+            EVERY_DIALECT,
+            "`{sql}` is constant-true and must trip VERICTO-003 on every dialect"
+        );
+    }
+}
+
+// Fixed in 4.1.3 (finding F3 of the 0031 tests): walker drift. libpg_query
+// folds `-1` into one negative constant, so `pg_ast.rs` decided `-1 < 0`;
+// sqlparser reads it as `UnaryOp(Minus, 1)`, which `walk.rs` did not accept
+// as a literal. The same DELETE tripped VERICTO-003 (and `OR -1 < 0`
+// VERICTO-090) on PostgreSQL only. Both walkers now fold the sign through the
+// shared `parser::Const::negated`, so these are detected on every dialect.
+#[test]
+fn negative_literal_comparisons_agree_across_walkers() {
+    for sql in [
+        "DELETE FROM users WHERE -1 < 0",
+        "DELETE FROM users WHERE 0 > -1",
+        "DELETE FROM users WHERE -1 = -1",
+        "DELETE FROM users WHERE -(1) < 0",
+        "DELETE FROM users WHERE -1.5 <= -1",
+        "DELETE FROM users WHERE NOT (-1 > 0)",
+        "DELETE FROM users WHERE -1 IN (-1, 2)",
+        "DELETE FROM users WHERE -1 BETWEEN -2 AND 0",
+        "DELETE FROM users WHERE -1",
+    ] {
+        assert_eq!(
+            dialects_firing_003(sql),
+            EVERY_DIALECT,
+            "`{sql}` is constant-true and must trip VERICTO-003 on every dialect"
+        );
+    }
+    for sql in [
+        "SELECT * FROM users WHERE id = 5 OR -1 < 0",
+        "SELECT * FROM users WHERE id = 5 OR 0 > -1",
+    ] {
+        assert_eq!(
+            dialects_firing_090(sql),
+            EVERY_DIALECT,
+            "`{sql}` must trip VERICTO-090 on every dialect"
+        );
+    }
+    // False, or row-dependent: a real filter on every dialect.
+    for sql in [
+        "DELETE FROM users WHERE -1 > 0",
+        "DELETE FROM users WHERE NOT (-1 < 0)",
+        "DELETE FROM users WHERE -id < 0",
+        "DELETE FROM users WHERE -1 = NULL",
+        "DELETE FROM users WHERE -0",
+    ] {
+        assert_eq!(
+            dialects_firing_003(sql),
+            Vec::<Dialect>::new(),
+            "`{sql}` is not provably always-true and must NOT trip VERICTO-003"
+        );
+    }
+    let sql = "SELECT * FROM users WHERE id = 5 OR -1 > 0";
+    assert_eq!(dialects_firing_090(sql), Vec::<Dialect>::new(), "`{sql}`");
+}
+
+// A bind parameter is a value the engine does not see, not a constant: the
+// pg_query walker reads `$1` as a parameter, and the sqlparser walker used to
+// compare two placeholders by their text, so `? = ?` was a tautology on every
+// dialect but PostgreSQL. Both walkers agree since 4.1.3.
+#[test]
+fn bind_parameters_are_not_constants_on_every_dialect() {
+    for d in EVERY_DIALECT {
+        let p = if d == Dialect::Postgres { "$1" } else { "?" };
+        let q = if d == Dialect::Postgres { "$2" } else { "?" };
+        for sql in [
+            format!("DELETE FROM users WHERE {p} = {q}"),
+            format!("DELETE FROM users WHERE NOT ({p} = 1)"),
+            format!("DELETE FROM users WHERE {p} IN ({q})"),
+            format!("DELETE FROM users WHERE {p} LIKE '%'"),
+        ] {
+            assert!(
+                !fires_003(&sql, d),
+                "`{sql}` must NOT trip VERICTO-003 on {d:?}"
+            );
+        }
     }
 }

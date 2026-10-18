@@ -7,7 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Documentation only. No API, behaviour or rule changes.
+## [4.1.3] — 2026-10-18
+
+Four evaluation fixes, found by the tests that pin them (the walker coverage
+suite added before this release, whose four findings were `#[ignore]`d failing
+tests and now pass). Three of them **narrow what is reported and blocked**:
+fewer false positives, nothing that was a real tautology stops being one. The
+fourth (negative literals) goes the other way on purpose: MySQL, Oracle, SQL
+Server, SQLite and Snowflake now detect `-1 < 0`-style tautologies that only
+PostgreSQL detected, so a query those five dialects allowed can now be blocked
+there. No API change, no new rule, and the rule catalogue is unchanged.
+
+### Fixed
+
+- **A comparison with NULL was a tautology.** Both walkers compared a `NULL`
+  literal like any value, so `DELETE … WHERE NULL = NULL`, `WHERE NULL <> 1` and
+  `WHERE NOT (NULL = 1)` tripped VERICTO-003 (Critical, blocking) on every
+  dialect, and the same forms as an `OR` branch tripped VERICTO-090, although
+  under SQL's three-valued logic a comparison with NULL is UNKNOWN and such a
+  `DELETE` removes no row. The constant comparison now lives once, in
+  `parser::mod`, shared by both walkers, and returns true, false or unknown; a
+  NULL operand is unknown, and so is its `NOT`. VERICTO-030/042 (the `UPDATE`
+  forms) and VERICTO-040 read the same predicate and are narrowed the same way.
+  `x = NULL` was never a tautology and still is not.
+- **`NOT` of a comparison the engine cannot decide was a tautology.** A string
+  ordering depends on the collation, so the engine left `'a' < 'b'` undecided,
+  and then read "undecided" as "false": `NOT ('a' < 'b')` and `NOT ('b' > 'a')`
+  tripped VERICTO-003 on every dialect, although one of the two matches no row
+  under any collation. Undecided now stays undecided through `NOT`, and only a
+  provably true predicate is reported. The same reading closes three neighbouring
+  cases of the same kind: string equality a collation can decide either way
+  (`'a' <> 'A'` and `NOT ('a' = 'A')`; case- and accent-insensitive collations
+  are the MySQL and SQL Server defaults, and Snowflake's can also ignore
+  punctuation and surrounding spaces), literals of different kinds
+  (`NOT (1 = '1')`, true on PostgreSQL and MySQL), and, on the sqlparser
+  dialects only, bind parameters, which were compared by their text (`? = ?`)
+  where PostgreSQL never did. Identical string literals (`'a' = 'a'`, the
+  classic `' OR 'a'='a` injection) and distinct plain ones (`'a' <> 'b'`) are
+  still decided and still blocked.
+- **Negative literals were decided on PostgreSQL only.** libpg_query folds `-1`
+  into one constant; sqlparser reads it as a unary minus, which the other
+  walker did not accept as a literal. `DELETE … WHERE -1 < 0` tripped
+  VERICTO-003, and `… OR -1 < 0` VERICTO-090, on PostgreSQL and on none of the
+  other five dialects. Both walkers now fold the sign through one shared helper,
+  so the comparison, `IN`, `BETWEEN` and bare-literal forms (`WHERE -1`) are
+  decided alike everywhere. **This widens detection** on MySQL, Oracle, SQL
+  Server, SQLite and Snowflake: such a `DELETE` was allowed there and is now
+  blocked, as it already was on PostgreSQL.
+- **Snowflake's `ORDER BY ALL` was read as a column named `ALL`.** sqlparser
+  0.63's Snowflake dialect does not parse `ORDER BY ALL` (fixed upstream in
+  apache/datafusion-sqlparser-rs#2502, not yet released), so the VERICTO-085
+  mask rewrite never saw it: `SELECT note FROM customers ORDER BY ALL` over a
+  masked `note` was forwarded with the masked values (no disclosure) in the
+  order of the masked values, which the same check refuses for `ORDER BY note`
+  and `ORDER BY 1`. Under a VERICTO-087 allowlist the phantom column was denied,
+  so an identity granted `customers.id` could not run
+  `SELECT id FROM customers ORDER BY ALL` (fail-safe, a false positive). The
+  engine now reads an ORDER BY that is exactly one bare, unquoted `ALL` (any
+  case, with its direction and `NULLS` order) as ordering by every output, in
+  one place shared by the sensitive and access walkers: the mask rewrite is
+  refused when any output is masked, with the same reason as `ORDER BY 1`, and
+  an allowlist sees no reference beyond the outputs. A quoted `"ALL"` is still
+  a column, as is `all_col`. Snowflake only: no other dialect Vericto supports
+  has `ORDER BY ALL`. The workaround is temporary and is to be removed when the
+  engine moves to a sqlparser release that contains #2502 (expected 0.64); its
+  tests stay as the regression check for that upgrade.
+
+The golden corpora (MySQL ORM, Snowflake, SQLite) pass unchanged: no outcome
+in them differs from 4.1.2.
 
 ### Documentation
 
@@ -1765,7 +1832,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.1.2...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.1.3...HEAD
+[4.1.3]: https://github.com/vericto/vericto-engine/compare/v4.1.2...v4.1.3
 [4.1.2]: https://github.com/vericto/vericto-engine/compare/v4.1.1...v4.1.2
 [4.1.1]: https://github.com/vericto/vericto-engine/compare/v4.1.0...v4.1.1
 [4.1.0]: https://github.com/vericto/vericto-engine/compare/v4.0.0...v4.1.0

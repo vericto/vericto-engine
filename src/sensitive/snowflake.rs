@@ -221,8 +221,11 @@ pub(crate) fn render(
     let printed = tokens(&print(original)).map_err(faithful)?;
     equivalent(&client, &printed).map_err(faithful)?;
     let text = print(rewritten);
-    let again = Parser::parse_sql(&SnowflakeDialect {}, &text)
+    let mut again = Parser::parse_sql(&SnowflakeDialect {}, &text)
         .map_err(|e| format!("the rewritten text does not parse ({e})"))?;
+    // Read `ORDER BY ALL` as the parse did, so a subquery's `ORDER BY ALL`
+    // compares equal (temporary, see the function).
+    crate::parser::resolve_snowflake_order_by_all(&mut again);
     if again != rewritten {
         return Err("the rewritten text does not parse back to the rewritten query".into());
     }
