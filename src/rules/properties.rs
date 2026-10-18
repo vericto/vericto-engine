@@ -660,14 +660,19 @@ mod column_predicates_are_not_tautologies {
 // randomly generated rulesets and policies:
 //
 //   1. `violations.first()` IS the winner reported in the flat fields.
-//   2. The order is (severity desc, code asc) — never the caller's slice order.
+//   2. The order is (action desc, severity desc, code asc) — never the caller's
+//      slice order.
 //   3. Reordering the input `rules` slice cannot change the outcome at all.
 //   4. Empty exactly when no rule matched.
+//
+// Property 11 (4.2.0) adds the claim the decision rests on: it is the strongest
+// resolved action of the set, for any order of the slice.
 #[cfg(test)]
 mod all_violations_are_reported {
     use crate::parser::{Dialect, parser_for};
     use crate::rules::engine::{
-        Decision, EnforcementAction, EnforcementPolicy, Rule, RuleEngine, RuleType, Severity,
+        Decision, EnforcementAction, EnforcementPolicy, Rule, RuleClass, RuleEngine, RuleType,
+        Severity,
     };
     use proptest::prelude::*;
 
@@ -677,6 +682,7 @@ mod all_violations_are_reported {
         "VERICTO-001",
         "VERICTO-003",
         "VERICTO-010",
+        "VERICTO-030",
         "VERICTO-040",
         "VERICTO-042",
         "VERICTO-050",
@@ -696,9 +702,12 @@ mod all_violations_are_reported {
         "SELECT id, email FROM users WHERE email = $1 LIMIT 1", // clean
         // Trips a SchemaMigration rule AND a DataMutation one, so a
         // schema_migration_cap can invert their resolved actions relative to
-        // severity. This is the shape that distinguishes "decision from the winner"
-        // from "decision from the strongest action in the set".
+        // severity. This is the shape that distinguishes "decision from the
+        // highest severity" from "decision from the strongest action in the set".
         "DROP TABLE users; DELETE FROM users",
+        // The CI-check script of the 4.2.0 fix: a capped DROP before a
+        // WHERE-less UPDATE.
+        "DROP TABLE a; UPDATE accounts SET balance = 0",
     ];
 
     fn severity_strategy() -> impl Strategy<Value = Severity> {
@@ -730,12 +739,10 @@ mod all_violations_are_reported {
     }
 
     /// Includes `cap = Monitor`, not just `Flag`. That matters: a cap can push a
-    /// high-severity SchemaMigration violation BELOW a lower-severity uncapped one,
-    /// so the winner (highest severity) no longer necessarily holds the strongest
-    /// action. Without a Monitor cap in the generator, an implementation that
-    /// escalated the decision to `max(action)` over the whole set would look
-    /// indistinguishable from the correct one — verified by injecting exactly that
-    /// mutation and watching it survive until this case was generated.
+    /// high-severity SchemaMigration violation BELOW a lower-severity uncapped one.
+    /// Before 4.2.0 the winner was the highest severity, so that case let the
+    /// softened violation decide; since 4.2.0 the decision is the strongest action
+    /// of the set (Property 11), and this case is what tells the two apart.
     fn policy_strategy() -> impl Strategy<Value = EnforcementPolicy> {
         (
             any::<bool>(),
@@ -750,6 +757,12 @@ mod all_violations_are_reported {
                 schema_migration_cap: cap,
                 ..EnforcementPolicy::default()
             })
+    }
+
+    /// Any action per severity, any parse-error action, monitor_mode and any cap:
+    /// the host's severity mapping can soften a Critical below a High too.
+    fn full_policy_strategy() -> impl Strategy<Value = EnforcementPolicy> {
+        super::policy_strategy()
     }
 
     proptest! {
@@ -789,11 +802,12 @@ mod all_violations_are_reported {
             }
         }
 
-        // Property 10 (order): severity descending, then rule code ascending, for
-        // every adjacent pair. Asserted pairwise rather than by re-sorting, so the
-        // test does not restate the implementation.
+        // Property 10 (order): resolved action descending, then severity
+        // descending, then rule code ascending, for every adjacent pair (since
+        // 4.2.0; severity came first before). Asserted pairwise rather than by
+        // re-sorting, so the test does not restate the implementation.
         #[test]
-        fn p10_violations_are_ordered_by_severity_then_code(
+        fn p10_violations_are_ordered_by_action_then_severity_then_code(
             sql in prop::sample::select(QUERIES),
             rules in ruleset_strategy(),
             policy in policy_strategy(),
@@ -804,12 +818,68 @@ mod all_violations_are_reported {
             for pair in out.violations.windows(2) {
                 let (a, b) = (&pair[0], &pair[1]);
                 prop_assert!(
-                    a.severity > b.severity
-                        || (a.severity == b.severity && a.rule_code < b.rule_code),
-                    "out of order: {:?}/{} then {:?}/{}",
-                    a.severity, a.rule_code, b.severity, b.rule_code
+                    a.action > b.action
+                        || (a.action == b.action && a.severity > b.severity)
+                        || (a.action == b.action
+                            && a.severity == b.severity
+                            && a.rule_code < b.rule_code),
+                    "out of order: {:?}/{:?}/{} then {:?}/{:?}/{}",
+                    a.action, a.severity, a.rule_code, b.action, b.severity, b.rule_code
                 );
             }
+        }
+
+        // Property 11: the decision is the strongest resolved action of the set,
+        // for any order of the caller's `rules` slice. Each violation's action is
+        // re-derived here from the policy and the rule's severity and class, so
+        // the property does not trust the engine's own resolution either. A
+        // violation the policy softened (a cap, monitor_mode, the severity
+        // mapping) can never lower the decision below another one's action.
+        #[test]
+        fn p11_decision_is_the_max_resolved_action_for_any_rule_order(
+            sql in prop::sample::select(QUERIES),
+            rules in ruleset_strategy().prop_shuffle(),
+            policy in full_policy_strategy(),
+        ) {
+            let parsed = parser_for(Dialect::Postgres).parse(sql).expect("must parse");
+            let out = RuleEngine::evaluate(&parsed, &rules, &policy);
+
+            let strongest = out
+                .violations
+                .iter()
+                .map(|v| {
+                    let rule = rules.iter().find(|r| r.code == v.rule_code).expect("from the ruleset");
+                    let action = policy.action_for_class(rule.severity, RuleClass::for_code(&rule.code));
+                    prop_assert_eq!(v.action, action, "{} resolved differently", v.rule_code);
+                    Ok(action)
+                })
+                .collect::<Result<Vec<_>, TestCaseError>>()?
+                .into_iter()
+                .max();
+            prop_assert_eq!(out.action, strongest);
+            prop_assert_eq!(
+                out.decision,
+                strongest.map_or(Decision::Allow, Decision::from_action)
+            );
+            // The reported winner holds that action, and no violation outranks it.
+            if let Some(winner) = out.violations.first() {
+                prop_assert_eq!(Some(winner.action), strongest);
+                prop_assert_eq!(out.rule_code.as_deref(), Some(winner.rule_code.as_str()));
+                for v in &out.violations[1..] {
+                    prop_assert!(
+                        v.action < winner.action
+                            || (v.action == winner.action && v.severity <= winner.severity),
+                        "{:?} outranks the winner {:?}", v, winner
+                    );
+                }
+            }
+
+            // Sorted input gives the same outcome: order is not an input.
+            let mut sorted = rules.clone();
+            sorted.sort_by(|a, b| a.code.cmp(&b.code));
+            let again = RuleEngine::evaluate(&parsed, &sorted, &policy);
+            prop_assert_eq!(out.decision, again.decision);
+            prop_assert_eq!(out.rule_code, again.rule_code);
         }
 
         // Property 10 (order-independence): shuffling the caller's `rules` slice
@@ -838,15 +908,15 @@ mod all_violations_are_reported {
             prop_assert_eq!(codes(&forward), codes(&reversed));
         }
 
-        // Property 10 (the decision is the winner's alone): the verdict must depend
-        // only on the highest-severity violation, never on how many others there
-        // are. Asserted by evaluating the winning rule BY ITSELF and requiring the
-        // same decision and action.
+        // Property 10 (the decision is the winner's alone): the verdict is the
+        // winner's action, and the winner is a violation like any other. Asserted
+        // by evaluating the winning rule BY ITSELF and requiring the same decision,
+        // action, severity and code.
         //
-        // Without this, "violations is evidence, not an input" is only a comment:
-        // an implementation that escalated the decision when several rules fired
-        // would satisfy every other property here while changing whether a query is
-        // blocked — the one thing this field must never do.
+        // With Property 11 (the decision is the strongest action of the set) this
+        // pins both sides: an implementation that escalated the decision beyond
+        // any single violation's action because several rules fired fails here,
+        // and one that let a softened violation decide fails there.
         #[test]
         fn p10_decision_comes_from_the_winner_alone(
             sql in prop::sample::select(QUERIES),

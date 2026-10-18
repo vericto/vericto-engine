@@ -12,7 +12,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.1.3" }
+//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.2.0" }
 //! ```
 //!
 //! ```rust
@@ -34,6 +34,33 @@
 //! let policy = EnforcementPolicy::default();
 //! let result = evaluate("DELETE FROM users", Dialect::Postgres, &rules, &policy);
 //! assert!(result.decision == Decision::Block);
+//! ```
+//!
+//! ## The standard ruleset and versions
+//!
+//! A host with no ruleset of its own (before a first rule sync, after a failed
+//! one, or offline) evaluates with [`standard_rules()`]: every built-in rule at
+//! its default severity. [`STANDARD_RULES`] is the same table with each rule's
+//! class and default action. [`ENGINE_VERSION`] and [`STANDARD_RULESET_VERSION`]
+//! (`standard@<engine version>`) say what a verdict was evaluated with.
+//!
+//! ```rust
+//! use vericto_engine::{
+//!     evaluate, standard_rules, Decision, Dialect, EnforcementAction, EnforcementPolicy,
+//!     ENGINE_VERSION, STANDARD_RULESET_VERSION,
+//! };
+//!
+//! // A CI channel: schema DDL reports instead of blocking.
+//! let ci = EnforcementPolicy {
+//!     schema_migration_cap: Some(EnforcementAction::Flag),
+//!     ..EnforcementPolicy::default()
+//! };
+//! let sql = "DROP TABLE a; UPDATE accounts SET balance = 0;";
+//! let outcome = evaluate(sql, Dialect::Postgres, &standard_rules(), &ci);
+//! // The decision is the strongest action of any violation: the UPDATE blocks.
+//! assert_eq!(outcome.decision, Decision::Block);
+//! assert_eq!(outcome.rule_code.as_deref(), Some("VERICTO-030"));
+//! assert_eq!(STANDARD_RULESET_VERSION, format!("standard@{ENGINE_VERSION}"));
 //! ```
 
 // No `unsafe` in this crate: the only unsafe code it runs is in its parser
@@ -58,6 +85,9 @@ pub use rules::engine::{
     Decision, EnforcementAction, EnforcementPolicy, EvaluationOutcome, ParseErrorAction,
     ParseErrorKind, ReportedViolation, Rule, RuleClass, RuleEngine, RuleType, Severity,
     TEXT_DIVERGENCE_RULE_CODE,
+};
+pub use rules::standard::{
+    ENGINE_VERSION, STANDARD_RULES, STANDARD_RULESET_VERSION, StandardRule, standard_rules,
 };
 pub use sensitive::{
     MaskStyle, SENSITIVE_RULE_CODE, SensitiveColumn, SensitivePolicy, TouchedColumn,

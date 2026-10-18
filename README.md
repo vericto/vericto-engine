@@ -33,7 +33,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.1.3" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.2.0" }
 ```
 
 ### Quick example
@@ -72,11 +72,46 @@ fn is_safe(sql: &str, rules: &[Rule], policy: &EnforcementPolicy) -> bool {
 }
 ```
 
-A query may violate several rules at once; the outcome reports the one with the
-highest severity. When several share the top severity, the one with the lowest
-`code` wins. The order of the `rules` slice never affects the result, so you do
-not need to sort it — the same query and ruleset always report the same
-violation.
+A query (or a script of several statements) may violate several rules at once.
+Each violation's action is resolved through the policy on its own, and the
+decision is the **strongest** of those actions (Block > Flag > Monitor), never
+weaker than any single violation's. The outcome reports the violation that holds
+it: among those with the same action, the highest severity, then the lowest
+`code`. The order of the `rules` slice never affects the result, so you do not
+need to sort it — the same query and ruleset always report the same violation.
+
+Before 4.2.0 the winner was the highest severity, and its action became the
+decision. Under a CI policy (`schema_migration_cap: Some(Flag)`) the script
+`DROP TABLE a; UPDATE accounts SET balance = 0;` therefore reported the capped
+DROP (VERICTO-010, Flag) and passed, although its WHERE-less UPDATE
+(VERICTO-030) blocks. Since 4.2.0 it blocks with VERICTO-030.
+
+### The standard ruleset and versions
+
+A host with no ruleset of its own — before its first rule sync, after a failed
+one, or checking files offline — evaluates with `standard_rules()`: every
+built-in rule of the [catalogue](#standard-rules-vericto-) at its default
+severity, ready to pass to `evaluate`. `STANDARD_RULES` is the same table as
+`StandardRule` entries, with each rule's `code`, `severity`, `class` (as
+`RuleClass::for_code`), the `default_action` the default policy maps that
+severity to, and `engine_driven` for VERICTO-085, 086 and 087, which the policy
+drives and the rules slice neither enables nor disables. A test keeps the table
+equal to the catalogue below.
+
+`ENGINE_VERSION` is this crate's version (`"4.2.0"`) and
+`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@4.2.0"`):
+a built-in rule's predicate lives in the engine, so what the standard ruleset
+detects changes with the engine version. Print them with a verdict to say what
+it was evaluated with.
+
+```rust
+use vericto_engine::{
+    evaluate, standard_rules, Dialect, EnforcementPolicy, STANDARD_RULESET_VERSION,
+};
+
+let outcome = evaluate(sql, Dialect::Postgres, &standard_rules(), &EnforcementPolicy::default());
+println!("{:?} ({STANDARD_RULESET_VERSION})", outcome.decision);
+```
 
 ### Every violation, not only the winner
 
@@ -87,10 +122,10 @@ proxy builds a single native protocol error, and an audit row has one
 ```rust
 let outcome = evaluate(sql, Dialect::Postgres, &rules, &policy);
 
-// The verdict — derived from the winner alone.
+// The verdict — the winner's action, the strongest of the set.
 if outcome.decision == Decision::Block { /* reject */ }
 
-// Everything the query is guilty of, worst first.
+// Everything the query is guilty of, strongest action first.
 for v in &outcome.violations {
     println!("{} {:?} → {:?}  {}", v.rule_code, v.severity, v.action, v.ast_node_path);
 }
@@ -99,10 +134,12 @@ for v in &outcome.violations {
 Guarantees, each pinned by a property test:
 
 - `violations[0]` **is** the winner reported in the flat fields.
-- Ordered severity descending, then rule code ascending — never by the order you
-  passed the rules in.
-- `decision` and `action` come from the winner **alone**. A longer list can never
-  change whether a query is blocked, so the field is safe to ignore.
+- Ordered by resolved action descending (Block, Flag, Monitor), then severity
+  descending, then rule code ascending — never by the order you passed the rules
+  in. VERICTO-085 and VERICTO-087 take their place in the same order.
+- `decision` and `action` are the winner's, and the winner holds the strongest
+  action of the list: no entry resolves to an action stronger than the decision,
+  so a host that reads only the flat fields acts on the strictest violation.
 - Contains exactly the rules that fire when each is evaluated on its own — nothing
   dropped, nothing invented.
 - Empty exactly when no rule matched. A parse error also reports an empty set:
@@ -110,10 +147,11 @@ Guarantees, each pinned by a property test:
 
 Each entry carries its **own** resolved `severity` and `action`, so a caller
 rendering the set does not re-derive them and cannot disagree with the decision.
-Note that a per-class cap can make a lower-severity violation resolve to a
-*stronger* action than the winner — `schema_migration_cap: Monitor` softens a
-Critical `DROP TABLE` while a High `DELETE` still blocks. The winner is chosen by
-severity, not by action.
+A per-class cap can make a lower-severity violation resolve to a *stronger*
+action than a higher-severity one — `schema_migration_cap: Monitor` softens a
+Critical `DROP TABLE` while a High `INSERT … SELECT` still blocks. The winner is
+chosen by action first, so the High block is the winner and the decision, and the
+capped DROP follows it in the list.
 
 Before this field, a host that wanted the full set had to call `evaluate()` once
 per rule, re-parsing the SQL every time: measured at roughly **20× the cost** on a
@@ -424,7 +462,9 @@ copy (masking would change stored data), on MySQL to a statement the engine
 cannot print back faithfully (see below), or on Oracle and SQL Server (no rewrite
 yet; blocking is the fail-safe direction). The column
 verdict is a **floor** over the rules: the final decision is the stricter of the
-two, and VERICTO-085 takes the flat fields only when it is the stricter one.
+two, and VERICTO-085 takes the flat fields only when it ranks first in the
+shared order (action, then severity, then code): a `mask` (High, Flag) next to a
+Medium rule that flags is the winner, a Critical rule that blocks keeps them.
 `monitor_mode` turns a column block into a flag and never applies a mask (the
 would-be rewrite is in `suggested_safe_query`). With a `block` or `mask` tag
 configured, a parse error blocks
@@ -769,6 +809,11 @@ is allowed.
 2. Not allowed → VERICTO-087: `Block` under `enforce`, `Flag` under `observe`.
 3. Allowed and tagged `mask` → the VERICTO-085 rewrite.
 4. Otherwise allowed (a `flag` tag still flags).
+
+The flat fields follow the shared order (action, then severity, then code): a
+`block` tag and an `enforce` denial both block at High, and VERICTO-085 is the
+lower code; under `observe` a denial (High, Flag) ranks ahead of a `flag` tag
+(Medium, Flag).
 
 A denial clears any rewrite (a refused query is never forwarded, masked or not);
 under `observe` an allowed mask keeps its rewrite. `monitor_mode` turns a denial

@@ -204,7 +204,11 @@ fn render() -> String {
             // (allowed, as on Postgres, instead of a parse error) and a mask
             // rewrite keeps a table alias without `AS` as the client wrote it,
             // and one line changed in 4.1.2: the `last4` mask now redacts a
-            // value of 8 characters or fewer.
+            // value of 8 characters or fewer. Two lines changed in 4.2.0: a
+            // `mask` tag (VERICTO-085, High, Flag) next to VERICTO-050
+            // (Medium, Flag) now reports VERICTO-085 as the winner and first
+            // violation (same action, higher severity); decision and rewrite
+            // are unchanged.
             assert!(o.access_denied.is_empty(), "{sql}");
             let line = format!("{o:?}").replace(", access_denied: []", "");
             out.push_str(&format!("{dialect:?}\t{name}\t{sql:?}\t{line}\n"));

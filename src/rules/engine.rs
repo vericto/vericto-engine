@@ -445,7 +445,9 @@ impl Decision {
 ///
 /// `action` is resolved per violation through the same per-class path the winner
 /// uses, so a caller rendering the set does not have to re-derive it — and cannot
-/// get it wrong in a way that disagrees with the decision.
+/// get it wrong in a way that disagrees with the decision. The winner is the
+/// violation with the strongest `action` (then severity, then code), so no entry
+/// is ever stronger than the decision.
 #[derive(Debug, Clone)]
 pub struct ReportedViolation {
     pub rule_id: String,
@@ -473,13 +475,14 @@ pub struct EvaluationOutcome {
     pub suggested_safe_query: Option<String>,
     /// Every violation the query triggered, including the one reported above.
     ///
-    /// Ordered exactly as the winner is chosen — severity descending, then rule
-    /// code ascending — so `violations.first()` IS the winner and the order never
-    /// depends on how the host assembled the `rules` slice.
+    /// Ordered exactly as the winner is chosen — resolved action descending
+    /// (Block, Flag, Monitor), then severity descending, then rule code
+    /// ascending — so `violations.first()` IS the winner and the order never
+    /// depends on how the host assembled the `rules` slice (since 4.2.0; before,
+    /// severity came first).
     ///
-    /// `decision` is derived from the winner alone. Adding to this vector cannot
-    /// change whether a query is blocked, which is what makes it safe to consume
-    /// or ignore.
+    /// `decision` is the winner's action, which is the strongest action in this
+    /// vector: no entry resolves to an action stronger than the decision.
     ///
     /// Empty exactly when no rule matched, i.e. when `rule_code` is `None`.
     pub violations: Vec<ReportedViolation>,
@@ -543,28 +546,34 @@ impl EvaluationOutcome {
 pub const TEXT_DIVERGENCE_RULE_CODE: &str = "VERICTO-086";
 
 /// The rule engine. Evaluates a parsed query against the active rules and
-/// returns the highest-severity violation (or ALLOW if none is violated).
+/// returns the violation with the strongest resolved action (or ALLOW if none
+/// is violated).
 pub struct RuleEngine;
 
 impl RuleEngine {
-    /// Evaluates `parsed` against `rules`, resolving the winning violation's
-    /// action via `policy`.
+    /// Evaluates `parsed` against `rules`, resolving every violation's action
+    /// via `policy`.
     ///
     /// - No match            → Decision::Allow, action None (R3.2).
-    /// - One or more matches → highest-severity violation wins (R3.3); its
-    ///   action is `policy.action_for(severity)` (R3.4); decision derived from
-    ///   the action (R3.6). Severity, action, rule_id, rule_code, ast_node_path
-    ///   and suggested_safe_query are populated (R3.5, R3.7).
+    /// - One or more matches → each violation's action is
+    ///   `policy.action_for_class(severity, class)` (R3.4); the violation with
+    ///   the strongest action wins, so the decision (R3.6) is the strongest
+    ///   action of the set and never weaker than any one violation's. Severity,
+    ///   action, rule_id, rule_code, ast_node_path and suggested_safe_query are
+    ///   the winner's (R3.5, R3.7).
     ///
-    /// When several violated rules share the top severity, the one with the
-    /// lowest `code` wins. The order of `rules` never affects the outcome, so
-    /// the same query and ruleset always report the same violation regardless of
-    /// how the host assembled the slice.
+    /// Among violations with the same action the highest severity wins (R3.3),
+    /// then the lowest `code`. The order of `rules` never affects the outcome,
+    /// so the same query and ruleset always report the same violation
+    /// regardless of how the host assembled the slice. Before 4.2.0 severity
+    /// came first, so a softened violation (a `schema_migration_cap`, a host's
+    /// severity mapping) could outrank a blocking one and decide.
     ///
     /// MySQL text that MySQL reads differently from sqlparser (see
     /// `parser::mysql_lex`) carries every statement the server may execute:
-    /// each is evaluated and the strictest outcome wins (block, then flag or
-    /// mask, then monitor, then allow; on a tie the base reading's). Text that
+    /// each is evaluated and the outcome whose winner ranks first by the same
+    /// order wins (block, then flag or mask, then monitor, then allow; then
+    /// severity, then code; on a full tie the base reading's). Text that
     /// cannot be read with certainty blocks with [`TEXT_DIVERGENCE_RULE_CODE`].
     pub fn evaluate(
         parsed: &ParsedQuery,
@@ -586,15 +595,21 @@ impl RuleEngine {
                 Ok(p) => Self::with_access(Self::evaluate_rules(p, rules, policy), p, policy),
                 Err(e) => parse_error_outcome(e, policy),
             };
-            if strictness(&other) > strictness(&outcome) {
-                // A stricter outcome never forwards a rewrite (a rewrite is a
-                // flag, so the stricter one is a block); the tagged columns the
-                // client's text reads stay in the audit trail.
+            if outranks(other.precedence(), outcome.precedence()) {
+                // The tagged columns the client's text reads stay in the audit
+                // trail. A block never forwards a rewrite; a reading that
+                // outranks a masked one on severity or code alone (the same
+                // flag) keeps the mask, so ranking never unmasks a column.
                 let touched = std::mem::take(&mut outcome.sensitive_columns);
                 let denied = std::mem::take(&mut outcome.access_denied);
+                let rewrite = outcome.rewritten_query.take();
                 std::mem::swap(&mut outcome, &mut other);
                 outcome.sensitive_columns = touched;
-                outcome.rewritten_query = None;
+                outcome.rewritten_query = if outcome.decision == Decision::Block {
+                    None
+                } else {
+                    rewrite
+                };
                 other.access_denied = denied;
             }
             // Every reading's denials stay in the audit trail.
@@ -628,7 +643,9 @@ impl RuleEngine {
     /// parse-error outcome is a floor, resolved as for any parse error (a
     /// flag by default, a block under `parse_error: block`, a protective tag
     /// or an enforced allowlist). The findings keep the flat fields unless
-    /// the floor is strictly stricter, so what cannot be read is never
+    /// the floor outranks their winner in the shared order (a stronger
+    /// action; at the same action, the floor's Medium above a Low or
+    /// Informational finding), so what cannot be read is never
     /// treated more leniently than a parse error, and what was recognised is
     /// still named in the report.
     fn with_unread(
@@ -640,7 +657,7 @@ impl RuleEngine {
             return outcome;
         };
         let floor = parse_error_outcome(why, policy);
-        if strictness(&floor) > strictness(&outcome) {
+        if outranks(floor.precedence(), outcome.precedence()) {
             let mut floor = floor;
             // Keep the audit trail (the decision comes from the floor alone).
             floor.sensitive_columns = outcome.sensitive_columns;
@@ -705,26 +722,24 @@ impl RuleEngine {
             })
             .collect();
 
-        // Highest severity first, then lowest rule code. This is the same
-        // comparison that used to pick the winner inline, lifted to a total order
-        // so the whole set is deterministic and `violations[0]` is the winner.
+        // Strongest resolved action first, then highest severity, then lowest
+        // rule code (`by_precedence`), so `violations[0]` is the winner and its
+        // action is the strongest of the set. Every statement of the input is
+        // in this one set, so this is also where a multi-statement script gets
+        // its single verdict.
         //
-        // Sorting on (severity, code) — never on position in `rules` — is the point:
-        // the host supplies that slice, the control plane serves it from a query
-        // with no ORDER BY, so position is not a property of the query being
-        // evaluated. Letting it decide made the reported code vary between runs on
-        // identical input (fixed in 3.2.4).
-        violations.sort_by(|a, b| match b.severity.cmp(&a.severity) {
-            Ordering::Equal => a.rule_code.cmp(&b.rule_code),
-            other => other,
-        });
+        // Sorting on the violations themselves — never on position in `rules` — is
+        // the point: the host supplies that slice, the control plane serves it from
+        // a query with no ORDER BY, so position is not a property of the query
+        // being evaluated. Letting it decide made the reported code vary between
+        // runs on identical input (fixed in 3.2.4).
+        violations.sort_by(|a, b| by_precedence(a.precedence(), b.precedence()));
 
         match violations.first() {
             None => EvaluationOutcome::allowed(),
             Some(winner) => {
-                // `decision` and `action` come from the winner alone, exactly as
-                // before. The vector is additional evidence, never an input to
-                // the verdict.
+                // The winner holds the strongest action, so the decision is the
+                // strongest action of the set: never weaker than any violation.
                 let action = winner.action;
                 EvaluationOutcome {
                     decision: Decision::from_action(action),
@@ -821,15 +836,83 @@ fn divergence_outcome(why: &str, policy: &EnforcementPolicy) -> EvaluationOutcom
     }
 }
 
-/// Strictness of an outcome: block > flag (a mask is a flag) > monitor >
-/// allow.
-fn strictness(o: &EvaluationOutcome) -> u8 {
-    match (o.decision, o.action) {
-        (Decision::Block, _) => 3,
-        (Decision::Flag, _) => 2,
-        (Decision::Allow, Some(EnforcementAction::Monitor)) => 1,
-        (Decision::Allow, _) => 0,
+/// What a finding is ranked by: its resolved action, its severity and its code.
+/// `None` fields (an outcome with no violation) rank below every `Some`.
+#[derive(Debug, Clone, Copy)]
+struct Precedence<'a> {
+    action: Option<EnforcementAction>,
+    severity: Option<Severity>,
+    code: Option<&'a str>,
+}
+
+impl ReportedViolation {
+    fn precedence(&self) -> Precedence<'_> {
+        Precedence {
+            action: Some(self.action),
+            severity: Some(self.severity),
+            code: Some(&self.rule_code),
+        }
     }
+}
+
+impl EvaluationOutcome {
+    /// The precedence of the winner the flat fields carry.
+    fn precedence(&self) -> Precedence<'_> {
+        Precedence {
+            action: self.action,
+            severity: self.severity,
+            code: self.rule_code.as_deref(),
+        }
+    }
+}
+
+/// The one order every winner in the engine is chosen by: the strongest
+/// resolved action first (Block > Flag > Monitor > none), then the highest
+/// severity, then the lowest rule code. `Ordering::Less` means `a` ranks
+/// ahead of `b`. It is total, and nothing in it depends on the order of the
+/// host's `rules` slice, so the result is deterministic.
+///
+/// Action comes first because the decision is the strongest action of the
+/// set: ranking by severity first let a violation whose action a policy
+/// softened (a `schema_migration_cap`, `monitor_mode`, a host's severity
+/// mapping) outrank one that blocks, and the weaker action became the
+/// decision (fixed in 4.2.0). It governs the order of
+/// [`EvaluationOutcome::violations`], the slot VERICTO-085 and VERICTO-087
+/// take in it, the MySQL reading kept when the text has several
+/// (VERICTO-086), and the parse-error floor of unread code.
+fn by_precedence(a: Precedence<'_>, b: Precedence<'_>) -> Ordering {
+    b.action
+        .cmp(&a.action)
+        .then_with(|| b.severity.cmp(&a.severity))
+        .then_with(|| a.code.cmp(&b.code))
+}
+
+/// True when `a` ranks strictly ahead of `b`: on a full tie the finding
+/// already in place stays.
+fn outranks(a: Precedence<'_>, b: Precedence<'_>) -> bool {
+    by_precedence(a, b) == Ordering::Less
+}
+
+/// Inserts an engine-driven violation (VERICTO-085, VERICTO-087) into the
+/// outcome's ordered set. When it ranks first it becomes the winner and takes
+/// the flat fields; otherwise the winner keeps them.
+fn merge_violation(outcome: &mut EvaluationOutcome, v: ReportedViolation) {
+    let pos = outcome
+        .violations
+        .iter()
+        .position(|o| outranks(v.precedence(), o.precedence()))
+        .unwrap_or(outcome.violations.len());
+    if pos == 0 {
+        outcome.decision = Decision::from_action(v.action);
+        outcome.action = Some(v.action);
+        outcome.severity = Some(v.severity);
+        outcome.rule_id = Some(v.rule_id.clone());
+        outcome.rule_code = Some(v.rule_code.clone());
+        outcome.ast_node_path = Some(v.ast_node_path.clone());
+        outcome.estimated_rows_affected = None;
+        outcome.suggested_safe_query = v.suggested_safe_query.clone();
+    }
+    outcome.violations.insert(pos, v);
 }
 
 /// Folds the sensitive-column verdict into the rule engine's outcome.
@@ -839,11 +922,10 @@ fn strictness(o: &EvaluationOutcome) -> u8 {
 /// Flag cannot let a blocked column through (nor a flagged column let a
 /// blocked DELETE through).
 ///
-/// - Column verdict strictly stricter: VERICTO-085 becomes the winner — the
-///   flat fields are its, and it is `violations[0]`.
-/// - Otherwise the rule winner keeps the flat fields and `violations[0]`;
-///   VERICTO-085 joins the rest of the vector at its (severity desc, code asc)
-///   position.
+/// VERICTO-085 joins `violations` at its place in the shared order (action,
+/// then severity, then code; see `by_precedence`). When that place is first it
+/// is the winner and the flat fields are its; otherwise the rule winner keeps
+/// them.
 ///
 /// Under `monitor_mode` a column block becomes a flag and a mask is NOT
 /// applied (dry-run never changes what runs); the would-be rewrite stays in
@@ -879,29 +961,7 @@ fn apply_sensitive(
         suggested_safe_query: verdict.suggested_safe_query,
     };
 
-    let column_decision = Decision::from_action(action);
-    let stricter = decision_rank(column_decision) > decision_rank(outcome.decision);
-    if stricter || outcome.violations.is_empty() {
-        outcome.decision = column_decision;
-        outcome.action = Some(action);
-        outcome.severity = Some(v.severity);
-        outcome.rule_id = Some(v.rule_id.clone());
-        outcome.rule_code = Some(v.rule_code.clone());
-        outcome.ast_node_path = Some(v.ast_node_path.clone());
-        outcome.estimated_rows_affected = None;
-        outcome.suggested_safe_query = v.suggested_safe_query.clone();
-        outcome.violations.insert(0, v);
-    } else {
-        let pos = outcome.violations[1..]
-            .iter()
-            .position(|o| match v.severity.cmp(&o.severity) {
-                Ordering::Greater => true,
-                Ordering::Equal => v.rule_code < o.rule_code,
-                Ordering::Less => false,
-            })
-            .map_or(outcome.violations.len(), |p| p + 1);
-        outcome.violations.insert(pos, v);
-    }
+    merge_violation(&mut outcome, v);
 
     outcome.rewritten_query = if verdict.outcome == SensitivePolicy::Mask
         && !policy.monitor_mode
@@ -919,10 +979,10 @@ fn apply_sensitive(
 /// then VERICTO-085).
 ///
 /// Like the column verdict, a floor: the final decision is the strictest.
-/// VERICTO-087 takes the flat fields only when it is **strictly** stricter, so
-/// a VERICTO-085 block keeps them (design §6.1 step 1: a `block` tag always
-/// wins) and otherwise joins `violations` at its (severity desc, code asc)
-/// position. A block clears any mask rewrite: a refused query is never
+/// VERICTO-087 joins `violations` at its place in the shared order and takes
+/// the flat fields only when it ranks first, so a VERICTO-085 block keeps
+/// them (same action and severity, lower code: design §6.1 step 1, a `block`
+/// tag always wins). A block clears any mask rewrite: a refused query is never
 /// forwarded, masked or not. Under `mode = observe` (and `monitor_mode`) it
 /// flags and never blocks, and an allowed mask keeps its rewrite (steps 3/4
 /// still apply).
@@ -945,29 +1005,7 @@ fn apply_access(
         estimated_rows_affected: None,
         suggested_safe_query: verdict.suggested_safe_query,
     };
-    let decision = Decision::from_action(action);
-    let stricter = decision_rank(decision) > decision_rank(outcome.decision);
-    if stricter || outcome.violations.is_empty() {
-        outcome.decision = decision;
-        outcome.action = Some(action);
-        outcome.severity = Some(v.severity);
-        outcome.rule_id = Some(v.rule_id.clone());
-        outcome.rule_code = Some(v.rule_code.clone());
-        outcome.ast_node_path = Some(v.ast_node_path.clone());
-        outcome.estimated_rows_affected = None;
-        outcome.suggested_safe_query = v.suggested_safe_query.clone();
-        outcome.violations.insert(0, v);
-    } else {
-        let pos = outcome.violations[1..]
-            .iter()
-            .position(|o| match v.severity.cmp(&o.severity) {
-                Ordering::Greater => true,
-                Ordering::Equal => v.rule_code < o.rule_code,
-                Ordering::Less => false,
-            })
-            .map_or(outcome.violations.len(), |p| p + 1);
-        outcome.violations.insert(pos, v);
-    }
+    merge_violation(&mut outcome, v);
     if outcome.decision == Decision::Block {
         outcome.rewritten_query = None;
     }
@@ -983,14 +1021,6 @@ fn union_denied(into: &mut Vec<DeniedRef>, more: Vec<DeniedRef>) {
     into.extend(more);
     into.sort();
     into.dedup();
-}
-
-fn decision_rank(d: Decision) -> u8 {
-    match d {
-        Decision::Allow => 0,
-        Decision::Flag => 1,
-        Decision::Block => 2,
-    }
 }
 
 // ---------------------------------------------------------------------------

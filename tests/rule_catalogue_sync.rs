@@ -8,7 +8,12 @@
 //! Both files are pulled in at compile time via `include_str!`, so the test runs
 //! with no filesystem access and works from any working directory.
 
-use std::collections::BTreeSet;
+//!
+//! Since 4.2.0 the engine also exports the catalogue (`STANDARD_RULES` /
+//! `standard_rules()`): its codes, severities and classes are checked against
+//! the README's catalogue and class tables, and against the evaluator.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 const EVALUATOR_SRC: &str = include_str!("../src/rules/evaluator.rs");
 const README_SRC: &str = include_str!("../README.md");
@@ -93,5 +98,136 @@ fn readme_catalogue_matches_evaluator() {
         "README rule catalogue is out of sync with src/rules/evaluator.rs\n  \
          implemented but undocumented (add to README): {missing_in_readme:?}\n  \
          documented but not implemented (remove from README or implement): {missing_in_impl:?}"
+    );
+}
+
+// ── The exported standard ruleset (4.2.0) ────────────────────────────────────
+
+use vericto_engine::{RuleClass, STANDARD_RULES, Severity};
+
+/// README catalogue rows with the severity of the `### <Severity>` heading they
+/// sit under, inside the "Standard rules" section.
+fn readme_severities() -> BTreeMap<String, Severity> {
+    let mut out = BTreeMap::new();
+    let mut in_section = false;
+    let mut severity = None;
+    for line in README_SRC.lines() {
+        if let Some(h) = line.strip_prefix("## ") {
+            in_section = h.starts_with("Standard rules");
+            severity = None;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some(h) = line.strip_prefix("### ") {
+            severity = Some(match h.trim() {
+                "Critical" => Severity::Critical,
+                "High" => Severity::High,
+                "Medium" => Severity::Medium,
+                "Low" => Severity::Low,
+                "Informational" => Severity::Informational,
+                other => panic!("unexpected severity heading `### {other}` in the catalogue"),
+            });
+            continue;
+        }
+        let Some(code) = line
+            .trim_start()
+            .strip_prefix("| ")
+            .and_then(take_code)
+            .filter(|c| {
+                line.trim_start()[2 + c.len()..]
+                    .trim_start()
+                    .starts_with('|')
+            })
+        else {
+            continue;
+        };
+        let sev = severity.unwrap_or_else(|| panic!("{code} sits under no severity heading"));
+        assert!(
+            out.insert(code.to_string(), sev).is_none(),
+            "{code} is listed twice in the README catalogue"
+        );
+    }
+    out
+}
+
+/// The README's "Rule classes" table: class → codes, ranges (`010–019`)
+/// expanded and kept to the codes the catalogue has.
+fn readme_classes(catalogue: &BTreeSet<String>) -> BTreeMap<String, RuleClass> {
+    let mut out = BTreeMap::new();
+    for line in README_SRC.lines() {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        // `| `Class` | codes | text |` → ["", "`Class`", "codes", "text", ""]
+        if cells.len() < 4 {
+            continue;
+        }
+        let class = match cells[1] {
+            "`SchemaMigration`" => RuleClass::SchemaMigration,
+            "`DataMutation`" => RuleClass::DataMutation,
+            "`Security`" => RuleClass::Security,
+            "`Performance`" => RuleClass::Performance,
+            _ => continue,
+        };
+        for item in cells[2].split(',').map(str::trim) {
+            let (lo, hi) = item.split_once('–').unwrap_or((item, item));
+            let (lo, hi): (u32, u32) = (
+                lo.parse().expect("a class code"),
+                hi.parse().expect("a class code"),
+            );
+            for n in lo..=hi {
+                let code = format!("VERICTO-{n:03}");
+                if catalogue.contains(&code) {
+                    out.insert(code, class);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn standard_rules_match_the_readme_catalogue() {
+    let exported: BTreeMap<String, Severity> = STANDARD_RULES
+        .iter()
+        .map(|r| (r.code.to_string(), r.severity))
+        .collect();
+    assert_eq!(exported.len(), STANDARD_RULES.len(), "duplicate codes");
+    assert_eq!(
+        exported,
+        readme_severities(),
+        "STANDARD_RULES (code, severity) differs from the README catalogue"
+    );
+}
+
+#[test]
+fn standard_rules_match_the_evaluator() {
+    let exported: BTreeSet<String> = STANDARD_RULES.iter().map(|r| r.code.to_string()).collect();
+    assert_eq!(
+        exported,
+        codes_in_evaluator(),
+        "STANDARD_RULES differs from the evaluator's match arms"
+    );
+}
+
+#[test]
+fn standard_rule_classes_match_the_readme_and_the_engine() {
+    let codes: BTreeSet<String> = STANDARD_RULES.iter().map(|r| r.code.to_string()).collect();
+    let readme = readme_classes(&codes);
+    for r in STANDARD_RULES {
+        assert_eq!(r.class, RuleClass::for_code(r.code), "{}", r.code);
+        assert_eq!(
+            readme.get(r.code),
+            Some(&r.class),
+            "{} has class {:?}; the README's class table says {:?}",
+            r.code,
+            r.class,
+            readme.get(r.code)
+        );
+    }
+    assert_eq!(
+        readme.len(),
+        codes.len(),
+        "the README's class table lists every code once"
     );
 }

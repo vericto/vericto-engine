@@ -976,7 +976,9 @@ fn precedence_with_sensitive_columns_follows_the_design_table() {
         (TagCase::Flag,  true,  Enforce, F, Some(S), false, &[S],    false),
         (TagCase::Flag,  true,  Observe, F, Some(S), false, &[S],    false),
         (TagCase::Flag,  false, Enforce, B, Some(X), false, &[X, S], true),
-        (TagCase::Flag,  false, Observe, F, Some(S), false, &[S, X], true),
+        // Both flag: the High 087 ranks ahead of the Medium `flag` tag (since
+        // 4.2.0 every winner is chosen by action, then severity, then code).
+        (TagCase::Flag,  false, Observe, F, Some(X), false, &[X, S], true),
     ];
     for &(tag, allowed, mode, decision, code, rewritten, codes, has_denied) in table {
         let o = precedence_case(tag, allowed, mode);
