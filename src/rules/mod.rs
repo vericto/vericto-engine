@@ -4,9 +4,12 @@
 //!   that orchestrates evaluation.
 //! - [`evaluator`]: logic that evaluates each rule (built-in and custom) against
 //!   the normalized AST.
+//! - [`standard`]: the standard ruleset (every built-in rule at its default)
+//!   and the engine and ruleset version strings.
 
 pub mod engine;
 pub mod evaluator;
+pub mod standard;
 
 /// Property-based tests (P1-P8) and example-based engine unit tests for the
 /// severity-based-enforcement feature. Test-only; not compiled into the lib.

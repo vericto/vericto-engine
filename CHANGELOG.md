@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.2.0] — 2026-10-18
+
+A security fix and a small additive API. **This release can block scripts that
+4.1.3 let through.** When a policy softened a high-severity violation (a CI
+channel's `schema_migration_cap`, or a host's severity mapping), 4.1.3 could let
+that violation decide for the whole evaluation and pass a script that also held
+a violation that blocks. 4.2.0 blocks those scripts. Nothing that 4.1.3 blocked
+is allowed now, and an evaluation whose violations all resolve to the same action
+gets the same decision and the same reported rule as before. The API additions
+change no existing signature.
+
+### Fixed
+
+- **The decision could be weaker than one of the violations.** The engine chose
+  the winning violation by severity first, then by the lowest code, and only then
+  used that violation's resolved action as the decision. When a policy resolved
+  the higher-ranked violation to a weaker action, that weaker action decided.
+  Under a CI policy (`schema_migration_cap = Some(Flag)`), the script
+  `DROP TABLE a; UPDATE accounts SET balance = 0;` reported the DROP
+  (VERICTO-010, Critical, capped to Flag) ahead of the UPDATE without WHERE
+  (VERICTO-030, also Critical, which blocks). The whole evaluation was a Flag, and
+  the file passed the check. The same happened to any evaluation where a
+  higher-ranked rule resolved to a weaker action, for example a capped DROP ahead
+  of a High `INSERT … SELECT` with no filter (VERICTO-040), or a host policy that
+  maps Critical to Flag. The CLI offline-mode spike found it. Online checks were
+  exposed wherever a whole script is evaluated as one unit.
+  Since 4.2.0 the decision is the strongest resolved action across all
+  violations (Block, then Flag, then Monitor), so it is never weaker than any
+  single violation's action. The reported winner is the violation that holds that
+  action: among those with the same action, the highest severity wins, then the
+  lowest rule code, so the result stays deterministic and never depends on the
+  order of the `rules` slice. The script above now blocks with VERICTO-030.
+  Without the cap it still blocks with VERICTO-010, as before. `monitor_mode`
+  still turns every block into a flag.
+  One comparator now governs every place a winner is chosen:
+  - the order of `EvaluationOutcome::violations` (action, then severity, then
+    code; `violations[0]` is still the winner);
+  - the place VERICTO-085 (sensitive columns) and VERICTO-087 (agent allowlists)
+    take in that list, and whether they take the flat fields;
+  - the reading kept when MySQL may read the text in several ways (VERICTO-086
+    alternatives);
+  - the parse-error floor for Snowflake and SQLite code the engine does not read.
+  **Reporting changes, no change to what is blocked:**
+  - when the engine-driven codes share an action with a rule, they now rank by
+    severity like any rule. A `mask` tag (VERICTO-085, High, Flag) next to
+    VERICTO-050 (Medium, Flag) now reports VERICTO-085 as the winner. The
+    decision is still Flag, and the rewrite is still forwarded.
+  - an `observe` allowlist denial (VERICTO-087, High, Flag) now outranks a `flag`
+    tag (VERICTO-085, Medium, Flag).
+  - in the golden corpora, two MySQL ORM lines under the `tags` policy changed
+    their winner from VERICTO-050 to VERICTO-085, for that reason. The Snowflake
+    and SQLite corpora are unchanged.
+  A new property test checks that the decision equals the maximum of each
+  violation's resolved action, for any order of the rules (Property 11). The
+  ordering property (Property 10) now checks action, then severity, then code.
+  The regression tests run on all six dialects.
+
+### Added
+
+- **`standard_rules()` and `STANDARD_RULES`: the standard ruleset.** These hold
+  all 42 built-in rules at their default severity. `standard_rules()` returns a
+  `Vec<Rule>` that you can pass to `evaluate`. Each `StandardRule` entry in
+  `STANDARD_RULES` holds the rule's code, severity, `RuleClass` and default
+  action. Its `engine_driven` field marks VERICTO-085, 086 and 087, which the
+  policy drives. A host with no ruleset of its own can use this table instead of
+  keeping a copy: the proxy uses one when its rule sync fails, and the CLI's
+  offline mode needs one. `tests/rule_catalogue_sync.rs` keeps it equal to the
+  README catalogue (codes and severities), to the README's class table, and to
+  the evaluator.
+- **`ENGINE_VERSION` and `STANDARD_RULESET_VERSION`.** `ENGINE_VERSION` is the
+  crate version (`"4.2.0"`). `STANDARD_RULESET_VERSION` is
+  `standard@<engine version>` (`"standard@4.2.0"`). Hosts can print them with a
+  verdict to record what it was evaluated with.
+
 ## [4.1.3] — 2026-10-18
 
 Four evaluation fixes, found by the tests that pin them (the walker coverage
@@ -1832,7 +1906,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.1.3...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.2.0...HEAD
+[4.2.0]: https://github.com/vericto/vericto-engine/compare/v4.1.3...v4.2.0
 [4.1.3]: https://github.com/vericto/vericto-engine/compare/v4.1.2...v4.1.3
 [4.1.2]: https://github.com/vericto/vericto-engine/compare/v4.1.1...v4.1.2
 [4.1.1]: https://github.com/vericto/vericto-engine/compare/v4.1.0...v4.1.1

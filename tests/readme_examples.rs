@@ -181,3 +181,30 @@ fn agent_access_example() {
     );
     assert_eq!(probe.access_denied[0].column.as_deref(), Some("email"));
 }
+
+#[test]
+fn standard_ruleset_example() {
+    use vericto_engine::{
+        Decision, Dialect, ENGINE_VERSION, EnforcementAction, EnforcementPolicy,
+        STANDARD_RULESET_VERSION, evaluate, standard_rules,
+    };
+
+    let sql = "DROP TABLE a; UPDATE accounts SET balance = 0;";
+    let outcome = evaluate(
+        sql,
+        Dialect::Postgres,
+        &standard_rules(),
+        &EnforcementPolicy::default(),
+    );
+    let line = format!("{:?} ({STANDARD_RULESET_VERSION})", outcome.decision);
+    assert_eq!(line, format!("Block (standard@{ENGINE_VERSION})"));
+
+    // The README's 4.2.0 example: under a CI cap the UPDATE still blocks.
+    let ci = EnforcementPolicy {
+        schema_migration_cap: Some(EnforcementAction::Flag),
+        ..EnforcementPolicy::default()
+    };
+    let outcome = evaluate(sql, Dialect::Postgres, &standard_rules(), &ci);
+    assert_eq!(outcome.decision, Decision::Block);
+    assert_eq!(outcome.rule_code.as_deref(), Some("VERICTO-030"));
+}

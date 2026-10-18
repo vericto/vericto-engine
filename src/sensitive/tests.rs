@@ -691,8 +691,9 @@ fn the_column_verdict_is_a_floor_over_the_rules() {
     assert_eq!(o.violations[0].rule_code, "VERICTO-085");
     assert_eq!(o.violations[1].rule_code, "VERICTO-001");
 
-    // A mask under a flagging rule: the rule keeps the flat fields, the
-    // rewrite still applies.
+    // A mask under a flagging rule: both flag, so the mask (High) ranks
+    // ahead of the Medium rule and takes the flat fields (since 4.2.0); the
+    // rewrite applies either way.
     let p = policy(vec![masked("customers", "email", Full)]);
     let o = crate::evaluate(
         "SELECT email FROM customers",
@@ -701,7 +702,28 @@ fn the_column_verdict_is_a_floor_over_the_rules() {
         &p,
     );
     assert_eq!(o.decision, Decision::Flag);
+    assert_eq!(o.rule_code.as_deref(), Some("VERICTO-085"));
+    assert_eq!(o.violations[1].rule_code, "VERICTO-050");
+    // A High flagging rule ties the mask on action and severity: the lower
+    // code, VERICTO-050, keeps the flat fields.
+    let o = crate::evaluate(
+        "SELECT email FROM customers",
+        Dialect::Postgres,
+        &[rule("VERICTO-050", Severity::High)],
+        &EnforcementPolicy {
+            high: EnforcementAction::Flag,
+            ..p.clone()
+        },
+    );
+    assert_eq!(o.decision, Decision::Flag);
     assert_eq!(o.rule_code.as_deref(), Some("VERICTO-050"));
+    assert!(o.rewritten_query.is_some());
+    let o = crate::evaluate(
+        "SELECT email FROM customers",
+        Dialect::Postgres,
+        &[rule("VERICTO-050", Severity::Medium)],
+        &p,
+    );
     assert_eq!(
         o.rewritten_query.as_deref(),
         Some("SELECT '[redacted]'::text AS email FROM customers")
