@@ -67,11 +67,24 @@ export LIBCLANG_PATH=$(brew --prefix llvm)/lib
 
 vericto-engine is source-available under the [Elastic License 2.0](LICENSE).
 Before your first pull request can be merged, you need to sign the Vericto
-Contributor License Agreement (CLA). It gives Vericto S.A.S. the rights it needs to
-distribute your contribution as part of the project, under the Elastic License 2.0 and
-under the commercial licenses it offers.
+Contributor License Agreement (CLA), version 1.0, in [CLA.md](CLA.md). It gives
+Vericto S.A.S. the rights it needs to distribute your contribution as part of the
+project, under the Elastic License 2.0 and under the commercial licenses it offers.
 
-A bot comments on your first pull request with a link to read and sign the agreement
-with your GitHub account. The signature is recorded once and applies to your later
-pull requests. If you contribute on behalf of an employer, write to
+On your first pull request, the `CLA` check comments with a link to the agreement and
+fails until every author of a commit in the pull request has signed. To sign, read the
+agreement, then post this comment on the pull request, exactly as written:
+
+```
+I have read the CLA Document and I hereby sign the CLA
+```
+
+The check records your GitHub username and account id, the pull request, your comment
+and its time on this repository's `cla-signatures` branch, and passes. The signature
+applies to your later pull requests here. If the check does not rerun on its own,
+comment `recheck`. A commit whose email is not linked to a GitHub account cannot be
+signed for: add the email to your account, or amend the commit. When the pull request
+is closed, its conversation is locked so that the signature comment stays as it was.
+
+If you contribute on behalf of an employer, write to
 [legal@vericto.com](mailto:legal@vericto.com) before opening the pull request.
