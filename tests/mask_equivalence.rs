@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Equivalence of the VERICTO-085 mask rewrite (design §12): run the original
 //! and the rewritten query against the same Postgres fixture and require that
 //! every non-masked column is identical, row for row, and every masked column

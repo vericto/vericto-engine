@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Verdicts the sqlparser 0.52 → 0.63 upgrade (3.9.0) must keep, or changes
 //! it makes on purpose, pinned on statements taken from the existing test
 //! suites, documentation and traffic fixtures.

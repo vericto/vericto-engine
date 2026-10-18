@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Custom-rule YAML compatibility (`ast_condition_yaml`).
 //!
 //! The YAML here is the YAML users already write: the rule templates the

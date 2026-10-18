@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Guard: every dependency snippet a consumer might copy must name this repo and
 //! this version.
 //!

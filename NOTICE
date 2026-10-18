@@ -1,4 +1,32 @@
 vericto-engine
 Copyright 2026 Vericto S.A.S.
 
-Licensed under the Elastic License 2.0. See LICENSE.
+This software is licensed under the Functional Source License, Version 1.1,
+ALv2 Future License (SPDX-License-Identifier: FSL-1.1-ALv2). The full terms
+are in LICENSE.
+
+Future license: each version of this software is also licensed under the
+Apache License, Version 2.0 (SPDX-License-Identifier: Apache-2.0) from the
+second anniversary of the date Vericto S.A.S. makes that version available,
+as the "Grant of Future License" section of LICENSE states.
+
+The FSL applies from version 4.3.0. Versions 4.2.0 and earlier, and every
+commit before the one that introduced the FSL, were released under the
+Elastic License 2.0 (SPDX-License-Identifier: Elastic-2.0) and remain under
+it. See LICENSING.md.
+
+"Vericto" and the Vericto logo are trademarks of Vericto S.A.S. The licenses
+grant no right to use them; see TRADEMARKS.md.
+
+Third-party material in this repository:
+
+- tests/fixtures/snowflake_corpus.sql holds SQL statements taken from
+  dbt-labs/jaffle_shop and dbt-labs/dbt-adapters (Apache License 2.0),
+  get-select/dbt-snowflake-monitoring and tobymao/sqlglot (MIT License). They
+  are test input only and are not compiled into the library. Their copyright
+  notices and license texts are in tests/fixtures/snowflake_corpus.LICENSES.
+
+The crates this library depends on (pg_query, which compiles libpg_query and
+parts of PostgreSQL, sqlparser, serde, serde_json, serde_norway, tracing and
+thiserror) are downloaded by Cargo under their own licenses and are not part
+of this repository.

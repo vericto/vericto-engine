@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Agent access allowlists (VERICTO-087).
 //!
 //! The host gives the identity making the call (an API key, or the database

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Regression corpus: queries shaped like the ones Rails (ActiveRecord +
 //! mysql2), Hibernate, Django, Prisma and Sequelize send to MySQL, including
 //! string literals with backslash escapes and quotes, and the comments some of

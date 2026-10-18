@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! MySQL lexical normalization: the text MySQL executes, before any rule runs.
 //!
 //! sqlparser's tokenizer is not MySQL's lexer, and the two disagree on text a

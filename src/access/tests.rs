@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! VERICTO-087 unit tests: every evasion form of VERICTO-085's suite applied
 //! to the allowlist, writes, DDL, the catalogue, name resolution, the
 //! precedence with VERICTO-085 (design §6.1), observe mode, `None` and the

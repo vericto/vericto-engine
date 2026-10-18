@@ -65,11 +65,20 @@ export LIBCLANG_PATH=$(brew --prefix llvm)/lib
 
 ## License and Contributor License Agreement
 
-vericto-engine is source-available under the [Elastic License 2.0](LICENSE).
+vericto-engine is source-available under the
+[Functional Source License, Version 1.1, ALv2 Future License](LICENSE) (FSL-1.1-ALv2)
+since 4.3.0; each version becomes Apache-2.0 two years after it is released
+([LICENSING.md](LICENSING.md)).
 Before your first pull request can be merged, you need to sign the Vericto
 Contributor License Agreement (CLA), version 1.0, in [CLA.md](CLA.md). It gives
 Vericto S.A.S. the rights it needs to distribute your contribution as part of the
-project, under the Elastic License 2.0 and under the commercial licenses it offers.
+project: under the project's license (the FSL, and the Apache License 2.0 once a
+version converts) and under the commercial licenses it offers. CLA 1.0 names the
+Elastic License 2.0, the project's license when it was written; its section 2 also
+covers later and other licenses, so it applies unchanged.
+New source files start with the same two SPDX lines as the existing ones
+(`SPDX-FileCopyrightText: 2026 Vericto S.A.S.` and
+`SPDX-License-Identifier: FSL-1.1-ALv2`).
 
 On your first pull request, the `CLA` check comments with a link to the agreement and
 fails until every author of a commit in the pull request has signed. To sign, read the

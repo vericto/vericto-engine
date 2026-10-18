@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Compile-check that the code snippets in README.md match the real API.
 //! If the API changes, these fail to compile and the README must be updated.
 

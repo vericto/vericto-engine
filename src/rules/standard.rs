@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! The standard ruleset: every built-in rule at its default severity.
 //!
 //! Hosts need it when they have no ruleset of their own to pass: the proxy

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! The decision is the strongest resolved action over every violation, and the
 //! winner reported in the flat fields is the violation that holds it.
 //!

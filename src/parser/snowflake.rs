@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Snowflake AST parser.
 //!
 //! Uses `sqlparser-rs` with `SnowflakeDialect`, walked by the shared

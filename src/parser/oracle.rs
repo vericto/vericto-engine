@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Parser AST para Oracle SQL.
 //!
 //! Uses `sqlparser-rs` with `GenericDialect` as the closest approximation to

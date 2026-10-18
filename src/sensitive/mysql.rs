@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! MySQL front end and renderer for VERICTO-085.
 //!
 //! sqlparser is not MySQL. Where the two read the same text differently, the

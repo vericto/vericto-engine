@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! VERICTO-085 on SQLite against a real SQLite (design §8, "mask equivalence:
 //! SQLite in CI against a real sqlite3"): every mask rewrite is run through
 //! the `sqlite3` command-line shell over values that exercise the edge cases

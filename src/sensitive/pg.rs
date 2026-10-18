@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Sensitive-column derivation and mask rewrite over the `pg_query` AST.
 //!
 //! The walk runs on a **clone** of the parse tree, because the same pass that

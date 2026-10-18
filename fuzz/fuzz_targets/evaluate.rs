@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Fuzz target: the public parse + evaluate entry point on arbitrary input.
 //!
 //! The first byte selects the dialect; the rest, when it is UTF-8 and within
