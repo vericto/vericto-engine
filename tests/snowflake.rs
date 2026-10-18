@@ -1528,6 +1528,21 @@ fn vericto_085_snowflake_refuses_what_it_cannot_rewrite() {
     }
 }
 
+// FINDING (reported to the owner, not fixed here): `snowflake_order_refusal`
+// refuses `ORDER BY ALL` over masked outputs (Snowflake would sort by the
+// masked values, so the rewrite changes the result order), but sqlparser
+// 0.63's Snowflake dialect does not read `ORDER BY ALL`: it parses `ALL` as a
+// column, the refusal never runs, and the rewrite is forwarded with
+// `ORDER BY ALL` intact. The values stay masked (no disclosure); the order
+// differs from the client's query, which the same check refuses for
+// `ORDER BY note` and `ORDER BY 1` above.
+#[test]
+#[ignore = "finding: Snowflake ORDER BY ALL over a masked output is rewritten, not refused"]
+fn vericto_085_snowflake_refuses_order_by_all() {
+    let path = refused("SELECT note FROM customers ORDER BY ALL");
+    assert!(path.contains("ORDER BY ALL"), "{path}");
+}
+
 /// The rewrite is parsed back and must be the rewritten tree.
 #[test]
 fn vericto_085_snowflake_rewrite_reparses() {

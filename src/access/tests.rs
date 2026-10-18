@@ -1159,6 +1159,50 @@ fn analysis_too_deep_fails_closed() {
     assert_eq!(o.decision, Decision::Block, "{o:?}");
 }
 
+/// `SELECT id FROM orders WHERE id = (SELECT (SELECT … 1))`, `n` levels.
+fn nested_scalar_subqueries(n: usize) -> String {
+    format!(
+        "SELECT id FROM orders WHERE id = {}1{}",
+        "(SELECT ".repeat(n),
+        ")".repeat(n)
+    )
+}
+
+#[test]
+fn a_walk_that_cannot_finish_fails_closed_with_its_reason() {
+    // Twelve levels parse (the parser's own limit is higher) but exhaust the
+    // access walk's MAX_AST_DEPTH budget: the statement may reference
+    // anything, so VERICTO-087 blocks it and says why, instead of
+    // allowing what it could not read.
+    let sql = nested_scalar_subqueries(12);
+    assert!(crate::parser::parser_for(Postgres).parse(&sql).is_ok());
+    let o = eval(Postgres, &sql, &agent());
+    assert_eq!(o.decision, Decision::Block, "{o:?}");
+    assert_eq!(o.rule_code.as_deref(), Some(ACCESS_RULE_CODE));
+    assert!(
+        o.ast_node_path
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("AccessPolicy > query could not be analysed for access"),
+        "{o:?}"
+    );
+    assert!(o.access_denied.is_empty(), "{:?}", denied(&o));
+    // Observe mode reports the same thing without blocking.
+    let observe = AccessPolicy {
+        mode: AccessMode::Observe,
+        ..agent()
+    };
+    let o = eval(Postgres, &sql, &observe);
+    assert_eq!(o.decision, Decision::Flag, "{o:?}");
+    // Shallow nesting is analysed normally.
+    assert_allowed(&nested_scalar_subqueries(3));
+    // On the sqlparser dialects the parser stops first: an AST-too-deep parse
+    // error, which an enforced allowlist blocks.
+    let o = eval(Mysql, &nested_scalar_subqueries(16), &agent());
+    assert_eq!(o.decision, Decision::Block, "{o:?}");
+    assert_eq!(o.rule_code.as_deref(), Some("VERICTO-PARSE-ERROR"));
+}
+
 // ── None: no change, and no cost ────────────────────────────────────────────
 
 /// Queries of every kind, for the "no policy = 3.7.0" checks.
@@ -1474,6 +1518,64 @@ fn session_boilerplate_is_allowed_for_an_identity_with_no_grants() {
         with(none).effective_parse_error_for("SET GLOBAL max_connections = 1", Mysql),
         ParseErrorAction::Block
     );
+}
+
+#[test]
+fn the_session_text_list_is_closed() {
+    // The text-level list hosts consult for statements the parser may reject
+    // (`effective_parse_error_for`). It exempts the closed list from the
+    // enforced allowlist's parse-error block, and nothing else.
+    let p = with(allow(Vec::new()));
+    for (d, sql) in [
+        (Mysql, "START TRANSACTION WITH CONSISTENT SNAPSHOT"),
+        (Mysql, "BEGIN WORK"),
+        (Postgres, "BEGIN TRANSACTION READ ONLY, NOT DEFERRABLE"),
+        (Mysql, "COMMIT AND CHAIN"),
+        (Mysql, "COMMIT WORK AND NO CHAIN"),
+        (Postgres, "ROLLBACK TO s1"),
+        (Postgres, "RELEASE s1"),
+        (Postgres, "SET LOCAL statement_timeout = 0"),
+        (Postgres, "SET TIME ZONE INTERVAL '+00:00' HOUR TO MINUTE"),
+        (Postgres, "SET standard_conforming_strings = on"),
+        // A doubled quote inside a literal, and one trailing `;`.
+        (Postgres, "SET application_name = 'it''s'"),
+        (Postgres, "SET extra_float_digits = 3;"),
+        // sql_mode: a literal without a lexing mode, DEFAULT, or the current
+        // mode extended next to a comma.
+        (Mysql, "SET sql_mode = 'STRICT_TRANS_TABLES'"),
+        (Mysql, "SET sql_mode = DEFAULT"),
+        (Mysql, "SET sql_mode = CONCAT(@@sql_mode, ',NO_ZERO_DATE')"),
+        (Mysql, "SET sql_mode = 'TRADITIONAL', time_zone = '+00:00'"),
+    ] {
+        assert_eq!(
+            p.effective_parse_error_for(sql, d),
+            ParseErrorAction::AllowReport,
+            "{d:?} {sql} is session boilerplate"
+        );
+    }
+    for (d, sql) in [
+        // A backslash: where the literal ends depends on the escape mode.
+        (Mysql, r"SET application_name = 'a\'b'"),
+        (Mysql, "COMMIT AND"),
+        (Postgres, "SET standard_conforming_strings = off"),
+        (Mysql, "SET sql_mode = 'ANSI_QUOTES'"),
+        // `@@sql_mode` glued to a literal could complete a lexing mode name.
+        (Mysql, "SET sql_mode = CONCAT(@@sql_mode, 'X')"),
+        (Mysql, "SET sql_mode = 'a', 'b'"),
+        (Mysql, "SET @x = 1"),
+        (Postgres, "SET search_path = public"),
+        (Mysql, "SAVEPOINT @x"),
+        // `--` without a space is not a MySQL comment: unrecognised text.
+        (Mysql, "SET time_zone = '+00:00' --c"),
+        (Mysql, "BEGIN; DROP TABLE jobs"),
+        (Mysql, "SET NAMES utf8mb4 COLLATE"),
+    ] {
+        assert_eq!(
+            p.effective_parse_error_for(sql, d),
+            ParseErrorAction::Block,
+            "{d:?} {sql} is not on the list"
+        );
+    }
 }
 
 #[test]
@@ -2055,4 +2157,383 @@ fn unparseable_statements_off_the_session_list_still_block_with_tags() {
             "{d:?} {sql}"
         );
     }
+}
+
+// ── Statement classes and clauses of the sqlparser dialects ─────────────────
+//
+// `access/sql.rs` decides, per statement, walk / allow / deny; the walk is
+// `sensitive/sql.rs` in access mode, which must visit every clause that
+// names a column. The cases below are the forms the Postgres-first suite
+// above does not reach.
+
+/// Denied by VERICTO-087 with exactly the references in `want`.
+#[track_caller]
+fn assert_denied_exactly_on(dialect: Dialect, sql: &str, want: &[&str]) {
+    let o = eval(dialect, sql, &agent());
+    assert_eq!(
+        o.decision,
+        Decision::Block,
+        "{dialect:?} {sql} must be denied: {o:?}"
+    );
+    assert_eq!(
+        o.rule_code.as_deref(),
+        Some(ACCESS_RULE_CODE),
+        "{sql}: {o:?}"
+    );
+    assert_eq!(denied(&o), want, "{dialect:?} {sql}");
+}
+
+#[test]
+fn more_ddl_is_denied_with_its_own_name_on_postgres() {
+    for (sql, what) in [
+        (
+            "CREATE MATERIALIZED VIEW mv AS SELECT id FROM orders",
+            "CREATE MATERIALIZED VIEW:ddl",
+        ),
+        // Role membership: GRANT / REVOKE of a role, not of a privilege.
+        ("GRANT admin TO bob", "GRANT:ddl"),
+        ("REVOKE admin FROM bob", "REVOKE:ddl"),
+        ("ALTER TABLE jobs RENAME TO j2", "ALTER … RENAME:ddl"),
+        // Kinds without a dedicated name are denied under their node's name.
+        ("CREATE EXTENSION hstore", "CREATE EXTENSION:ddl"),
+    ] {
+        assert_denied_exactly_on(Postgres, sql, &[what]);
+    }
+    // `standard_conforming_strings` may only be (re)set on: every spelling.
+    for sql in [
+        "SET standard_conforming_strings = on",
+        "SET standard_conforming_strings = 'on'",
+        "SET standard_conforming_strings = 1",
+        "SET standard_conforming_strings = true",
+    ] {
+        assert_allowed(sql);
+    }
+    // EXPLAIN takes the class of the statement it explains.
+    assert_allowed("EXPLAIN SELECT id FROM orders");
+    assert_denied(
+        "EXPLAIN SELECT email FROM customers",
+        "customers.email:read",
+    );
+    // A sampled relation is still the relation.
+    assert_allowed("SELECT id FROM orders TABLESAMPLE SYSTEM (10)");
+    assert_denied(
+        "SELECT id FROM customers TABLESAMPLE SYSTEM (10) WHERE email = 'x'",
+        "customers.email:read",
+    );
+}
+
+#[test]
+fn mysql_set_values_built_from_literals_and_the_current_mode_are_allowed() {
+    for sql in [
+        // A user variable set to a literal (or a signed literal).
+        "SET @v = 1",
+        "SET @v = -1",
+        "SET @@SESSION.time_zone = '+00:00'",
+        "SET time_zone = '+00:00', autocommit = 1",
+        // `sql_mode` back to its default, or to the current mode (possibly
+        // extended with a literal): nothing the engine cannot read.
+        "SET sql_mode = DEFAULT",
+        "SET sql_mode = @@sql_mode",
+        "SET sql_mode = @@SESSION.sql_mode",
+        "SET sql_mode = (@@sql_mode)",
+        "SET sql_mode = CONCAT(@@sql_mode, ',STRICT_TRANS_TABLES')",
+        "SET NAMES utf8mb4",
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        // Session-only SHOW and EXPLAIN of an allowed statement.
+        "SHOW CHARSET",
+        "SHOW CHARACTER SET",
+        "SHOW VARIABLES LIKE 'x'",
+        "SHOW STATUS",
+        "SHOW WARNINGS",
+        "SHOW ENGINES",
+        "EXPLAIN SELECT id FROM orders",
+        "UNLOCK TABLES",
+    ] {
+        assert_allowed_on(Mysql, sql, &agent());
+    }
+    for (sql, what) in [
+        ("SET @v = 1 + 1", "SET (computed value):ddl"),
+        // CONCAT with a modifier is not the plain concatenation.
+        (
+            "SET sql_mode = CONCAT(DISTINCT @@sql_mode)",
+            "SET sql_mode:ddl",
+        ),
+        (
+            "SET standard_conforming_strings = 0",
+            "SET standard_conforming_strings:ddl",
+        ),
+        ("EXPLAIN DROP TABLE jobs", "DROP:ddl"),
+        ("TRUNCATE TABLE jobs", "TRUNCATE:ddl"),
+        ("DEALLOCATE PREPARE s", "DEALLOCATE:ddl"),
+    ] {
+        assert_denied_exactly_on(Mysql, sql, &[what]);
+    }
+}
+
+#[test]
+fn mysql_catalogue_describe_and_locks_need_their_grants() {
+    for (sql, want) in [
+        // SHOW reads the information_schema view it is built on.
+        ("SHOW TABLES", "information_schema.TABLES:read"),
+        ("SHOW FULL TABLES", "information_schema.TABLES:read"),
+        (
+            "SHOW COLUMNS FROM orders",
+            "information_schema.COLUMNS:read",
+        ),
+        ("SHOW DATABASES", "information_schema.SCHEMATA:read"),
+        ("SHOW CREATE TABLE orders", "information_schema.TABLES:read"),
+        // SHOW forms the parser does not model, and the ones that reveal
+        // other sessions or privileges, are denied outright.
+        ("SHOW FUNCTION STATUS", "SHOW FUNCTION STATUS:ddl"),
+        ("SHOW PROCESSLIST", "SHOW PROCESSLIST:ddl"),
+        ("SHOW GRANTS", "SHOW GRANTS:ddl"),
+        // DESCRIBE is the table's structure: every column.
+        ("DESCRIBE customers", "customers.*:read"),
+        // Any table lock stalls writers: it needs write, READ lock included.
+        ("LOCK TABLES orders READ", "orders:write"),
+    ] {
+        assert_denied_exactly_on(Mysql, sql, &[want]);
+    }
+    assert_allowed_on(Mysql, "DESCRIBE orders", &agent());
+    assert_allowed_on(Mysql, "LOCK TABLES jobs WRITE", &agent());
+}
+
+#[test]
+fn mysql_write_clauses_are_read_and_multi_table_deletes_need_write() {
+    // UPDATE / DELETE … ORDER BY … LIMIT read the ordering column.
+    assert_denied_exactly_on(
+        Mysql,
+        "UPDATE tickets SET status = 'x' WHERE id = 1 ORDER BY priority LIMIT 1",
+        &["tickets.priority:read"],
+    );
+    assert_allowed_on(
+        Mysql,
+        "DELETE FROM jobs ORDER BY created LIMIT 10",
+        &agent(),
+    );
+    assert_denied_exactly_on(
+        Mysql,
+        "DELETE FROM jobs WHERE id IN (SELECT id FROM customers WHERE email = 'x')",
+        &["customers.email:read"],
+    );
+    // `DELETE t FROM …`: the listed targets lose rows, not every relation.
+    assert_allowed_on(
+        Mysql,
+        "DELETE j FROM jobs j JOIN orders o ON o.id = j.id",
+        &agent(),
+    );
+    assert_denied_exactly_on(
+        Mysql,
+        "DELETE o FROM jobs j JOIN orders o ON o.id = j.id",
+        &["orders:write"],
+    );
+    // A target naming nothing in scope is taken as a table (conservative).
+    assert_denied_exactly_on(
+        Mysql,
+        "DELETE x FROM jobs j JOIN orders o ON o.id = j.id",
+        &["x:write"],
+    );
+    // GROUP BY … WITH ROLLUP, named windows, USING and NATURAL joins and
+    // MATCH … AGAINST all name columns.
+    for (sql, want) in [
+        (
+            "SELECT id FROM customers GROUP BY email WITH ROLLUP",
+            "customers.email:read",
+        ),
+        (
+            "SELECT ROW_NUMBER() OVER w FROM customers WINDOW w AS (ORDER BY email)",
+            "customers.email:read",
+        ),
+        (
+            "SELECT id FROM orders o JOIN customers c USING (email)",
+            "customers.email:read",
+        ),
+        (
+            "SELECT o.id FROM orders o NATURAL JOIN customers c",
+            "customers.*:read",
+        ),
+        (
+            "SELECT MATCH(email) AGAINST ('x') FROM customers",
+            "customers.email:read",
+        ),
+    ] {
+        assert_denied_exactly_on(Mysql, sql, &[want]);
+    }
+}
+
+#[test]
+fn sqlite_upserts_and_update_from_read_every_column_they_name() {
+    assert_allowed_on(
+        Sqlite,
+        "UPDATE tickets SET status = 'x' FROM orders o WHERE o.id = tickets.id",
+        &agent(),
+    );
+    assert_allowed_on(
+        Sqlite,
+        "INSERT INTO tickets (id, status) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET status = excluded.status WHERE tickets.note = 'x'",
+        &agent(),
+    );
+    for (sql, want) in [
+        (
+            "UPDATE tickets SET status = 'x' FROM customers c WHERE c.email = tickets.note",
+            "customers.email:read",
+        ),
+        // The conflict target and the DO UPDATE … WHERE are reads.
+        (
+            "INSERT INTO tickets (id, status) VALUES (1, 'a') ON CONFLICT (priority) DO NOTHING",
+            "tickets.priority:read",
+        ),
+        (
+            "INSERT INTO tickets (id, status) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET status = 'b' WHERE tickets.priority = 1",
+            "tickets.priority:read",
+        ),
+        (
+            "DELETE FROM tickets WHERE id = 1 RETURNING priority",
+            "tickets.priority:read",
+        ),
+    ] {
+        assert_denied_exactly_on(Sqlite, sql, &[want]);
+    }
+}
+
+#[test]
+fn sql_server_output_needs_read_and_output_into_is_denied() {
+    assert_allowed_on(
+        MsSql,
+        "INSERT INTO tickets (id) OUTPUT inserted.id VALUES (1)",
+        &agent(),
+    );
+    assert_allowed_on(
+        MsSql,
+        "UPDATE tickets SET status = 'x' OUTPUT inserted.note WHERE id = 1",
+        &agent(),
+    );
+    for (sql, want) in [
+        (
+            "DELETE FROM tickets OUTPUT deleted.priority WHERE id = 1",
+            "tickets.priority:read",
+        ),
+        (
+            "UPDATE tickets SET status = 'x' OUTPUT inserted.priority WHERE id = 1",
+            "tickets.priority:read",
+        ),
+        // OUTPUT … INTO writes a table the clause names: denied outright,
+        // even into a table granted read/write.
+        (
+            "INSERT INTO tickets (id) OUTPUT inserted.id INTO jobs VALUES (1)",
+            "OUTPUT INTO:ddl",
+        ),
+        ("CREATE VIEW v AS SELECT id FROM orders", "CREATE VIEW:ddl"),
+        ("GRANT SELECT ON orders TO bob", "GRANT:ddl"),
+        ("REVOKE SELECT ON orders FROM bob", "REVOKE:ddl"),
+        ("CREATE INDEX i ON jobs (id)", "CREATE INDEX:ddl"),
+    ] {
+        assert_denied_exactly_on(MsSql, sql, &[want]);
+    }
+}
+
+#[test]
+fn snowflake_session_stage_and_catalogue_statements() {
+    assert_allowed_on(Snowflake, "ALTER SESSION SET QUERY_TAG = 'x'", &agent());
+    for (sql, want) in [
+        // It changes how every name resolves.
+        (
+            "ALTER SESSION SET QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE",
+            "ALTER SESSION SET QUOTED_IDENTIFIERS_IGNORE_CASE:ddl",
+        ),
+        ("ALTER SESSION UNSET QUERY_TAG", "ALTER SESSION UNSET:ddl"),
+        // Stages move data in and out of the account.
+        ("LIST @stage", "LIST:ddl"),
+        ("PUT file:///tmp/x @stage", "PUT:ddl"),
+        ("CREATE STAGE s", "CREATE STAGE:ddl"),
+        ("COPY INTO jobs FROM @stage", "COPY INTO:ddl"),
+        ("CREATE WAREHOUSE w", "CREATE WAREHOUSE:ddl"),
+        ("USE DATABASE x", "USE:ddl"),
+        // A scripting block's control flow is not analysed.
+        ("BEGIN SELECT 1; END", "BEGIN … END block:ddl"),
+        // The catalogue, spelled the way Snowflake stores it.
+        ("SHOW TABLES", "INFORMATION_SCHEMA.TABLES:read"),
+        ("SHOW VIEWS", "INFORMATION_SCHEMA.VIEWS:read"),
+        ("SHOW FUNCTIONS", "INFORMATION_SCHEMA.ROUTINES:read"),
+        ("SHOW SCHEMAS", "INFORMATION_SCHEMA.SCHEMATA:read"),
+    ] {
+        assert_denied_exactly_on(Snowflake, sql, &[want]);
+    }
+}
+
+#[test]
+fn snowflake_and_oracle_clauses_that_name_columns_are_read() {
+    for (d, sql) in [
+        (
+            Snowflake,
+            "UPDATE tickets SET status = o.status FROM orders o WHERE o.id = tickets.id",
+        ),
+        (
+            Snowflake,
+            "SELECT * FROM orders PIVOT (MAX(total) FOR status IN ('a', 'b')) AS p",
+        ),
+        (
+            Snowflake,
+            "MERGE INTO jobs j USING orders o ON j.id = o.id WHEN MATCHED THEN UPDATE SET j.state = o.status WHEN NOT MATCHED THEN INSERT VALUES (o.id, o.status)",
+        ),
+        (
+            Snowflake,
+            "MERGE INTO tickets t USING orders o ON t.id = o.id WHEN NOT MATCHED AND o.status = 'x' THEN INSERT (id) VALUES (o.id)",
+        ),
+        // Oracle pseudo-columns are not table columns.
+        (
+            Oracle,
+            "SELECT id, ROWNUM, LEVEL FROM orders CONNECT BY PRIOR id = status",
+        ),
+        // Oracle's MERGE … UPDATE … WHERE … DELETE WHERE: a table-level write.
+        (
+            Oracle,
+            "MERGE INTO tickets t USING orders o ON (t.id = o.id) WHEN MATCHED THEN UPDATE SET t.status = o.status WHERE o.total > 1 DELETE WHERE t.note = 'x'",
+        ),
+    ] {
+        assert_allowed_on(d, sql, &agent());
+    }
+    for (d, sql, want) in [
+        (
+            Snowflake,
+            "SELECT id FROM customers QUALIFY ROW_NUMBER() OVER (ORDER BY email) = 1",
+            "CUSTOMERS.EMAIL:read",
+        ),
+        (
+            Snowflake,
+            "SELECT c.id FROM customers c ASOF JOIN orders o MATCH_CONDITION (c.email >= o.ts) ON c.id = o.id",
+            "CUSTOMERS.EMAIL:read",
+        ),
+        // A MERGE clause predicate is a read.
+        (
+            Snowflake,
+            "MERGE INTO tickets t USING customers c ON t.id = c.id WHEN MATCHED AND c.email = 'x' THEN DELETE",
+            "CUSTOMERS.EMAIL:read",
+        ),
+        (
+            Oracle,
+            "SELECT id FROM customers START WITH email = 'x' CONNECT BY PRIOR id = name",
+            "customers.email:read",
+        ),
+        (
+            Oracle,
+            "MERGE INTO tickets t USING orders o ON (t.id = o.id) WHEN NOT MATCHED THEN INSERT (id, priority) VALUES (o.id, 1)",
+            "tickets.priority:write",
+        ),
+    ] {
+        assert_denied_exactly_on(d, sql, &[want]);
+    }
+}
+
+// FINDING (reported to the owner, not fixed here): sqlparser 0.63's Snowflake
+// dialect does not read `ORDER BY ALL` (its `supports_order_by_all` is
+// false), so `ALL` comes back as a column named ALL. Under an allowlist that
+// column is denied: an identity granted `customers.id` cannot run
+// `SELECT id FROM customers ORDER BY ALL`, which orders by `id` only. Fails
+// safe (a false positive, not a bypass). The mask half of the same parse is
+// `tests/snowflake.rs::vericto_085_snowflake_refuses_order_by_all`.
+#[test]
+#[ignore = "finding: Snowflake ORDER BY ALL is parsed as a column named ALL"]
+fn snowflake_order_by_all_orders_by_the_outputs() {
+    assert_allowed_on(Snowflake, "SELECT id FROM customers ORDER BY ALL", &agent());
 }

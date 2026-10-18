@@ -1148,6 +1148,84 @@ mod tests {
         }
     }
 
+    /// The codes of `violations`, in reported order.
+    fn violation_codes(o: &EvaluationOutcome) -> Vec<&str> {
+        o.violations.iter().map(|v| v.rule_code.as_str()).collect()
+    }
+
+    /// VERICTO-085 and VERICTO-087 join the rule violations without taking the
+    /// flat fields when they are not stricter. Their slot must follow the same
+    /// (severity desc, code asc) order as the rules, whatever the order of the
+    /// caller's slice: the audit trail is part of the deterministic outcome.
+    #[test]
+    fn engine_driven_codes_join_the_violation_list_in_severity_then_code_order() {
+        let sql = "SELECT * FROM users";
+        let tagged = EnforcementPolicy {
+            sensitive_columns: vec![crate::sensitive::SensitiveColumn {
+                schema: None,
+                table: "users".into(),
+                column: "email".into(),
+                policy: crate::sensitive::SensitivePolicy::Flag,
+                mask_style: crate::sensitive::MaskStyle::Full,
+            }],
+            ..EnforcementPolicy::default()
+        };
+        // A `flag` tag reports at Medium: between a High and a Low rule.
+        let high = rule_at("VERICTO-050", Severity::High);
+        let low = rule_at("VERICTO-051", Severity::Low);
+        for slice in [[high.clone(), low.clone()], [low.clone(), high.clone()]] {
+            let o = crate::evaluate(sql, Dialect::Postgres, &slice, &tagged);
+            assert_eq!(o.decision, Decision::Block);
+            assert_eq!(o.rule_code.as_deref(), Some("VERICTO-050"));
+            assert_eq!(
+                violation_codes(&o),
+                ["VERICTO-050", "VERICTO-085", "VERICTO-051"]
+            );
+        }
+        // At equal severity the lower code goes first: VERICTO-051 < 085.
+        let medium = rule_at("VERICTO-051", Severity::Medium);
+        let o = crate::evaluate(sql, Dialect::Postgres, &[high.clone(), medium], &tagged);
+        assert_eq!(
+            violation_codes(&o),
+            ["VERICTO-050", "VERICTO-051", "VERICTO-085"]
+        );
+
+        // VERICTO-087 (High, Block under enforce) is not strictly stricter
+        // than a blocking Critical rule, so it also takes its ordered slot.
+        let denied = EnforcementPolicy {
+            access_policy: Some(crate::access::AccessPolicy {
+                mode: crate::access::AccessMode::Enforce,
+                entries: Vec::new(),
+                ddl: crate::access::DdlPolicy::Deny,
+                default_schema: None,
+                default_database: None,
+                quoted_identifiers_ignore_case: None,
+            }),
+            ..EnforcementPolicy::default()
+        };
+        let critical = rule_at("VERICTO-050", Severity::Critical);
+        for (other, want) in [
+            (
+                rule_at("VERICTO-051", Severity::High),
+                ["VERICTO-050", "VERICTO-051", "VERICTO-087"],
+            ),
+            (
+                rule_at("VERICTO-051", Severity::Medium),
+                ["VERICTO-050", "VERICTO-087", "VERICTO-051"],
+            ),
+        ] {
+            for slice in [
+                [critical.clone(), other.clone()],
+                [other.clone(), critical.clone()],
+            ] {
+                let o = crate::evaluate(sql, Dialect::Postgres, &slice, &denied);
+                assert_eq!(o.decision, Decision::Block);
+                assert_eq!(o.rule_code.as_deref(), Some("VERICTO-050"));
+                assert_eq!(violation_codes(&o), want);
+            }
+        }
+    }
+
     // ── RuleClass classification ──────────────────────────────────────────────
     #[test]
     fn rule_class_partitions_the_catalogue() {
