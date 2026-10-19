@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Parser AST para Microsoft SQL Server (T-SQL).
 //!
 //! Uses `sqlparser-rs` with `MsSqlDialect`, which handles T-SQL specifics

@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.3.0] — 2026-10-18
+
+**A new license, and no code change.** From this version on, vericto-engine is
+licensed under the Functional Source License, Version 1.1, ALv2 Future License
+(SPDX `FSL-1.1-ALv2`) instead of the Elastic License 2.0. **All previously
+released versions, 4.2.0 and earlier, remain under the Elastic License 2.0.**
+The engine evaluates exactly as 4.2.0 did: same rules, same decisions. Only
+`ENGINE_VERSION` and `STANDARD_RULESET_VERSION` move to `4.3.0` and
+`standard@4.3.0`.
+
+### Changed
+
+- **License: FSL-1.1-ALv2, which becomes Apache-2.0 after two years.** `LICENSE`
+  is the FSL-1.1-ALv2 text from fsl.software, unmodified, with
+  "Copyright 2026 Vericto S.A.S." in its notice. It lets you use, copy, modify
+  and redistribute the engine for any purpose other than a Competing Use: a
+  commercial product or service that substitutes for the engine, or for a
+  Vericto product that uses it, or that offers substantially similar
+  functionality. Internal use, including in production at a company,
+  non-commercial education and research, and professional services for a
+  licensee are permitted purposes. Each version is also licensed under the
+  Apache License 2.0 from the second anniversary of the date it is made
+  available, irrevocably. Compared with the Elastic License 2.0, the FSL also
+  covers self-managed competing products (ELv2 only restricted hosted and
+  managed services) and drops the license-key clause, which this code never
+  used.
+- `Cargo.toml` declares `license = "FSL-1.1-ALv2"` (the SPDX identifier), and so
+  does the fuzz crate. The crate description says FSL-1.1-ALv2.
+- `NOTICE` states the copyright, the license, the Apache-2.0 future license and
+  that versions up to 4.2.0 stay under the Elastic License 2.0, and lists the
+  third-party SQL in the Snowflake test corpus.
+- **New `LICENSING.md`**: which versions are under which license, and a short
+  FAQ (what is allowed, what a Competing Use is, when a version becomes
+  Apache-2.0, commercial licenses). **New `TRADEMARKS.md`**: the license grants
+  no right to the Vericto name or logo, and what you may do without asking.
+- Every Rust source file, and the test helper `tests/support/mysql_runner.cjs`,
+  starts with `SPDX-FileCopyrightText` and `SPDX-License-Identifier` lines (the
+  REUSE convention). The third-party test fixtures keep their own notices.
+- README (badge and License section), crate documentation and CONTRIBUTING
+  name the new license. CONTRIBUTING explains that CLA 1.0, which names the
+  Elastic License 2.0, also covers later and other licenses.
+- `deny.toml`: `Elastic-2.0` is no longer an allowed dependency license, and
+  `FSL-1.1-ALv2` is allowed for this crate only, so a dependency under a
+  source-available license still fails `cargo deny check`.
+
+### Documentation
+
+- **The CLA check runs in GitHub Actions** instead of cla-assistant.io, whose
+  webhook failed on every delivery on 2026-10-17 and 2026-10-18 and left pull
+  requests without a status. `.github/workflows/cla.yml` (CLA Assistant Lite,
+  pinned by commit SHA) reports the `CLA` check. The agreement is unchanged
+  (ICLA v1.0, now also in `CLA.md`). Contributors sign it by commenting
+  `I have read the CLA Document and I hereby sign the CLA` on their pull
+  request, and `recheck` reruns the check. Signatures are kept on the
+  `cla-signatures` branch. The workflow never checks out pull request code.
+  No code change.
+
 ## [4.2.0] — 2026-10-18
 
 A security fix and a small additive API. **This release can block scripts that

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Session boilerplate: the statements drivers and ORMs send on every
 //! connection (transaction control, isolation level, character set, time
 //! zone, timeouts, application name). Under an allowlist they are allowed

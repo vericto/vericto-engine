@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Access analysis over the `sqlparser` AST (MySQL, Oracle, SQL Server,
 //! Snowflake, SQLite): which statements are analysed, allowed or denied
 //! outright. The analysis itself is the VERICTO-085 walker run in access mode

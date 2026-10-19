@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Equivalence of the VERICTO-085 MySQL mask rewrite (3.7.0) against a real
 //! MySQL: run the original and the rewritten query on the same fixture and
 //! require every non-masked column to be identical, row for row, and every

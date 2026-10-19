@@ -3,7 +3,7 @@
 > Deterministic SQL AST evaluation engine — the source-available core of [Vericto](https://vericto.com).
 
 [![CI](https://github.com/vericto/vericto-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/vericto/vericto-engine/actions/workflows/ci.yml)
-[![License: ELv2](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](LICENSE)
+[![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg)](LICENSING.md)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 `vericto-engine` parses each SQL query into its full Abstract Syntax Tree using
@@ -33,7 +33,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.2.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.3.0" }
 ```
 
 ### Quick example
@@ -98,8 +98,8 @@ severity to, and `engine_driven` for VERICTO-085, 086 and 087, which the policy
 drives and the rules slice neither enables nor disables. A test keeps the table
 equal to the catalogue below.
 
-`ENGINE_VERSION` is this crate's version (`"4.2.0"`) and
-`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@4.2.0"`):
+`ENGINE_VERSION` is this crate's version (`"4.3.0"`) and
+`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@4.3.0"`):
 a built-in rule's predicate lives in the engine, so what the standard ruleset
 detects changes with the engine version. Print them with a verdict to say what
 it was evaluated with.
@@ -1050,7 +1050,12 @@ vericto-engine/
 
 ## License
 
-Copyright 2026 Vericto S.A.S. Elastic License 2.0 — source-available, community PRs
-welcome, no managed-service resale. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Copyright 2026 Vericto S.A.S. Source-available under the
+[Functional Source License, Version 1.1, ALv2 Future License](LICENSE)
+(SPDX `FSL-1.1-ALv2`) since 4.3.0: use, modify and redistribute it for any
+purpose other than a Competing Use, and each version becomes Apache-2.0 two
+years after it is released. Versions 4.2.0 and earlier remain under the Elastic
+License 2.0. [LICENSING.md](LICENSING.md) answers the common questions; see
+also [NOTICE](NOTICE) and [TRADEMARKS.md](TRADEMARKS.md). Community PRs welcome.
 
-For a managed-service license contact [enterprise@vericto.com](mailto:enterprise@vericto.com).
+For a commercial license contact [enterprise@vericto.com](mailto:enterprise@vericto.com).

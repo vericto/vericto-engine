@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! VERICTO-085 `mask` on MySQL (3.7.0), through the public API only.
 //!
 //! Every rewrite is parsed back with sqlparser's MySQL dialect and its AST is

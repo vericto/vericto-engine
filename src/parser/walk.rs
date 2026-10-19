@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Converts `sqlparser-rs` ASTs to Vericto's normalized representation.
 //!
 //! Walks the syntax tree in depth detecting destructive statements (DELETE,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Snowflake parse-rate corpus (design §8): public, legitimate Snowflake SQL
 //! (rendered dbt models and the DDL dbt-snowflake wraps them in, the
 //! statements dbt-snowflake sends, sqlglot's Snowflake test statements; see

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Walker of the `pg_query` protobuf AST (libpg_query, PostgreSQL's internal
 //! parser) into Vericto's normalized representation.
 //!

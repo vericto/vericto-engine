@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! SQLite corpus (design §8): the statements SQLite applications, ORMs and
 //! migration tools send, and the dangerous ones the rules must catch, written
 //! for this repository (see the header of `tests/fixtures/sqlite_corpus.sql`).

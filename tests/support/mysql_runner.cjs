@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Test support for tests/mysql_mask_equivalence.rs: runs SQL against a real
 // MySQL with the `mysql2` driver and prints the results as JSON.
 //

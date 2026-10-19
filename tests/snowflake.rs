@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Snowflake (3.10.0, design "SQLite and Snowflake support" §4 and §8): the
 //! dialect and its walker cases, the 31 standard rules on Snowflake (design
 //! §4.2: direct, variant, not applicable), the Snowflake rules VERICTO-091 to

@@ -27,5 +27,5 @@
 - [ ] No `unwrap()` / `expect()` on runtime paths
 - [ ] Public functions documented with `///`
 - [ ] Commits follow Conventional Commits
-- [ ] I have signed the Vericto Contributor License Agreement (the CLA bot asks on your first pull request)
+- [ ] I have signed the Vericto Contributor License Agreement in `CLA.md` (on your first pull request, comment `I have read the CLA Document and I hereby sign the CLA`; comment `recheck` if the `CLA` check does not rerun)
 - [ ] Rule documented in `README.md` (if adding a rule)

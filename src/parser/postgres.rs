@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! PostgreSQL AST parser.
 //!
 //! Uses `pg_query` (a binding for libpg_query — PostgreSQL's internal parser)

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Sensitive Column Protection (VERICTO-085).
 //!
 //! The host tags columns as sensitive ([`SensitiveColumn`], carried in

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Regression: deeply nested input must be REFUSED, not abort the process.
 //!
 //! Before `guard_nesting_depth`, ~950 nested `NOT`s overflowed the stack inside

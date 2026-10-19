@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! MySQL reads some text differently from sqlparser: comments and, depending
 //! on the server's string-escape mode, where a string literal ends. The
 //! engine must evaluate the statement MySQL executes, so each wrapped

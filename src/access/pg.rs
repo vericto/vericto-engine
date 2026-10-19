@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Access analysis over the `pg_query` AST (Postgres): which statements are
 //! analysed, allowed or denied outright. The analysis itself is the
 //! VERICTO-085 walker run in access mode ([`crate::sensitive::pg::access_walk`]).

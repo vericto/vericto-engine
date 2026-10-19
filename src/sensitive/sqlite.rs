@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! SQLite renderer and mask expressions for VERICTO-085.
 //!
 //! As on Snowflake, the rewrite is printed from the sqlparser tree and only
