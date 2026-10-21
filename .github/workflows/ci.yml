@@ -64,6 +64,33 @@ jobs:
       - name: Run tests
         run: cargo test --all
 
+  # The policy-evaluation budget gate (benches/policy.rs): fails when an
+  # added cost is over its budget. GitHub's runners are slower and noisier
+  # than the proxy's hosts, so the absolute budgets are doubled here; the
+  # empty-set ratio and the measurement are paired, so they are not.
+  policy-bench:
+    name: policy budget gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: "1.88.0"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libclang-dev clang libssl-dev pkg-config protobuf-compiler
+
+      - name: Bench and gate
+        env:
+          VERICTO_BENCH_BUDGET_FACTOR: "2"
+          VERICTO_BENCH_RATIO_MAX: "1.05"
+        run: cargo bench --bench policy
+
   # Dependency checks: RustSec advisories (vulnerable, unsound, unmaintained or
   # yanked crates), licenses, bans and sources, as configured in deny.toml.
   # Linux only: the result does not depend on the platform.

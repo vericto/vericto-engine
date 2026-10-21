@@ -15,7 +15,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.3.0" }
+//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.4.0" }
 //! ```
 //!
 //! ```rust
@@ -74,6 +74,7 @@
 pub mod access;
 pub mod error;
 pub mod parser;
+pub mod policy;
 pub mod rules;
 pub mod sensitive;
 
@@ -95,6 +96,50 @@ pub use rules::standard::{
 pub use sensitive::{
     MaskStyle, SENSITIVE_RULE_CODE, SensitiveColumn, SensitivePolicy, TouchedColumn,
 };
+
+/// [`evaluate`] with business policies and the declared context (design
+/// "Business policy rules" §4.6). `policies` is compiled once from the same
+/// rules ([`policy::PolicySet::compile`]); `ctx` is what the host declares
+/// about the statement (principal, database, time, ticket, session).
+///
+/// With an empty `policies` it is exactly `evaluate`. A statement that does
+/// not parse resolves as in `evaluate`, except that it is forced to `Block`
+/// when an enforced blocking policy may apply to this principal (a statement
+/// the engine cannot read cannot be shown to satisfy a business policy);
+/// session boilerplate stays exempt. Since 4.4.0.
+pub fn evaluate_with_context(
+    sql: &str,
+    dialect: Dialect,
+    rules: &[Rule],
+    policy: &EnforcementPolicy,
+    policies: &policy::PolicySet,
+    ctx: &policy::EvalContext,
+) -> EvaluationOutcome {
+    if policies.is_empty() {
+        return evaluate(sql, dialect, rules, policy);
+    }
+    let parser = parser::parser_for(dialect);
+    match parser.parse(sql) {
+        Ok(parsed) => {
+            RuleEngine::evaluate_with_context(&parsed, rules, policy, policies, ctx, Some(sql))
+        }
+        Err(e) => {
+            let resolved = policy.effective_parse_error_for(sql, dialect);
+            let mut outcome = rules::engine::parse_error_outcome_as(e, resolved);
+            if outcome.decision != Decision::Block
+                && !access::session::is_session_boilerplate(sql, dialect)
+            {
+                let forcing = policies.blocks_unreadable(ctx, policy);
+                if !forcing.is_empty() {
+                    outcome.decision = Decision::Block;
+                    outcome.action = Some(EnforcementAction::Block);
+                    outcome.policy_hits = forcing;
+                }
+            }
+            outcome
+        }
+    }
+}
 
 /// Convenience function: parse + evaluate in one call.
 ///

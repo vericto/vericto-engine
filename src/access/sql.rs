@@ -44,6 +44,12 @@ pub(crate) fn collect(statements: &[Statement], tags: &Tags, dialect: Dialect) -
     Ok(())
 }
 
+/// Records the references of one top-level statement (the policy facts
+/// walk one statement at a time).
+pub(crate) fn collect_statement(s: &Statement, tags: &Tags, dialect: Dialect) -> Result<()> {
+    collect(std::slice::from_ref(s), tags, dialect)
+}
+
 /// Snowflake's text with its identifiers folded the way Snowflake stores
 /// them, parsed again: unquoted names to upper case, and quoted ones too when
 /// `fold_quoted` (`QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE`). The fold is done

@@ -1829,7 +1829,7 @@ fn walk_with_from_ctes(
     Ok(())
 }
 
-fn where_presence(selection: Option<&Expr>, sqlite: bool) -> WherePresence {
+pub(crate) fn where_presence(selection: Option<&Expr>, sqlite: bool) -> WherePresence {
     match selection {
         None => WherePresence::Absent,
         Some(expr) if is_always_true(expr, sqlite) => WherePresence::AlwaysTrue,

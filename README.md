@@ -33,7 +33,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.3.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.4.0" }
 ```
 
 ### Quick example
@@ -98,8 +98,8 @@ severity to, and `engine_driven` for VERICTO-085, 086 and 087, which the policy
 drives and the rules slice neither enables nor disables. A test keeps the table
 equal to the catalogue below.
 
-`ENGINE_VERSION` is this crate's version (`"4.3.0"`) and
-`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@4.3.0"`):
+`ENGINE_VERSION` is this crate's version (`"4.4.0"`) and
+`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@4.4.0"`):
 a built-in rule's predicate lives in the engine, so what the standard ruleset
 detects changes with the engine version. Print them with a verdict to say what
 it was evaluated with.
@@ -1016,6 +1016,135 @@ condition:
 
 ---
 
+## Business policies (CEL)
+
+Since 4.4.0, a custom rule can also be a **business policy**: who runs the
+statement (the *principal*), what it does (its facts: tables, columns, the
+values it assigns, the values its `WHERE` pins), and the declared context
+(database, time, ticket, session), combined in a [CEL](https://github.com/google/cel-spec)
+expression inside the same YAML. It resolves to `allow`, `monitor`, `flag`,
+`block` or `require_approval`.
+
+```yaml
+rule: refund-cap
+applies_to: { ops: [insert, update], tables: ["public.refunds"], principal_types: [agent, human] }
+vars: { limit: 200 }
+min_trust: medium
+deny_if: stmt.values("public.refunds.amount").exists(v, double(v) > double(vars.limit))
+on_unknown: block
+action: block
+message: "Refunds above {{vars.limit}} need approval"
+tests:
+  - { name: small passes, sql: "INSERT INTO refunds (amount) VALUES (150)", principal: { type: agent }, expect: allow }
+  - { name: large blocks, sql: "INSERT INTO refunds (amount) VALUES (950)", principal: { type: agent }, expect: block }
+```
+
+**Backward compatible.** A document is a policy only when it carries one of
+`when`, `deny_if`, `require`, `action`, `applies_to`, `min_trust`, `exempt`,
+`modes`, `vars`, `on_unknown`. Every other custom rule — including one with keys
+this engine already ignored, such as `severity:` or `metadata:` — evaluates
+exactly as before. `evaluate()` is unchanged for every document; policies run
+only through `evaluate_with_context()` with a compiled `PolicySet`, which the
+host gates behind its own flag:
+
+```rust
+use vericto_engine::policy::{EvalContext, PolicySet, Principal, PrincipalType, Trust};
+use vericto_engine::{evaluate_with_context, Dialect, EnforcementPolicy};
+
+let policies = PolicySet::compile(&rules); // once, at rule sync
+let ctx = EvalContext::new()
+    .with_principal(Principal::new("agent-support-bot", PrincipalType::Agent, Trust::Medium));
+let outcome = evaluate_with_context(sql, Dialect::Postgres, &rules, &EnforcementPolicy::default(), &policies, &ctx);
+// outcome.policy_hits, outcome.unknowns, outcome.approval_required
+```
+
+### Keys
+
+| Key | Meaning |
+|---|---|
+| `applies_to` | `ops` (`select`, `insert`, `update`, `delete`, `merge`, `ddl`, `copy`, `call`, `set`, `other`), `tables` (globs), `principal_types`, `databases` (id or name). A cheap index evaluated before any CEL |
+| `modes` | `proxy`, `runtime_api`, `mcp`, `ci`; default all |
+| `node_type` / `condition` | Today's predicates; they AND with the CEL |
+| `vars` | Named constants (`vars.limit`) |
+| `min_trust` | `weak`, `medium` or `strong`: below it, `on_insufficient_trust` (`block` by default, or `flag`) |
+| `when` | CEL guard |
+| `deny_if` / `require` | CEL: a violation when `deny_if` is true or `require` is false (at most one; neither: every match is a violation) |
+| `on_unknown` | `block` (default for `block`/`require_approval`), `flag` (default otherwise), `skip` (only with an explicit `modes:` list) |
+| `action` | `allow`, `monitor`, `flag`, `block`, `require_approval` |
+| `approval` | `approvers` (`roles`, `groups`), `quorum`, `request_timeout`, `grant_ttl`, `fallback_for` (`service`/`pipeline`/`tool` → `block` or `flag`: they never wait for a human) |
+| `exempt` | `{ rule_classes: [schema_migration, performance], cap: flag }`: caps those rule classes for this principal. Needs `min_trust: strong`; Security and DataMutation can never be exempted |
+| `mode` | `enforce` (default) or `monitor` (blocks become flags) |
+| `message`, `tests`, `rule`, `code`, `severity`, `metadata` | Text (`{{vars.x}}` is substituted), fixtures, labels |
+
+`rewrite_limit`, `inject_predicate`, `limits`, `budget`, `deny_after` and
+`params` are refused by this version (later milestones and phases).
+
+### The context
+
+| Field | Type | From |
+|---|---|---|
+| `principal.type`, `.id`, `.owner`, `.via` | string | The host's identity mapping; `unknown` when unmatched |
+| `principal.trust` | int (`WEAK` 1, `MEDIUM` 2, `STRONG` 3) | The signal that identified it |
+| `principal.attrs`, `.groups`, `.end_user` | map, list, map | Mapping config, IdP groups, a service's asserted end user |
+| `stmt.op`, `.kind` | string | The statement |
+| `stmt.tables`, `.tables_written`, `.columns_read`, `.columns_written`, `.functions` | list(string) | `schema.table[.column]`, default schema applied (as VERICTO-087 reads names) |
+| `stmt.has_where`, `.where_always_true`, `.has_returning`, `.truncated` | bool | |
+| `stmt.limit`, `.insert_rows` | int (optional) | Literal outer `LIMIT`/`FETCH`/`TOP`; `VALUES` rows |
+| `db.id`, `.name`, `.env`, `.tags`, `.dialect` | string, list | The database record |
+| `time.now`, `.hour`, `.minute`, `.weekday` (1 = Monday), `.date`, `.tz` | timestamp, int, string | The host's clock in the workspace time zone. **The engine reads no clock** |
+| `session.tenant`, `.application_name`, `.client_ip`, `.listener` | string | The proxy session (weak signals: they tighten, never loosen) |
+| `ticket.id`, `.source`, `.verified` | string, bool | Declared by the session or the caller |
+
+Helpers: `stmt.values(col)`, `stmt.filter_values(col)`, `stmt.has_filter(col)`,
+`stmt.lower_bound(col)`, `stmt.upper_bound(col)`, `stmt.reads(glob)`,
+`stmt.writes(glob)`, `stmt.touches(glob)`, `glob(s, pattern)`,
+`cidr_contains(cidr, ip)`, `in_window(ts, "Mon-Fri 09:00-18:00", tz)` (UTC, a
+fixed offset, or the workspace zone the host passed), plus the CEL standard
+subset (`size`, `in`, `contains`, `startsWith`, `endsWith`, `matches` with a
+literal pattern compiled once, `int`/`uint`/`double`/`string`/`bool`,
+`timestamp`/`duration` of literals, `has`, `all`, `exists`, `exists_one`,
+`map`, `filter`). There is no `now()`, no randomness and no I/O.
+
+### Unknown, deterministic, conservative
+
+A field absent in a mode (`session.tenant` over MCP), a parameter (`$2`), a
+value that is an expression, a column the walk cannot resolve to one table, a
+fact list over 1,024 entries: each is **UNKNOWN**, and `on_unknown` decides —
+never a guess. `&&`, `||`, `all` and `exists` absorb an UNKNOWN when the other
+side decides, as in CEL. A policy that does not compile fails closed in its
+`applies_to` scope. A statement that does not parse blocks when an enforced
+blocking policy may apply to the principal (session boilerplate excepted).
+
+Precedence: VERICTO-086, then a 085 block, an 087 denial, a policy block, a
+policy requiring approval, then flags and monitors — a policy finding joins
+`violations` after every other finding of the same action. A required approval
+is a `Block` decision plus `approval_required`, so a host that does not know
+approvals blocks.
+
+### Authoring
+
+`policy::check_policy(yaml)` returns errors with their key and offset (with
+suggestions for typos), warnings, the fields the policy reads and, per mode,
+whether it is decidable there. `policy::run_policy_tests(yaml, dialect)` runs
+its `tests:` fixtures. `policy::statement_facts(sql, dialect, default_schema)`
+shows what a policy sees in a statement.
+
+The CEL is Vericto's own interpreter of a CEL subset (same grammar and
+semantics), checked against [cel-rust](https://github.com/cel-rust/cel-rust)
+on generated expressions in the test suite. Static bounds: 2 KiB per
+expression, 256 nodes, comprehension nesting 2, `matches` patterns of 256
+bytes, a worst-case cost estimate, 200 policies per set.
+
+### Cost
+
+Measured by `cargo bench --bench policy` (statements under 2 KiB, added over
+`evaluate` with the standard ruleset; the bench fails when a cell is over its
+budget): an empty set adds nothing measurable; policies out of scope for the
+principal ≤ 1 µs; three typical policies ≤ 15 µs; fifty applicable policies
+≤ 50 µs.
+
+---
+
 ## Architecture
 
 ```
@@ -1023,6 +1152,7 @@ vericto-engine/
 ├── src/
 │   ├── lib.rs          ← public API + evaluate() convenience fn
 │   ├── error.rs        ← ProxyError, Result
+│   ├── policy/         ← business policies: context, facts (pg.rs, sql.rs), CEL subset (cel/), spec, set, check
 │   ├── access/         ← VERICTO-087: agent allowlists — policy types, statement classes, verdict (runs the sensitive/ walkers in access mode)
 │   ├── sensitive/      ← VERICTO-085: sensitive-column derivation + mask rewrite (pg.rs, sql.rs, mysql.rs, snowflake.rs)
 │   │   ├── mod.rs      ← tags, scopes, lineage, verdict

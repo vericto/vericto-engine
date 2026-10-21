@@ -8,6 +8,7 @@ use std::cmp::Ordering;
 
 use crate::access::{self, ACCESS_RULE_CODE, AccessMode, AccessPolicy, DeniedRef};
 use crate::parser::{MysqlReadings, ParsedQuery};
+use crate::policy::{ApprovalRequirement, EvalContext, PolicyHit, PolicySet, UnknownField};
 use crate::rules::evaluator;
 use crate::sensitive::{
     self, SENSITIVE_RULE_CODE, SensitiveColumn, SensitivePolicy, TouchedColumn,
@@ -504,6 +505,18 @@ pub struct EvaluationOutcome {
     /// deduplicated and sorted, for the audit trail. Filled in `observe` mode
     /// too. Always empty when the policy carries no `access_policy`.
     pub access_denied: Vec<DeniedRef>,
+    /// What each business policy found ([`crate::evaluate_with_context`]),
+    /// for the audit trail and the simulator: violations, inconclusive
+    /// results, insufficient trust, exemptions. Always empty without
+    /// policies. Since 4.4.0.
+    pub policy_hits: Vec<PolicyHit>,
+    /// `Some` when the decision is `Block` only because of
+    /// `require_approval` policies: a host that knows approvals may unblock
+    /// it with a grant; one that does not, blocks. Since 4.4.0.
+    pub approval_required: Option<ApprovalRequirement>,
+    /// The values policies needed and could not know (UNKNOWN), and genuine
+    /// evaluation errors, for operator alerts. Since 4.4.0.
+    pub unknowns: Vec<UnknownField>,
 }
 
 impl EvaluationOutcome {
@@ -534,6 +547,9 @@ impl EvaluationOutcome {
             rewritten_query: None,
             sensitive_columns: Vec::new(),
             access_denied: Vec::new(),
+            policy_hits: Vec::new(),
+            approval_required: None,
+            unknowns: Vec::new(),
         }
     }
 }
@@ -621,6 +637,110 @@ impl RuleEngine {
         outcome
     }
 
+    /// [`evaluate`](Self::evaluate) with the business policies of
+    /// `policies` and the declared context `ctx` (design §4.6). `sql` is the
+    /// statement text when the host has it (the Postgres function facts read
+    /// it).
+    ///
+    /// With an empty `policies` this is exactly `evaluate`: the same code
+    /// path, nothing else runs. Otherwise each reading is evaluated as
+    /// `evaluate` does, and then:
+    ///
+    /// - exemptions that applied cap their rule classes (never Security or
+    ///   DataMutation);
+    /// - every violated or inconclusive policy joins `violations` with its
+    ///   own action (not the severity mapping), after every rule, VERICTO-085
+    ///   and VERICTO-087 finding of the same action, and require-approval
+    ///   policies after policy blocks: the strictest outcome still wins;
+    /// - `policy_hits`, `unknowns` and `approval_required` are filled.
+    pub fn evaluate_with_context(
+        parsed: &ParsedQuery,
+        rules: &[Rule],
+        policy: &EnforcementPolicy,
+        policies: &PolicySet,
+        ctx: &EvalContext,
+        sql: Option<&str>,
+    ) -> EvaluationOutcome {
+        if policies.is_empty() {
+            return Self::evaluate(parsed, rules, policy);
+        }
+        let alternatives = match parsed.mysql.as_deref() {
+            None => return Self::evaluate_reading_ctx(parsed, rules, policy, policies, ctx, sql),
+            Some(MysqlReadings::Ambiguous(why)) => return divergence_outcome(why, policy),
+            Some(MysqlReadings::Alternatives(alts)) => alts,
+        };
+        let mut outcome = Self::evaluate_reading_ctx(parsed, rules, policy, policies, ctx, sql);
+        for alt in alternatives {
+            let mut other = match alt {
+                Ok(p) => {
+                    let verdict = crate::policy::set::evaluate(policies, p, ctx, policy, None);
+                    let base = Self::evaluate_rules_with(
+                        p,
+                        rules,
+                        policy,
+                        Some(policies),
+                        &verdict.exemptions,
+                    );
+                    with_policies(Self::with_access(base, p, policy), verdict)
+                }
+                Err(e) => parse_error_outcome(e, policy),
+            };
+            if outranks(other.precedence(), outcome.precedence()) {
+                let touched = std::mem::take(&mut outcome.sensitive_columns);
+                let denied = std::mem::take(&mut outcome.access_denied);
+                let hits = std::mem::take(&mut outcome.policy_hits);
+                let unknowns = std::mem::take(&mut outcome.unknowns);
+                let rewrite = outcome.rewritten_query.take();
+                std::mem::swap(&mut outcome, &mut other);
+                outcome.sensitive_columns = touched;
+                outcome.rewritten_query = if outcome.decision == Decision::Block {
+                    None
+                } else {
+                    rewrite
+                };
+                other.access_denied = denied;
+                other.policy_hits = hits;
+                other.unknowns = unknowns;
+            }
+            union_denied(&mut outcome.access_denied, other.access_denied);
+            for h in other.policy_hits {
+                if !outcome.policy_hits.contains(&h) {
+                    outcome.policy_hits.push(h);
+                }
+            }
+            for u in other.unknowns {
+                if !outcome.unknowns.contains(&u) {
+                    outcome.unknowns.push(u);
+                }
+            }
+        }
+        outcome
+    }
+
+    /// One reading with the policies: [`evaluate_reading`](Self::evaluate_reading),
+    /// with the exemptions applied to the rules and the policy findings
+    /// merged after VERICTO-085 and VERICTO-087.
+    fn evaluate_reading_ctx(
+        parsed: &ParsedQuery,
+        rules: &[Rule],
+        policy: &EnforcementPolicy,
+        policies: &PolicySet,
+        ctx: &EvalContext,
+        sql: Option<&str>,
+    ) -> EvaluationOutcome {
+        let verdict = crate::policy::set::evaluate(policies, parsed, ctx, policy, sql);
+        let mut outcome =
+            Self::evaluate_rules_with(parsed, rules, policy, Some(policies), &verdict.exemptions);
+        if !policy.sensitive_columns.is_empty() {
+            if let Some(v) = sensitive::evaluate(parsed, &policy.sensitive_columns) {
+                outcome = apply_sensitive(outcome, v, policy);
+            }
+        }
+        let outcome = Self::with_access(outcome, parsed, policy);
+        let outcome = with_policies(outcome, verdict);
+        Self::with_unread(outcome, parsed, policy)
+    }
+
     /// One reading: the rules, then the sensitive columns, then the
     /// identity's allowlist (design §6.1 precedence: applied after 085, so a
     /// `block` tag keeps the flat fields and an allowed `mask` keeps its
@@ -702,19 +822,42 @@ impl RuleEngine {
         rules: &[Rule],
         policy: &EnforcementPolicy,
     ) -> EvaluationOutcome {
+        Self::evaluate_rules_with(parsed, rules, policy, None, &[])
+    }
+
+    /// [`evaluate_rules`](Self::evaluate_rules), leaving out the rules a
+    /// policy set evaluates itself, and with the class caps of the
+    /// exemptions that applied (`action.min(cap)`, like
+    /// `schema_migration_cap`).
+    fn evaluate_rules_with(
+        parsed: &ParsedQuery,
+        rules: &[Rule],
+        policy: &EnforcementPolicy,
+        policies: Option<&PolicySet>,
+        caps: &[(RuleClass, EnforcementAction)],
+    ) -> EvaluationOutcome {
         // Collect every violation, then order them. The loop already evaluated
         // every rule to find the worst one — the previous version simply discarded
         // the rest — so keeping them costs a push, not extra evaluation.
         let mut violations: Vec<ReportedViolation> = rules
             .iter()
+            .filter(|rule| {
+                rule.rule_type != RuleType::Custom
+                    || policies.is_none_or(|set| !set.contains_rule(&rule.rule_id))
+            })
             .filter_map(|rule| {
                 evaluator::evaluate_rule(rule, parsed).map(|v| ReportedViolation {
                     // Resolve each action through the per-class path so a channel's
                     // schema-migration cap (if any) softens DDL without touching
                     // DataMutation / Security violations. Class comes from the rule
                     // code — a static property, not a channel input.
-                    action: policy
-                        .action_for_class(rule.severity, RuleClass::for_code(&v.rule_code)),
+                    action: {
+                        let class = RuleClass::for_code(&v.rule_code);
+                        let base = policy.action_for_class(rule.severity, class);
+                        caps.iter()
+                            .filter(|(c, _)| *c == class)
+                            .fold(base, |a, (_, cap)| a.min(*cap))
+                    },
                     severity: rule.severity,
                     rule_id: v.rule_id,
                     rule_code: v.rule_code,
@@ -757,6 +900,9 @@ impl RuleEngine {
                     rewritten_query: None,
                     sensitive_columns: Vec::new(),
                     access_denied: Vec::new(),
+                    policy_hits: Vec::new(),
+                    approval_required: None,
+                    unknowns: Vec::new(),
                 }
             }
         }
@@ -803,6 +949,9 @@ pub(crate) fn parse_error_outcome_as(
         rewritten_query: None,
         sensitive_columns: Vec::new(),
         access_denied: Vec::new(),
+        policy_hits: Vec::new(),
+        approval_required: None,
+        unknowns: Vec::new(),
     }
 }
 
@@ -836,6 +985,9 @@ fn divergence_outcome(why: &str, policy: &EnforcementPolicy) -> EvaluationOutcom
         rewritten_query: None,
         sensitive_columns: Vec::new(),
         access_denied: Vec::new(),
+        policy_hits: Vec::new(),
+        approval_required: None,
+        unknowns: Vec::new(),
     }
 }
 
@@ -1013,6 +1165,75 @@ fn apply_access(
         outcome.rewritten_query = None;
     }
     union_denied(&mut outcome.access_denied, verdict.denied);
+    outcome
+}
+
+/// Folds the policy verdict into the outcome so far (rules, VERICTO-085,
+/// VERICTO-087): a floor, like the column and allowlist verdicts. A policy
+/// violation joins `violations` after every non-policy finding of the same
+/// action (design §4.6: 085 block, then 087 deny, then policy block), and an
+/// approval policy after the other policy findings of the same action; it
+/// takes the flat fields only when its action is strictly stronger than
+/// everything before it. A block clears any mask rewrite.
+fn with_policies(
+    mut outcome: EvaluationOutcome,
+    verdict: crate::policy::set::Verdict,
+) -> EvaluationOutcome {
+    let approval_codes: Vec<&str> = verdict.approvals.iter().map(|(c, _)| c.as_str()).collect();
+    let mut vs = verdict.violations;
+    vs.sort_by(|a, b| {
+        b.action
+            .cmp(&a.action)
+            .then_with(|| {
+                approval_codes
+                    .contains(&a.rule_code.as_str())
+                    .cmp(&approval_codes.contains(&b.rule_code.as_str()))
+            })
+            .then_with(|| b.severity.cmp(&a.severity))
+            .then_with(|| a.rule_code.cmp(&b.rule_code))
+    });
+    for v in vs {
+        let pos = outcome
+            .violations
+            .iter()
+            .position(|o| o.action < v.action)
+            .unwrap_or(outcome.violations.len());
+        if pos == 0 {
+            outcome.decision = Decision::from_action(v.action);
+            outcome.action = Some(v.action);
+            outcome.severity = Some(v.severity);
+            outcome.rule_id = Some(v.rule_id.clone());
+            outcome.rule_code = Some(v.rule_code.clone());
+            outcome.ast_node_path = Some(v.ast_node_path.clone());
+            outcome.estimated_rows_affected = None;
+            outcome.suggested_safe_query = None;
+        }
+        outcome.violations.insert(pos, v);
+    }
+    if outcome.decision == Decision::Block {
+        outcome.rewritten_query = None;
+        // Approval can unblock only when every block is an approval policy.
+        let only_approvals = outcome
+            .violations
+            .iter()
+            .filter(|v| v.action == EnforcementAction::Block)
+            .all(|v| approval_codes.contains(&v.rule_code.as_str()));
+        if only_approvals {
+            outcome.approval_required = outcome
+                .violations
+                .iter()
+                .find(|v| v.action == EnforcementAction::Block)
+                .and_then(|v| {
+                    verdict
+                        .approvals
+                        .iter()
+                        .find(|(c, _)| *c == v.rule_code)
+                        .map(|(_, a)| a.clone())
+                });
+        }
+    }
+    outcome.policy_hits.extend(verdict.hits);
+    outcome.unknowns.extend(verdict.unknowns);
     outcome
 }
 

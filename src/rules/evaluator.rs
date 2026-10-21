@@ -739,29 +739,18 @@ fn evaluate_custom(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         }
     };
 
-    let target_kind = match spec.node_type.as_str() {
-        "DeleteStmt" => StatementKind::Delete,
-        "UpdateStmt" => StatementKind::Update,
-        "DropStmt" => StatementKind::Drop,
-        "TruncateStmt" => StatementKind::Truncate,
-        "InsertStmt" => StatementKind::Insert,
-        "SelectStmt" => StatementKind::Select,
-        "AlterTableStmt" => StatementKind::AlterTable,
-        "FuncCall" => StatementKind::FunctionCall,
-        other => {
-            tracing::warn!(
-                rule_code = %rule.code,
-                node_type = other,
-                "custom rule has an unknown node_type; rule skipped"
-            );
-            return None;
-        }
+    let Some(target_kind) = node_kind(&spec.node_type) else {
+        tracing::warn!(
+            rule_code = %rule.code,
+            node_type = spec.node_type.as_str(),
+            "custom rule has an unknown node_type; rule skipped"
+        );
+        return None;
     };
 
-    let cond = &spec.condition;
     // A node_type with no `condition:` block fires for every matching node
     // (e.g. `node_type: DropStmt` blocks any DROP).
-    let cond_get = |key: &str| cond.get(serde_norway::Value::from(key));
+    let cond = &spec.condition;
 
     // Warn on any predicate the engine doesn't understand. We only iterate the
     // condition when it's a mapping; a missing/scalar `condition:` has no keys.
@@ -782,6 +771,34 @@ fn evaluate_custom(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         }
     }
 
+    condition_matches(target_kind, cond, parsed).map(|s| violation(rule, s, None))
+}
+
+/// The statement kind of a custom rule's `node_type`, `None` for an unknown
+/// one (the rule never fires).
+pub(crate) fn node_kind(node_type: &str) -> Option<StatementKind> {
+    Some(match node_type {
+        "DeleteStmt" => StatementKind::Delete,
+        "UpdateStmt" => StatementKind::Update,
+        "DropStmt" => StatementKind::Drop,
+        "TruncateStmt" => StatementKind::Truncate,
+        "InsertStmt" => StatementKind::Insert,
+        "SelectStmt" => StatementKind::Select,
+        "AlterTableStmt" => StatementKind::AlterTable,
+        "FuncCall" => StatementKind::FunctionCall,
+        _ => return None,
+    })
+}
+
+/// The first statement of `parsed` a custom rule's `node_type` and
+/// `condition:` predicates match: the matching shared by today's custom rules
+/// and the guard of a policy that keeps them (`node_type:` with CEL).
+pub(crate) fn condition_matches<'p>(
+    target_kind: StatementKind,
+    cond: &serde_norway::Value,
+    parsed: &'p ParsedQuery,
+) -> Option<&'p StatementInfo> {
+    let cond_get = |key: &str| cond.get(serde_norway::Value::from(key));
     // `where_clause: null` — the key must be PRESENT (its value is null). serde's
     // `.get()` returns Some(Value::Null) when present-with-null, None when absent.
     let where_clause_present = cond_get("where_clause").is_some();
@@ -849,7 +866,6 @@ fn evaluate_custom(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         }
         true
     })
-    .map(|s| violation(rule, s, None))
 }
 
 /// Compares two relation names, dialect-normalized: strips schema qualifier and
