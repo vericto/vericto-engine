@@ -211,3 +211,58 @@ fn standard_ruleset_example() {
     assert_eq!(outcome.decision, Decision::Block);
     assert_eq!(outcome.rule_code.as_deref(), Some("VERICTO-030"));
 }
+
+/// The README's business-policy example: the YAML verbatim, its fixtures,
+/// and the evaluation snippet.
+#[test]
+fn business_policy_example() {
+    use vericto_engine::policy::{
+        EvalContext, PolicySet, Principal, PrincipalType, Trust, run_policy_tests,
+    };
+    use vericto_engine::{
+        Decision, Dialect, EnforcementAction, EnforcementPolicy, Rule, RuleType, Severity,
+        evaluate_with_context,
+    };
+
+    let readme = include_str!("../README.md");
+    let start = readme.find("## Business policies (CEL)").expect("section");
+    let block = &readme[start..];
+    let yaml_start = block.find("```yaml\n").expect("yaml block") + "```yaml\n".len();
+    let yaml = &block[yaml_start..yaml_start + block[yaml_start..].find("```").unwrap()];
+
+    let results = run_policy_tests(yaml, Dialect::Postgres).unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.passed), "{results:?}");
+
+    let rules = vec![Rule {
+        rule_id: "r-refund".into(),
+        code: "POL-001".into(),
+        severity: Severity::High,
+        default_action: EnforcementAction::Block,
+        rule_type: RuleType::Custom,
+        ast_condition_yaml: Some(yaml.into()),
+    }];
+    let policies = PolicySet::compile(&rules);
+    assert!(policies.errors().is_empty());
+    let ctx = EvalContext::new().with_principal(Principal::new(
+        "agent-support-bot",
+        PrincipalType::Agent,
+        Trust::Medium,
+    ));
+    let sql = "UPDATE refunds SET amount = 950 WHERE id = 1";
+    let outcome = evaluate_with_context(
+        sql,
+        Dialect::Postgres,
+        &rules,
+        &EnforcementPolicy::default(),
+        &policies,
+        &ctx,
+    );
+    assert_eq!(outcome.decision, Decision::Block);
+    assert!(
+        outcome
+            .ast_node_path
+            .unwrap()
+            .contains("Refunds above 200 need approval")
+    );
+}

@@ -1,6 +1,6 @@
 [package]
 name = "vericto-engine"
-version = "4.3.0"
+version = "4.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Vericto — Deterministic SQL AST evaluation engine (source-available, FSL-1.1-ALv2)"
@@ -29,6 +29,10 @@ serde_json = "1.0"
 # unmaintained (RUSTSEC-2024-0449).
 serde_norway = "0.9.42"
 
+# `matches` patterns of policies, compiled once when a policy is compiled
+# (linear-time matching, size-limited programs).
+regex = "1.11"
+
 # Observability
 tracing = "0.1"
 
@@ -38,6 +42,16 @@ thiserror = "2.0"
 [dev-dependencies]
 # Property-based testing for the engine's pure functions (Properties P1-P8).
 proptest = "1"
+# The CEL conformance oracle for the policy language (tests only): the
+# engine's own CEL subset is checked against cel-rust on generated
+# expressions. Pinned exactly; a bump re-runs that suite.
+cel = { version = "=0.15.0", default-features = false, features = ["regex"] }
+# The policy-evaluation micro-benchmark and its budget gate (benches/policy.rs).
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "policy"
+harness = false
 
 [profile.release]
 opt-level = 3

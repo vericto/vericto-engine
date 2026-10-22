@@ -622,7 +622,7 @@ fn func_call_name(funcname: &[Node]) -> Option<String> {
 }
 
 /// Determine WHERE clause state from a protobuf node.
-fn where_presence(where_clause: Option<&Node>) -> WherePresence {
+pub(crate) fn where_presence(where_clause: Option<&Node>) -> WherePresence {
     match where_clause {
         None => WherePresence::Absent,
         Some(node) => match node.node.as_ref() {

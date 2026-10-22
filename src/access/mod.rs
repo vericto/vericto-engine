@@ -754,6 +754,29 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, policy: &AccessPolicy) -> Option<Ac
     })
 }
 
+/// Every reference one top-level Postgres statement makes, as the access
+/// analysis records them (for the policy facts, `crate::policy::facts`).
+pub(crate) fn refs_pg(
+    node: &pg_query::protobuf::node::Node,
+) -> std::result::Result<Vec<Ref>, String> {
+    let collector = Collector::default();
+    let tags = Tags::collecting(&collector);
+    let mut node = node.clone();
+    pg::collect_statement(&mut node, &tags).map_err(|e| e.to_string())?;
+    Ok(collector.finish().0)
+}
+
+/// [`refs_pg`] for one statement of a sqlparser dialect.
+pub(crate) fn refs_sql(
+    stmt: &sqlparser::ast::Statement,
+    dialect: Dialect,
+) -> std::result::Result<Vec<Ref>, String> {
+    let collector = Collector::default();
+    let tags = Tags::collecting(&collector);
+    sql::collect_statement(stmt, &tags, dialect).map_err(|e| e.to_string())?;
+    Ok(collector.finish().0)
+}
+
 fn display(d: &DeniedRef) -> String {
     let mut s = String::new();
     if let Some(schema) = &d.schema {

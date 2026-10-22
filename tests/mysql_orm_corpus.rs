@@ -212,8 +212,18 @@ fn render() -> String {
             // (Medium, Flag) now reports VERICTO-085 as the winner and first
             // violation (same action, higher severity); decision and rewrite
             // are unchanged.
+            // 4.4.0 added `policy_hits`, `approval_required` and `unknowns`,
+            // always empty without policies (asserted here): the golden
+            // lines stay byte for byte.
             assert!(o.access_denied.is_empty(), "{sql}");
-            let line = format!("{o:?}").replace(", access_denied: []", "");
+            assert!(
+                o.policy_hits.is_empty() && o.approval_required.is_none() && o.unknowns.is_empty(),
+                "{sql}"
+            );
+            let line = format!("{o:?}").replace(", access_denied: []", "").replace(
+                ", policy_hits: [], approval_required: None, unknowns: []",
+                "",
+            );
             out.push_str(&format!("{dialect:?}\t{name}\t{sql:?}\t{line}\n"));
         }
     }

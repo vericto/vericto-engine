@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.4.0] — 2026-10-21
+
+**Business policies (Phase 1, engine core).** A custom rule can now be a
+principal-aware policy written in CEL inside the same YAML (design "Business
+policy rules", Confluence VTO 7798785; implementation plan, milestone M1).
+Nothing changes for anyone who does not use them: `evaluate()` is unchanged
+for every input, today's custom rules (including those with keys the engine
+already ignored) are not policies, and the outcome of the new entry point with
+an empty policy set is exactly `evaluate()`'s. The corpus goldens are
+unchanged byte for byte.
+
+### Added
+
+- **`evaluate_with_context(sql, dialect, rules, policy, &PolicySet, &EvalContext)`**
+  and `RuleEngine::evaluate_with_context`: the rules, VERICTO-085, VERICTO-087,
+  then the business policies of a `PolicySet` (compiled once with
+  `PolicySet::compile(&rules)`) against the declared context.
+- **`policy` module.** `EvalContext` (principal, database, time, ticket,
+  session, host mode, default schema; JSON-deserializable), `Principal` with
+  `PrincipalType` and `Trust` (weak 1, medium 2, strong 3), `PolicySet`,
+  `PolicyHit` / `PolicyOutcome`, `ApprovalRequirement`, `UnknownField`.
+- **Policy documents**: `applies_to` (ops, table globs, principal types,
+  databases), `modes`, `vars`, `min_trust` / `on_insufficient_trust`, `when`,
+  `deny_if` / `require`, `on_unknown` (`block`, `flag`, `skip`), `action`
+  (`allow`, `monitor`, `flag`, `block`, `require_approval`), `approval` (with
+  `fallback_for`: services, pipelines and tools never wait for a human),
+  `exempt` (caps `schema_migration` / `performance` violations, needs
+  `min_trust: strong`; Security and DataMutation can never be exempted),
+  `mode: monitor`, `message` with `{{vars.x}}`, `tests:`. `node_type` /
+  `condition` keep working and AND with the CEL.
+- **Statement facts** on both parser front ends (pg_query; sqlparser for
+  MySQL, SQL Server, Oracle, Snowflake and SQLite): tables, tables written,
+  columns read and written (the VERICTO-087 walk), op, kind, values assigned
+  (INSERT VALUES, UPDATE SET, upserts), the top-level conjunctive `=`/`IN`
+  pins and range bounds of the `WHERE`, the outer LIMIT/FETCH/TOP, RETURNING,
+  VALUES rows, called functions. Conservative: what cannot be known is
+  UNKNOWN. `policy::statement_facts()` shows them.
+- **A CEL subset** with its own checker (types against the fixed schema,
+  allowed identifiers and functions, suggestions for typos, static bounds:
+  2 KiB, 256 nodes, comprehension nesting 2, 256-byte `matches` patterns
+  compiled once, a worst-case cost estimate, 200 policies per set) and
+  interpreter (UNKNOWN absorbed by `&&`/`||`/`all`/`exists` as in CEL; no
+  clock: `time.*` comes from the host).
+- **Decision resolution** (design §4.6): a policy finding joins `violations`
+  with its own action, after every rule, 085 and 087 finding of the same action;
+  `require_approval` is `Block` plus `approval_required`; `monitor_mode` and
+  `mode: monitor` never block; a policy that does not compile fails closed in
+  its scope; a statement that does not parse blocks under an enforced blocking
+  policy that may apply (session boilerplate excepted).
+- `EvaluationOutcome` gains `policy_hits`, `approval_required` and `unknowns`
+  (always empty without policies).
+- **Authoring**: `policy::check_policy()` (errors with key and offset,
+  warnings, the fields read, per-mode decidability) and
+  `policy::run_policy_tests()` (the `tests:` fixtures).
+- **Benchmark and gate**: `cargo bench --bench policy` measures an empty set,
+  10 out-of-scope policies, 3 typical and 50 applicable policies, and fails
+  when a cell is over its budget (ratio ≤ 1.05; ≤ 1, 15 and 50 µs added). CI
+  runs it.
+- **Fuzzing**: a second cargo-fuzz target, `policy` (an arbitrary expression
+  and statement through the checker, the compiler and the evaluation); the
+  weekly workflow runs both targets.
+
+### Changed
+
+- `regex` is a new dependency (policy `matches` patterns). `cel` (=0.15.0) and
+  `criterion` are new dev-dependencies (the conformance oracle and the bench).
+- `rules::evaluator` splits the custom-rule matching into `node_kind` and
+  `condition_matches` (shared with the policy guard); behaviour is unchanged.
+
 ## [4.3.0] — 2026-10-18
 
 **A new license, and no code change.** From this version on, vericto-engine is

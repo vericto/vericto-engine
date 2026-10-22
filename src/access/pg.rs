@@ -40,6 +40,12 @@ pub(crate) fn collect(tree: &protobuf::ParseResult, tags: &Tags) -> Result<()> {
     Ok(())
 }
 
+/// Records the references of one top-level statement (the policy facts
+/// walk one statement at a time; `collect` walks a whole tree).
+pub(crate) fn collect_statement(node: &mut NodeEnum, tags: &Tags) -> Result<()> {
+    statement(node, tags)
+}
+
 fn statement(node: &mut NodeEnum, tags: &Tags) -> Result<()> {
     match classify(node, 0)? {
         Class::Walk => {
