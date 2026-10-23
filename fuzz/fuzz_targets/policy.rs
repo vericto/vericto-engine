@@ -11,7 +11,8 @@
 //! on the dialect the first byte selects. The engine must return for any
 //! input: a panic, an abort, a stack overflow or a timeout is a finding.
 //! A second policy, fixed, reads every fact helper so the facts extraction
-//! runs on every statement.
+//! runs on every statement, and a third bounds every SELECT
+//! (`rewrite_limit`), so the LIMIT rewrite and its verification run too.
 
 #![no_main]
 
@@ -42,6 +43,8 @@ on_unknown: flag
 action: flag
 "#;
 
+const LIMIT: &str = "applies_to: { principal_types: [agent] }\naction: { rewrite_limit: 7 }\n";
+
 fn rule(code: &str, yaml: String) -> Rule {
     Rule {
         rule_id: code.into(),
@@ -68,7 +71,11 @@ fuzz_target!(|data: &[u8]| {
     let indented: String = expr.lines().map(|l| format!("  {l}\n")).collect();
     let yaml = format!("applies_to: {{ principal_types: [agent] }}\ndeny_if: |\n{indented}action: block\n");
     let _ = check_policy(&yaml);
-    let rules = vec![rule("POL-F1", yaml), rule("POL-F2", FACTS.to_string())];
+    let rules = vec![
+        rule("POL-F1", yaml),
+        rule("POL-F2", FACTS.to_string()),
+        rule("POL-F3", LIMIT.to_string()),
+    ];
     let set = PolicySet::compile(&rules);
     let mut p = Principal::new("fuzz", PrincipalType::Agent, Trust::Medium);
     p.attrs.insert("k".into(), "v".into());

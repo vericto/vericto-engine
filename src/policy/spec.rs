@@ -16,6 +16,7 @@ use serde_norway::Value as Yaml;
 
 use super::cel::{Const, Program, time};
 use super::context::{HostMode, PrincipalType, Trust};
+use super::rewrite::MAX_REWRITE_LIMIT;
 use crate::parser::StatementKind;
 use crate::rules::engine::{EnforcementAction, RuleClass};
 
@@ -72,6 +73,11 @@ pub enum PolicyAction {
     /// Reported as a block with [`crate::EvaluationOutcome::approval_required`]:
     /// a host that does not know approvals blocks (the fail-safe direction).
     RequireApproval,
+    /// `{ rewrite_limit: n }`: bound a top-level SELECT to `n` rows by adding
+    /// or clamping its outer `LIMIT` (design §8.1). An applied rewrite is a
+    /// monitor finding with [`crate::EvaluationOutcome::rewritten_query`]; a
+    /// rewrite that cannot be verified blocks. Since 4.5.0.
+    RewriteLimit,
 }
 
 impl PolicyAction {
@@ -82,6 +88,7 @@ impl PolicyAction {
             PolicyAction::Flag => "flag",
             PolicyAction::Block => "block",
             PolicyAction::RequireApproval => "require_approval",
+            PolicyAction::RewriteLimit => "rewrite_limit",
         }
     }
 
@@ -182,6 +189,8 @@ pub(crate) struct PolicySpec {
     pub(crate) test: Option<(bool, Program)>,
     pub(crate) on_unknown: OnUnknown,
     pub(crate) action: PolicyAction,
+    /// The row count of `action: { rewrite_limit: n }`.
+    pub(crate) rewrite_limit: Option<u64>,
     pub(crate) approval: Option<ApprovalSpec>,
     pub(crate) fallback: BTreeMap<PrincipalType, PolicyAction>,
     pub(crate) exempt: Option<Exempt>,
@@ -593,6 +602,7 @@ pub(crate) fn parse(yaml: &str) -> Result<PolicySpec, Vec<Issue>> {
     }
 
     // action
+    let mut rewrite_limit = None;
     let action = match &raw.action {
         None => None,
         Some(Yaml::String(s)) => match PolicyAction::parse(s) {
@@ -609,16 +619,38 @@ pub(crate) fn parse(yaml: &str) -> Result<PolicySpec, Vec<Issue>> {
         },
         Some(Yaml::Mapping(m)) => {
             let key = m.keys().next().and_then(Yaml::as_str).unwrap_or("");
-            let why = match key {
-                "rewrite_limit" => "the LIMIT rewrite ships with the templates milestone (M5)",
-                "inject_predicate" => "the tenant predicate rewrite is Phase 2",
-                _ => "unknown action",
-            };
-            errors.push(Issue::new(
-                "action",
-                format!("`{key}`: not available in this engine version: {why}"),
-            ));
-            None
+            if m.len() != 1 {
+                errors.push(Issue::new(
+                    "action",
+                    "an action mapping has exactly one key (`{ rewrite_limit: 1000 }`)",
+                ));
+                None
+            } else if key == "rewrite_limit" {
+                let n = m.values().next().and_then(Yaml::as_u64);
+                match n {
+                    Some(n) if (1..=MAX_REWRITE_LIMIT).contains(&n) => {
+                        rewrite_limit = Some(n);
+                        Some(PolicyAction::RewriteLimit)
+                    }
+                    _ => {
+                        errors.push(Issue::new(
+                            "action.rewrite_limit",
+                            format!("must be a whole number of rows from 1 to {MAX_REWRITE_LIMIT}"),
+                        ));
+                        None
+                    }
+                }
+            } else {
+                let why = match key {
+                    "inject_predicate" => "the tenant predicate rewrite is Phase 2",
+                    _ => "unknown action",
+                };
+                errors.push(Issue::new(
+                    "action",
+                    format!("`{key}`: not available in this engine version: {why}"),
+                ));
+                None
+            }
         }
         Some(_) => {
             errors.push(Issue::new("action", "must be an action name"));
@@ -685,6 +717,24 @@ pub(crate) fn parse(yaml: &str) -> Result<PolicySpec, Vec<Issue>> {
     };
 
     let action = action.unwrap_or(PolicyAction::Block);
+    if action == PolicyAction::RewriteLimit {
+        // A LIMIT rewrite bounds reads: it applies to SELECT only.
+        let select = AppliesTo::op_bit("select");
+        if applies.ops & !select != 0 {
+            errors.push(Issue::new(
+                "applies_to.ops",
+                "`rewrite_limit` bounds SELECT statements only: use `ops: [select]` or leave `ops` out",
+            ));
+        }
+        applies.ops = select;
+        if sources.iter().any(|(_, src)| src.contains("stmt.limit")) {
+            warnings.push(Issue::new(
+                "",
+                "`rewrite_limit` only ever lowers a LIMIT, so a condition on `stmt.limit` is not needed; \
+                 it makes `LIMIT $1` UNKNOWN instead of rewriting it to `LEAST($1, n)`",
+            ));
+        }
+    }
     if action == PolicyAction::Allow {
         warnings.push(Issue::new(
             "action",
@@ -840,6 +890,7 @@ pub(crate) fn parse(yaml: &str) -> Result<PolicySpec, Vec<Issue>> {
         test,
         on_unknown,
         action,
+        rewrite_limit,
         approval,
         fallback,
         exempt,
@@ -1000,7 +1051,22 @@ approval:
     fn refusals() {
         assert!(errs("when: 'true'\ndeny-if: 'true'").contains("unknown field `deny-if`"));
         assert!(errs("when: 'true'\nlimits: {max_rows_returned: 1}").contains("Phase 2"));
-        assert!(errs("action: {rewrite_limit: 1000}").contains("M5"));
+        assert!(errs("action: {rewrite_limit: 0}").contains("from 1 to 1000000"));
+        assert!(errs("action: {rewrite_limit: 1000001}").contains("from 1 to 1000000"));
+        assert!(errs("action: {rewrite_limit: '10'}").contains("whole number"));
+        assert!(errs("action: {rewrite_limit: 10.5}").contains("whole number"));
+        assert!(
+            errs("action: {rewrite_limit: 10, inject_predicate: {}}").contains("exactly one key")
+        );
+        assert!(
+            errs("applies_to: {ops: [select, update]}\naction: {rewrite_limit: 10}")
+                .contains("SELECT statements only")
+        );
+        assert!(
+            errs("applies_to: {principal_types: [agent]}\naction: {rewrite_limit: 10}\napproval: {quorum: 1}")
+                .contains("needs `action: require_approval`")
+        );
+        assert!(errs("action: {inject_predicate: {column: tenant_id}}").contains("Phase 2"));
         assert!(errs("action: nuke").contains("not an action"));
         assert!(errs("deny_if: 'true'\nrequire: 'true'").contains("exactly one"));
         assert!(
@@ -1053,6 +1119,17 @@ approval:
         );
         let p = parse(r#"require: 'stmt.filter_values("public.t.c").all(v, v == "a")'"#).unwrap();
         assert!(p.warnings.iter().any(|w| w.message.contains("has_filter")));
+        let p =
+            parse("applies_to: {principal_types: [agent]}\naction: {rewrite_limit: 1000}").unwrap();
+        assert_eq!(
+            (p.action, p.rewrite_limit),
+            (PolicyAction::RewriteLimit, Some(1000))
+        );
+        assert_eq!(p.on_unknown, OnUnknown::Flag);
+        assert_eq!(p.applies.ops, AppliesTo::op_bit("select"));
+        let p = parse("when: '!has(stmt.limit) || stmt.limit > 10'\naction: {rewrite_limit: 10}")
+            .unwrap();
+        assert!(p.warnings.iter().any(|w| w.message.contains("LEAST")));
         let p = parse("action: require_approval\napplies_to: {principal_types: [agent, human]}")
             .unwrap();
         let a = p.approval.unwrap();

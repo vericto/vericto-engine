@@ -15,7 +15,8 @@ use super::cel::compile::Func;
 use super::cel::{Activation, FaultKind, Field};
 use super::context::{EvalContext, HostMode, PrincipalType};
 use super::facts::{self, FactList, Facts, Want};
-use super::spec::{self, AppliesTo, OnUnknown, PolicyAction, PolicySpec};
+pub(crate) use super::spec::OnUnknown;
+use super::spec::{self, AppliesTo, PolicyAction, PolicySpec};
 use crate::parser::ParsedQuery;
 use crate::rules::engine::{
     EnforcementAction, EnforcementPolicy, ReportedViolation, Rule, RuleClass, RuleType, Severity,
@@ -51,6 +52,13 @@ pub enum PolicyOutcome {
     /// The statement did not parse, and this enforced policy may apply to
     /// it: the parse error is forced to block.
     Unreadable,
+    /// A `rewrite_limit` bounded the statement: `rewritten_query` carries
+    /// the LIMIT (not applied in monitor mode, or when the statement is
+    /// blocked anyway; `reason` says so). Since 4.5.0.
+    Rewritten,
+    /// A `rewrite_limit` could not be applied safely: the statement blocks
+    /// (failure blocks, as for VERICTO-085). Since 4.5.0.
+    RewriteFailed,
 }
 
 /// One policy result, for the audit trail and the simulator.
@@ -400,11 +408,29 @@ fn tables_match(applies: &AppliesTo, f: &Facts) -> bool {
     }
 }
 
+/// A violated `rewrite_limit` policy on one statement: the rewrite runs
+/// after every other finding (design §4.6 step 6), on the final text.
+#[derive(Debug, Clone)]
+pub(crate) struct RewriteRequest {
+    pub(crate) statement: usize,
+    pub(crate) limit: u64,
+    pub(crate) rule_id: String,
+    pub(crate) code: String,
+    pub(crate) severity: Severity,
+    pub(crate) label: Option<String>,
+    pub(crate) message: String,
+    /// `mode: monitor`: reported, never applied.
+    pub(crate) monitor: bool,
+    pub(crate) on_unknown: OnUnknown,
+}
+
 /// Everything the policies decided on one reading of a statement.
 #[derive(Debug, Default)]
 pub(crate) struct Verdict {
     pub(crate) hits: Vec<PolicyHit>,
     pub(crate) violations: Vec<ReportedViolation>,
+    /// Violated `rewrite_limit` policies, in policy order.
+    pub(crate) rewrites: Vec<RewriteRequest>,
     /// Requires approval: one per approval policy violated, by precedence.
     pub(crate) approvals: Vec<(String, ApprovalRequirement)>,
     pub(crate) exemptions: Vec<(RuleClass, EnforcementAction)>,
@@ -424,6 +450,8 @@ fn resolve(
         PolicyAction::Monitor => (EnforcementAction::Monitor, false),
         PolicyAction::Flag => (EnforcementAction::Flag, false),
         PolicyAction::Block => (EnforcementAction::Block, false),
+        // Resolved after the rewrite ran (`RewriteRequest`), never here.
+        PolicyAction::RewriteLimit => (EnforcementAction::Monitor, false),
         PolicyAction::RequireApproval => match ptype {
             PrincipalType::Agent | PrincipalType::Human => (EnforcementAction::Block, true),
             other => match fallback.get(&other) {
@@ -651,6 +679,20 @@ pub(crate) fn evaluate(
                 continue;
             }
             if !violated {
+                continue;
+            }
+            if let (PolicyAction::RewriteLimit, Some(limit)) = (s.action, s.rewrite_limit) {
+                verdict.rewrites.push(RewriteRequest {
+                    statement: i,
+                    limit,
+                    rule_id: p.rule_id.clone(),
+                    code: p.code.clone(),
+                    severity: p.severity,
+                    label: s.label.clone(),
+                    message,
+                    monitor: s.monitor,
+                    on_unknown: s.on_unknown,
+                });
                 continue;
             }
             let (action, approval) = resolve(s.action, s.monitor, &s.fallback, ptype, policy);

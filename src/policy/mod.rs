@@ -62,6 +62,7 @@ pub mod check;
 pub mod context;
 pub(crate) mod facts;
 pub use facts::{StatementFacts, statement_facts};
+pub(crate) mod rewrite;
 pub mod set;
 pub mod spec;
 
@@ -70,8 +71,23 @@ pub use context::{
     DbContext, EvalContext, HostMode, Principal, PrincipalType, SessionContext, Ticket,
     TimeContext, Trust,
 };
+pub use rewrite::MAX_REWRITE_LIMIT;
 pub use set::{
     ApprovalRequirement, ApprovalSpec, PolicyError, PolicyHit, PolicyOutcome, PolicySet,
     UnknownField,
 };
 pub use spec::{Issue, POLICY_KEYS, PolicyAction, is_policy_document};
+
+/// The policy language this engine evaluates. Hosts announce it to the
+/// control plane (`X-Vericto-Policy-Language`), which sends policies only to
+/// hosts that understand them.
+pub const POLICY_LANGUAGE: &str = "cel/1";
+
+/// The optional features of [`POLICY_LANGUAGE`] this engine supports, for
+/// hosts to announce next to it as comma-separated tokens
+/// (`X-Vericto-Policy-Language: cel/1, rewrite_limit`): a control plane that
+/// only knows `cel/1` splits the header on commas, so it still reads the
+/// language. A control plane withholds a document that needs a feature from
+/// hosts that do not announce it: an engine without the feature would refuse
+/// the document and fail closed in its scope. Since 4.5.0: `rewrite_limit`.
+pub const POLICY_FEATURES: &[&str] = &["rewrite_limit"];

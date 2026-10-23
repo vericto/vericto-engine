@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.0] — 2026-10-23
+
+**`rewrite_limit`: bounded reads as a business policy** (design "Business
+policy rules" §8.1; implementation plan, milestone M5; the same semantics as
+the runtime-controls VERICTO-102 bound). Nothing changes for anyone who does
+not use it: `evaluate()` is unchanged for every input, the corpus goldens are
+unchanged byte for byte, and without a `rewrite_limit` policy
+`evaluate_with_context()` runs exactly the 4.4.0 code (one emptiness check).
+
+### Added
+
+- **`action: { rewrite_limit: n }`** (1 to 1,000,000; SELECT only:
+  `applies_to.ops` is `[select]` or left out; default `on_unknown: flag`).
+  A violated policy adds the outer `LIMIT n`, or lowers a larger literal
+  `LIMIT`/`FETCH FIRST`/MySQL `LIMIT a, m`; `OFFSET` is kept; a set operation
+  gets one outer `LIMIT`; subqueries and CTEs are untouched. Postgres
+  `LIMIT $k` (or any expression) becomes `LIMIT LEAST($k::bigint, n)`, which
+  keeps the parameter's number and inferred type. MySQL `LIMIT ?` is UNKNOWN
+  (`on_unknown` decides). Out of scope, as VERICTO-102: `SELECT 1`, `VALUES`,
+  aggregate-only projections without `GROUP BY`, `SELECT … INTO`,
+  data-modifying CTEs, `EXPLAIN`. Postgres and MySQL; other dialects are
+  UNKNOWN.
+- Built on the VERICTO-085 machinery and run last (§4.6 step 6): on top of a
+  mask when both apply; deparse (Postgres) or the MySQL renderer, then the
+  text must parse back with the same bind parameters; **failure blocks**
+  (`FETCH … WITH TIES` too). An applied rewrite is a `monitor` finding of the
+  policy with `rewritten_query` set; `monitor_mode`, `mode: monitor` and a
+  statement that blocks anyway apply nothing and report the would-be text as
+  the finding's `suggested_safe_query`.
+- `PolicyAction::RewriteLimit`; `PolicyOutcome::Rewritten` and
+  `PolicyOutcome::RewriteFailed`; `policy::MAX_REWRITE_LIMIT`.
+- `policy::POLICY_LANGUAGE` (`"cel/1"`) and `policy::POLICY_FEATURES`
+  (`["rewrite_limit"]`), for hosts to announce, so a control plane can
+  withhold `rewrite_limit` documents from older engines (which refuse them and
+  fail closed in their scope).
+- Fixtures: `expect: rewrite` and an optional `expect_sql:` (the exact text to
+  execute); reasons `REWRITTEN` and `REWRITE_FAILED`; `FixtureResult` gains
+  `rewritten_query`.
+- The checker validates the bound and the SELECT-only scope, and warns when a
+  `rewrite_limit` policy reads `stmt.limit` (not needed, and it makes
+  `LIMIT $1` UNKNOWN instead of rewriting it).
+- Tests: `tests/policy_rewrite.rs` (semantics, composition with the mask,
+  monitor modes, failures, fixtures, a property over generated SELECTs:
+  total, idempotent, binds kept) and `tests/limit_equivalence.rs` (against
+  real Postgres and MySQL: the rewritten query returns the first `n` rows of
+  the original under the same `ORDER BY`, across LIMIT/OFFSET, FETCH FIRST,
+  MySQL `LIMIT a, b`, UNION/INTERSECT/EXCEPT, CTEs, recursive CTEs,
+  subqueries, GROUP BY, DISTINCT, windows, FOR UPDATE and bind parameters,
+  plus mask + LIMIT); the fuzz target `policy` also runs the rewrite.
+
+### Changed
+
+- The checker no longer refuses `rewrite_limit` ("not available in this engine
+  version"); `inject_predicate` still is (Phase 2).
+
 ## [4.4.0] — 2026-10-21
 
 **Business policies (Phase 1, engine core).** A custom rule can now be a
@@ -2032,7 +2087,10 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.2.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.5.0...HEAD
+[4.5.0]: https://github.com/vericto/vericto-engine/compare/v4.4.0...v4.5.0
+[4.4.0]: https://github.com/vericto/vericto-engine/compare/v4.3.0...v4.4.0
+[4.3.0]: https://github.com/vericto/vericto-engine/compare/v4.2.0...v4.3.0
 [4.2.0]: https://github.com/vericto/vericto-engine/compare/v4.1.3...v4.2.0
 [4.1.3]: https://github.com/vericto/vericto-engine/compare/v4.1.2...v4.1.3
 [4.1.2]: https://github.com/vericto/vericto-engine/compare/v4.1.1...v4.1.2
