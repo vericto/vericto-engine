@@ -60,8 +60,8 @@ action: block
     ("two conditions", "deny_if: 'true'\nrequire: 'true'"),
     ("an unknown key", "deny-if: 'true'\nwhen: 'true'"),
     (
-        "rewrite_limit before M5",
-        "when: 'true'\naction: { rewrite_limit: 1000 }",
+        "rewrite_limit over its bound",
+        "when: 'true'\naction: { rewrite_limit: 5000000 }",
     ),
     (
         "an exemption without strong trust",
@@ -78,6 +78,14 @@ action: block
         "require: stmt.filter_values('public.t.c').all(v, v == 1)",
     ),
     ("everything", "action: flag"),
+    (
+        "LIMIT cap (design 5.3a)",
+        "rule: cap-select-rows\napplies_to: { ops: [select], principal_types: [agent, human] }\nwhen: '!has(stmt.limit) || stmt.limit > 1000'\naction: { rewrite_limit: 1000 }",
+    ),
+    (
+        "rewrite_limit on writes",
+        "applies_to: { ops: [select, delete] }\naction: { rewrite_limit: 1000 }",
+    ),
 ];
 
 fn render() -> String {
@@ -118,7 +126,8 @@ fn checker_verdicts() {
     // The first five are valid; then every refusal; the last two only warn.
     assert_eq!(&valid[..5], &[true; 5]);
     assert!(valid[5..18].iter().all(|v| !v));
-    assert_eq!(&valid[18..], &[true, true]);
+    assert_eq!(&valid[18..21], &[true, true, true]);
+    assert!(!valid[21]);
     let legacy = check_policy(DOCS[0].1);
     assert!(!legacy.is_policy);
     let tenant = check_policy(DOCS[2].1);

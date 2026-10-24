@@ -226,6 +226,9 @@ struct Fixture {
     expect: String,
     #[serde(default)]
     expect_reason: Option<String>,
+    /// With `expect: rewrite`: the exact text to execute (since 4.5.0).
+    #[serde(default)]
+    expect_sql: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -288,6 +291,10 @@ pub struct FixtureResult {
     /// The outcome's node path, for a failing fixture.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The text the host executes instead of the fixture's SQL (a
+    /// `rewrite_limit` or a mask), when there is one. Since 4.5.0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewritten_query: Option<String>,
 }
 
 fn context(f: &Fixture) -> Result<EvalContext, String> {
@@ -346,6 +353,10 @@ fn context(f: &Fixture) -> Result<EvalContext, String> {
 /// Runs the `tests:` fixtures of a policy document against the policy
 /// alone, on `dialect` unless a fixture names another. A fixture with
 /// `params:` is skipped: bind values are Phase 2.
+///
+/// `expect:` is the outcome: `allow`, `monitor`, `flag`, `block`,
+/// `require_approval`, or `rewrite` (since 4.5.0: a `rewrite_limit` was
+/// applied; `expect_sql:` optionally pins the exact text to execute).
 pub fn run_policy_tests(yaml: &str, dialect: Dialect) -> Result<Vec<FixtureResult>, String> {
     let list = fixtures(yaml)?;
     let rule = Rule {
@@ -378,6 +389,7 @@ pub fn run_policy_tests(yaml: &str, dialect: Dialect) -> Result<Vec<FixtureResul
                 expected_reason: f.expect_reason,
                 actual_reason: None,
                 detail: None,
+                rewritten_query: None,
             });
             continue;
         }
@@ -391,8 +403,13 @@ pub fn run_policy_tests(yaml: &str, dialect: Dialect) -> Result<Vec<FixtureResul
             .policy_hits
             .iter()
             .any(|h| h.action == Some(EnforcementAction::Monitor));
+        // The fixtures run without sensitive columns: a text to execute is
+        // a `rewrite_limit` that applied.
+        let rewrote = o.decision != Decision::Block && o.rewritten_query.is_some();
         let actual = if o.approval_required.is_some() {
             "require_approval"
+        } else if rewrote {
+            "rewrite"
         } else {
             match o.decision {
                 Decision::Block => "block",
@@ -410,13 +427,18 @@ pub fn run_policy_tests(yaml: &str, dialect: Dialect) -> Result<Vec<FixtureResul
                 PolicyOutcome::CompileError => "COMPILE_ERROR",
                 PolicyOutcome::Unreadable => "PARSE_ERROR",
                 PolicyOutcome::Exempted => "EXEMPTED",
+                PolicyOutcome::Rewritten => "REWRITTEN",
+                PolicyOutcome::RewriteFailed => "REWRITE_FAILED",
             }
             .to_string()
         });
         let passed = actual == expected
             && f.expect_reason
                 .as_ref()
-                .is_none_or(|r| actual_reason.as_deref() == Some(r.as_str()));
+                .is_none_or(|r| actual_reason.as_deref() == Some(r.as_str()))
+            && f.expect_sql
+                .as_ref()
+                .is_none_or(|q| o.rewritten_query.as_deref() == Some(q.as_str()));
         out.push(FixtureResult {
             name: f.name,
             passed,
@@ -425,7 +447,8 @@ pub fn run_policy_tests(yaml: &str, dialect: Dialect) -> Result<Vec<FixtureResul
             actual,
             expected_reason: f.expect_reason,
             actual_reason,
-            detail: (!passed).then(|| o.ast_node_path.unwrap_or_default()),
+            detail: (!passed).then(|| o.ast_node_path.clone().unwrap_or_default()),
+            rewritten_query: o.rewritten_query,
         });
     }
     Ok(out)

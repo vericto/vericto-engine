@@ -33,7 +33,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.4.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.5.0" }
 ```
 
 ### Quick example
@@ -98,8 +98,8 @@ severity to, and `engine_driven` for VERICTO-085, 086 and 087, which the policy
 drives and the rules slice neither enables nor disables. A test keeps the table
 equal to the catalogue below.
 
-`ENGINE_VERSION` is this crate's version (`"4.4.0"`) and
-`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@4.4.0"`):
+`ENGINE_VERSION` is this crate's version (`"4.5.0"`) and
+`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@4.5.0"`):
 a built-in rule's predicate lives in the engine, so what the standard ruleset
 detects changes with the engine version. Print them with a verdict to say what
 it was evaluated with.
@@ -1023,7 +1023,8 @@ statement (the *principal*), what it does (its facts: tables, columns, the
 values it assigns, the values its `WHERE` pins), and the declared context
 (database, time, ticket, session), combined in a [CEL](https://github.com/google/cel-spec)
 expression inside the same YAML. It resolves to `allow`, `monitor`, `flag`,
-`block` or `require_approval`.
+`block` or `require_approval`, or (since 4.5.0) rewrites the statement with
+`rewrite_limit`.
 
 ```yaml
 rule: refund-cap
@@ -1070,14 +1071,56 @@ let outcome = evaluate_with_context(sql, Dialect::Postgres, &rules, &Enforcement
 | `when` | CEL guard |
 | `deny_if` / `require` | CEL: a violation when `deny_if` is true or `require` is false (at most one; neither: every match is a violation) |
 | `on_unknown` | `block` (default for `block`/`require_approval`), `flag` (default otherwise), `skip` (only with an explicit `modes:` list) |
-| `action` | `allow`, `monitor`, `flag`, `block`, `require_approval` |
+| `action` | `allow`, `monitor`, `flag`, `block`, `require_approval`, or `{ rewrite_limit: n }` (since 4.5.0; see below) |
 | `approval` | `approvers` (`roles`, `groups`), `quorum`, `request_timeout`, `grant_ttl`, `fallback_for` (`service`/`pipeline`/`tool` → `block` or `flag`: they never wait for a human) |
 | `exempt` | `{ rule_classes: [schema_migration, performance], cap: flag }`: caps those rule classes for this principal. Needs `min_trust: strong`; Security and DataMutation can never be exempted |
 | `mode` | `enforce` (default) or `monitor` (blocks become flags) |
 | `message`, `tests`, `rule`, `code`, `severity`, `metadata` | Text (`{{vars.x}}` is substituted), fixtures, labels |
 
-`rewrite_limit`, `inject_predicate`, `limits`, `budget`, `deny_after` and
-`params` are refused by this version (later milestones and phases).
+`inject_predicate`, `limits`, `budget`, `deny_after` and `params` are refused
+by this version (later phases).
+
+### `rewrite_limit`: bounded reads (since 4.5.0)
+
+```yaml
+rule: cap-agent-reads
+applies_to: { principal_types: [agent] }   # ops: [select] is implied
+action: { rewrite_limit: 1000 }
+tests:
+  - { name: capped, sql: "SELECT id FROM orders", principal: { type: agent }, expect: rewrite,
+      expect_sql: "SELECT id FROM orders LIMIT 1000" }
+```
+
+A violated `rewrite_limit` policy bounds the **outer** query of a top-level
+`SELECT` to `n` rows (1 to 1,000,000), the semantics of the runtime-controls
+VERICTO-102 bound:
+
+| The statement | Becomes |
+|---|---|
+| No `LIMIT` (or `LIMIT ALL` / `LIMIT NULL`) | `… LIMIT n`; a set operation gets one outer `LIMIT` |
+| `LIMIT m`, `FETCH FIRST m ROWS ONLY`, MySQL `LIMIT a, m` with `m > n` | `m` lowered to `n`; `OFFSET` kept |
+| `LIMIT m` with `m <= n` | Unchanged (no finding) |
+| Postgres `LIMIT $k` (or any expression) | `LIMIT LEAST($k::bigint, n)`: the parameter keeps its number and its inferred type |
+| MySQL `LIMIT ?` / `LIMIT a, ?` | Unchanged and UNKNOWN: `on_unknown` decides (default `flag`). The value is only known at execution; the proxy checks it in Phase 2 |
+| `FETCH … WITH TIES`, text the rewrite cannot reproduce exactly | **Blocked** (outcome `rewrite_failed`): failure blocks |
+| `SELECT 1`, `VALUES`, aggregate-only projections without `GROUP BY`, `SELECT … INTO`, data-modifying CTEs, `EXPLAIN` | Out of scope: unchanged |
+
+Subqueries and CTEs are never touched. Without `ORDER BY` the rows kept are an
+arbitrary subset; the finding says so. The rewrite runs last (after VERICTO-085:
+a masked query is bounded on top of its mask), on Postgres through the
+`pg_query` deparser and on MySQL through the VERICTO-085 renderer, and is only
+returned after the same checks (the text parses back, with the same bind
+parameters in the same order). An applied rewrite is a `monitor` finding with
+`rewritten_query` set, which the host executes instead of the original; under
+`monitor_mode`, `mode: monitor` or when the statement blocks anyway, nothing is
+rewritten and the would-be text is the finding's `suggested_safe_query`.
+Postgres and MySQL only: other dialects are UNKNOWN. `tests/limit_equivalence.rs`
+checks against real Postgres and MySQL that the rewritten query returns the
+first `n` rows of the original under the same `ORDER BY`.
+
+Hosts that support it announce `policy::POLICY_FEATURES` (`["rewrite_limit"]`)
+next to `policy::POLICY_LANGUAGE` (`cel/1`), so a control plane can withhold
+such documents from older engines, which refuse them and fail closed.
 
 ### The context
 

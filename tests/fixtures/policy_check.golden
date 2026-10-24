@@ -24,8 +24,8 @@
 {"is_policy":true,"valid":false,"errors":[{"key":"require","message":"use exactly one of `deny_if` and `require`"}],"warnings":[],"fields":[],"decidability":[],"phase":"static","tests":0}
 ## an unknown key
 {"is_policy":true,"valid":false,"errors":[{"key":"","message":"invalid policy document: unknown field `deny-if`, expected one of `rule`, `code`, `version`, `severity`, `mode`, `metadata`, `description`, `message`, `tests`, `applies_to`, `modes`, `node_type`, `condition`, `vars`, `min_trust`, `on_insufficient_trust`, `when`, `deny_if`, `require`, `on_unknown`, `action`, `exempt`, `approval`, `deny_after`, `limits`, `budget`, `params`"}],"warnings":[],"fields":[],"decidability":[],"phase":"static","tests":0}
-## rewrite_limit before M5
-{"is_policy":true,"valid":false,"errors":[{"key":"action","message":"`rewrite_limit`: not available in this engine version: the LIMIT rewrite ships with the templates milestone (M5)"}],"warnings":[],"fields":[],"decidability":[],"phase":"static","tests":0}
+## rewrite_limit over its bound
+{"is_policy":true,"valid":false,"errors":[{"key":"action.rewrite_limit","message":"must be a whole number of rows from 1 to 1000000"}],"warnings":[],"fields":[],"decidability":[],"phase":"static","tests":0}
 ## an exemption without strong trust
 {"is_policy":true,"valid":false,"errors":[{"key":"min_trust","message":"an exemption loosens rules: it needs `min_trust: strong` (weak signals never loosen)"}],"warnings":[],"fields":[],"decidability":[],"phase":"static","tests":0}
 ## approval for services
@@ -38,3 +38,7 @@
 {"is_policy":true,"valid":true,"errors":[],"warnings":[{"key":"","message":"`stmt.filter_values(…).all(…)` is true when the column is not filtered at all (an empty list): pair it with `stmt.has_filter(…)`"}],"fields":[],"decidability":[{"mode":"proxy","status":"static","declared":[],"absent":[],"message":"Static in proxy"},{"mode":"runtime_api","status":"static","declared":[],"absent":[],"message":"Static in runtime_api"},{"mode":"mcp","status":"static","declared":[],"absent":[],"message":"Static in mcp"},{"mode":"ci","status":"static","declared":[],"absent":[],"message":"Static in ci"}],"phase":"static","tests":0}
 ## everything
 {"is_policy":true,"valid":true,"errors":[],"warnings":[{"key":"","message":"this policy applies to every statement of every principal"}],"fields":[],"decidability":[{"mode":"proxy","status":"static","declared":[],"absent":[],"message":"Static in proxy"},{"mode":"runtime_api","status":"static","declared":[],"absent":[],"message":"Static in runtime_api"},{"mode":"mcp","status":"static","declared":[],"absent":[],"message":"Static in mcp"},{"mode":"ci","status":"static","declared":[],"absent":[],"message":"Static in ci"}],"phase":"static","tests":0}
+## LIMIT cap (design 5.3a)
+{"is_policy":true,"valid":true,"errors":[],"warnings":[{"key":"","message":"`rewrite_limit` only ever lowers a LIMIT, so a condition on `stmt.limit` is not needed; it makes `LIMIT $1` UNKNOWN instead of rewriting it to `LEAST($1, n)`"}],"fields":["stmt.limit"],"decidability":[{"mode":"proxy","status":"static","declared":[],"absent":[],"message":"Static in proxy"},{"mode":"runtime_api","status":"static","declared":[],"absent":[],"message":"Static in runtime_api"},{"mode":"mcp","status":"static","declared":[],"absent":[],"message":"Static in mcp"},{"mode":"ci","status":"static","declared":[],"absent":[],"message":"Static in ci"}],"phase":"static","tests":0}
+## rewrite_limit on writes
+{"is_policy":true,"valid":false,"errors":[{"key":"applies_to.ops","message":"`rewrite_limit` bounds SELECT statements only: use `ops: [select]` or leave `ops` out"}],"warnings":[],"fields":[],"decidability":[],"phase":"static","tests":0}
