@@ -1192,6 +1192,12 @@ fn a_walk_that_cannot_finish_fails_closed_with_its_reason() {
         "{o:?}"
     );
     assert!(o.access_denied.is_empty(), "{:?}", denied(&o));
+    assert_eq!(
+        o.suggested_safe_query.as_deref(),
+        Some(
+            "This statement could not be checked against the agent-access allowlist of this identity, so it is refused. Split it into simpler statements, each checked against the allowlist, or ask a person"
+        )
+    );
     // Observe mode reports the same thing without blocking.
     let observe = AccessPolicy {
         mode: AccessMode::Observe,
@@ -2579,4 +2585,186 @@ fn order_by_all_stays_a_column_outside_snowflake() {
         let o = eval(d, "SELECT id FROM customers ORDER BY ALL", &agent());
         assert_eq!(o.decision, Decision::Block, "{d:?}: {o:?}");
     }
+}
+
+// ── The suggested fix ───────────────────────────────────────────────────────
+
+const GRANT_TEXT: &str = "An admin must grant it to this identity in Dashboard > Agent access; until then do not run it, and do not reach the same data through another table, identity or connection";
+
+#[test]
+fn a_denied_table_gets_a_fix_that_names_it_and_who_grants_it() {
+    let sql = "SELECT id FROM secrets";
+    let o = eval(Postgres, sql, &agent());
+    assert_eq!(o.decision, Decision::Block, "{o:?}");
+    // The existing fields are unchanged.
+    assert_eq!(o.rule_code.as_deref(), Some(ACCESS_RULE_CODE));
+    assert_eq!(
+        o.ast_node_path.as_deref(),
+        Some("AccessPolicy > secrets (read)")
+    );
+    assert_eq!(denied(&o), vec!["secrets:read".to_string()]);
+    let fix = format!(
+        "Not in the agent-access allowlist of this identity: `secrets` (needs read). {GRANT_TEXT}"
+    );
+    assert_eq!(o.suggested_safe_query.as_deref(), Some(fix.as_str()));
+    // The fix travels with the violation too, where hosts read every finding.
+    let v = o
+        .violations
+        .iter()
+        .find(|v| v.rule_code == ACCESS_RULE_CODE)
+        .expect("VERICTO-087 in violations");
+    assert_eq!(v.suggested_safe_query.as_deref(), Some(fix.as_str()));
+    // Deterministic: same statement and policy, same text, on every dialect
+    // that reads the statement the same way.
+    for d in [Postgres, Mysql, MsSql, Oracle, Sqlite] {
+        let again = eval(d, sql, &agent());
+        assert_eq!(
+            again.suggested_safe_query.as_deref(),
+            Some(fix.as_str()),
+            "{d:?}"
+        );
+    }
+}
+
+#[test]
+fn the_fix_names_the_column_and_the_level_a_write_needs() {
+    let o = eval(
+        Postgres,
+        "SELECT id FROM customers WHERE email = $1",
+        &agent(),
+    );
+    assert_eq!(
+        o.suggested_safe_query.as_deref(),
+        Some(
+            format!(
+                "Not in the agent-access allowlist of this identity: `customers.email` (needs read). {GRANT_TEXT}"
+            )
+            .as_str()
+        )
+    );
+    // `orders` is read-only: a write needs read_write.
+    let o = eval(
+        Postgres,
+        "UPDATE orders SET total = 0 WHERE id = 1",
+        &agent(),
+    );
+    assert_eq!(o.decision, Decision::Block, "{o:?}");
+    let fix = o.suggested_safe_query.unwrap_or_default();
+    assert!(fix.contains("`orders` (needs read_write)"), "{fix}");
+    assert!(fix.contains(GRANT_TEXT), "{fix}");
+}
+
+#[test]
+fn the_fix_names_three_references_and_counts_the_rest() {
+    let o = eval(
+        Postgres,
+        "SELECT s.a, a.b, c.email, c.ssn FROM secrets s, admin_users a, customers c",
+        &agent(),
+    );
+    assert_eq!(o.decision, Decision::Block, "{o:?}");
+    assert!(o.access_denied.len() > 3, "{:?}", denied(&o));
+    let fix = o.suggested_safe_query.unwrap_or_default();
+    let more = format!(" and {} more. ", o.access_denied.len() - 3);
+    assert!(fix.contains(&more), "{fix}");
+    assert_eq!(fix.matches("(needs ").count(), 3, "{fix}");
+}
+
+#[test]
+fn a_star_keeps_the_list_columns_hint_after_the_grant() {
+    let o = eval(Postgres, "SELECT * FROM customers", &agent());
+    let fix = o.suggested_safe_query.unwrap_or_default();
+    assert!(
+        fix.starts_with(
+            "Not in the agent-access allowlist of this identity: `customers.*` (needs read)."
+        ),
+        "{fix}"
+    );
+    assert!(
+        fix.ends_with("need every column of the table granted"),
+        "{fix}"
+    );
+}
+
+#[test]
+fn an_unqualified_ambiguous_column_says_to_qualify_it() {
+    let o = eval(
+        Postgres,
+        "SELECT name FROM customers JOIN orders ON orders.customer_id = customers.id WHERE email = 'x'",
+        &agent(),
+    );
+    assert_eq!(o.decision, Decision::Block, "{o:?}");
+    let fix = o.suggested_safe_query.unwrap_or_default();
+    assert!(
+        fix.contains("is unqualified and may belong to several tables"),
+        "{fix}"
+    );
+}
+
+#[test]
+fn ddl_is_never_offered_a_grant() {
+    let o = eval(Postgres, "CREATE TABLE t (id int)", &agent());
+    assert_eq!(o.decision, Decision::Block, "{o:?}");
+    let fix = o.suggested_safe_query.unwrap_or_default();
+    assert!(
+        fix.starts_with("`CREATE TABLE` is always denied under an agent-access allowlist"),
+        "{fix}"
+    );
+    assert!(fix.ends_with("ask a person to run it"), "{fix}");
+    assert!(!fix.contains("grant"), "DDL cannot be granted: {fix}");
+}
+
+#[test]
+fn the_fix_never_points_at_another_way_in() {
+    // Granted tables are never suggested as an alternative, and the text has
+    // no quotes a host's literal sanitizer would cut.
+    for (sql, d) in [
+        ("SELECT id FROM secrets", Postgres),
+        ("SELECT email FROM customers", Mysql),
+        ("DELETE FROM secrets WHERE id = 1", Postgres),
+        ("SET ROLE admin", Postgres),
+        ("SELECT * FROM customers", Mysql),
+    ] {
+        let o = eval(d, sql, &agent());
+        let fix = o.suggested_safe_query.unwrap_or_default();
+        assert!(!fix.is_empty(), "{sql}");
+        for granted in ["`orders`", "`jobs`", "`tickets`"] {
+            assert!(!fix.contains(granted), "{sql}: {fix}");
+        }
+        assert!(!fix.contains('\'') && !fix.contains('"'), "{sql}: {fix}");
+    }
+}
+
+#[test]
+fn observe_mode_flags_with_the_same_fix() {
+    let observe = AccessPolicy {
+        mode: AccessMode::Observe,
+        ..agent()
+    };
+    let enforced = eval(Postgres, "SELECT id FROM secrets", &agent());
+    let o = eval(Postgres, "SELECT id FROM secrets", &observe);
+    assert_eq!(o.decision, Decision::Flag, "{o:?}");
+    assert_eq!(o.suggested_safe_query, enforced.suggested_safe_query);
+}
+
+#[test]
+fn a_host_rebuilds_the_fix_from_its_redacted_list() {
+    let o = eval(Mysql, "SELECT id FROM customers WHERE email = 1", &agent());
+    // Unredacted: the same text as the evaluation.
+    assert_eq!(
+        crate::access_suggested_fix(&o.access_denied),
+        o.suggested_safe_query
+    );
+    // Redacted names: the fix carries the redaction, never the original.
+    let redacted: Vec<DeniedRef> = o
+        .access_denied
+        .iter()
+        .map(|d| DeniedRef {
+            column: d.column.as_ref().map(|_| "?".to_string()),
+            ..d.clone()
+        })
+        .collect();
+    let fix = crate::access_suggested_fix(&redacted).unwrap_or_default();
+    assert!(fix.contains("`customers.?` (needs read)"), "{fix}");
+    assert!(!fix.contains("email"), "{fix}");
+    assert_eq!(crate::access_suggested_fix(&[]), None);
 }

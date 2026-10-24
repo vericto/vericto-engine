@@ -33,7 +33,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.5.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.6.0" }
 ```
 
 ### Quick example
@@ -98,8 +98,8 @@ severity to, and `engine_driven` for VERICTO-085, 086 and 087, which the policy
 drives and the rules slice neither enables nor disables. A test keeps the table
 equal to the catalogue below.
 
-`ENGINE_VERSION` is this crate's version (`"4.5.0"`) and
-`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@4.5.0"`):
+`ENGINE_VERSION` is this crate's version (`"4.6.0"`) and
+`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@4.6.0"`):
 a built-in rule's predicate lives in the engine, so what the standard ruleset
 detects changes with the engine version. Print them with a verdict to say what
 it was evaluated with.
@@ -245,7 +245,7 @@ Low/Informational → Monitor).
 | VERICTO-098 | SQLite ATTACH DATABASE | `ATTACH [DATABASE] <file> AS <name>` — opens, or creates, another database file on the connection: arbitrary file access or creation, reads and writes across databases (`':memory:'` too). `DETACH` is not reported. Security. (SQLite.) |
 | VERICTO-099 | SQLite safety PRAGMA | A `PRAGMA` write that turns a safety off: `writable_schema` (any value), `trusted_schema = ON`, `foreign_keys = OFF`, `ignore_check_constraints = ON`, `journal_mode = OFF`, `synchronous = OFF`, `cell_size_check = OFF`, `query_only = OFF`, `schema_version = n`, `temp_store_directory` / `data_store_directory`. Reads (`PRAGMA table_info(t)`) and other settings are not reported. SchemaMigration: a CI channel's `schema_migration_cap` softens it (`PRAGMA foreign_keys = OFF` is the standard step of a SQLite table rebuild in migrations). (SQLite.) |
 | VERICTO-101 | SQLite VACUUM INTO | `VACUUM [schema] INTO <file>` — a full copy of the database written to a path. Plain `VACUUM` is not reported. Security. (SQLite.) |
-| VERICTO-087 | Access outside the agent's allowlist | The identity making the call (an API key, or the database user of a proxy session) references a table, column or write target its allowlist does not grant, or runs DDL. Every reference counts, predicates included. Driven by `EnforcementPolicy::access_policy`, not by the rules slice; blocks under `mode = enforce`, flags under `observe`. See [Agent access allowlists](#agent-access-allowlists-vericto-087). |
+| VERICTO-087 | Access outside the agent's allowlist | The identity making the call (an API key, or the database user of a proxy session) references a table, column or write target its allowlist does not grant, or runs DDL. Every reference counts, predicates included. Driven by `EnforcementPolicy::access_policy`, not by the rules slice; blocks under `mode = enforce`, flags under `observe`. The suggested fix names what to grant and where ([The suggested fix](#the-suggested-fix)). See [Agent access allowlists](#agent-access-allowlists-vericto-087). |
 
 ### Medium
 
@@ -647,6 +647,7 @@ assert_eq!(probe.decision, Decision::Block);
 assert_eq!(probe.rule_code.as_deref(), Some("VERICTO-087"));
 assert_eq!(probe.ast_node_path.as_deref(), Some("AccessPolicy > customers.email (read)"));
 assert_eq!(probe.access_denied[0].column.as_deref(), Some("email")); // for the audit trail
+assert!(probe.suggested_safe_query.unwrap().contains("Dashboard > Agent access")); // what to ask for
 ```
 
 An entry is `{"schema": null, "table": "orders", "columns": "*" | ["id", …], "access": "read" | "read_write"}`
@@ -802,6 +803,35 @@ allowed in `customers` as well, and the query is denied with
 qualify the column`. **Fix: qualify the column** —
 `SELECT count(*) FROM customers c WHERE c.id IN (SELECT o.customer_id FROM orders o)`
 is allowed.
+
+### The suggested fix
+
+Every VERICTO-087 finding carries a deterministic `suggested_safe_query` (the
+`suggested_fix` hosts return to the agent): what this identity's allowlist does
+not grant and who can grant it, never a way around it. It is built from the
+sorted `access_denied` list only, so the same statement and policy always get
+the same text, and it has no quotes or apostrophes (hosts store it through their
+SQL literal sanitizer). The `ast_node_path` and `access_denied` fields are as
+before.
+
+- References: up to three, with the level they need (`read`, or `read_write`
+  for a write), then how many more:
+  `` Not in the agent-access allowlist of this identity: `customers.email` (needs read). An admin must grant it to this identity in Dashboard > Agent access; until then do not run it, and do not reach the same data through another table, identity or connection ``.
+  A `*` adds the "list the columns explicitly" hint; an unqualified column that
+  may belong to several tables adds "qualify it with its table, which must also
+  be granted".
+- DDL and the identity / name-resolution statements cannot be granted:
+  `` `CREATE TABLE` is always denied under an agent-access allowlist (DDL and statements that change the session identity or name resolution). Do not retry it in another form: ask a person to run it ``.
+- A statement the analysis could not finish: it is refused, and the fix says to
+  split it into simpler statements (each checked against the allowlist) or ask
+  a person.
+
+The fix names what `access_denied` names, so it is as sensitive as that list. A
+host that redacts names before reporting them (on MySQL a double-quoted `"x"` is
+a string unless `ANSI_QUOTES` is on, and the engine also reads it as a column,
+so a denied "column" can be a literal the client sent) rebuilds the fix from its
+redacted list with [`access_suggested_fix`](src/access/mod.rs): the same text,
+without the hint to qualify an ambiguous column, which needs the query.
 
 ### Precedence with sensitive columns
 

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.6.0] — 2026-10-24
+
+**VERICTO-087 tells the agent what is missing and who can grant it.** Until
+4.5.0 an allowlist denial had no `suggested_safe_query` (only a `*` got the
+"list the columns" hint), so hosts returned `suggested_fix: null` and the proxy
+error had only the table (staging verification of checklist v1.1, check 08).
+
+### Changed
+
+- Every VERICTO-087 finding has a deterministic `suggested_safe_query`, in the
+  flat fields when it wins and in its `violations[]` entry: up to three denied
+  references with the level they need (`read`, or `read_write` for a write) and
+  how many more, and that an admin must grant them to this identity in
+  Dashboard > Agent access, without reaching the same data another way. A `*`
+  keeps the "list the columns explicitly" hint; an unqualified column that may
+  belong to several tables says to qualify it. DDL and the identity /
+  name-resolution statements say they are always denied and to ask a person;
+  a statement the analysis could not finish says to split it or ask a person.
+  Never a way around the allowlist. No quotes or apostrophes, so a host's SQL
+  literal sanitizer keeps it intact.
+- `ast_node_path`, `access_denied`, the decision, the action and the severity
+  are unchanged, and nothing changes without an `access_policy`.
+
+### Added
+
+- `access_suggested_fix(&[DeniedRef]) -> Option<String>`: the same fix, built
+  from a list of denials. The fix names what `access_denied` names, so a host
+  that redacts those names in sanitized mode (a MySQL double-quoted string the
+  engine also reads as a column can be a literal) rebuilds the fix from its
+  redacted list instead of reporting the engine's text.
+
+### Tests
+
+- `src/access/tests.rs`: the exact text for a table, a column and a write; three
+  named references and the count of the rest; `*`; an ambiguous unqualified
+  column; DDL (no grant offered); the unanalysable statement; observe mode; the
+  same text on every dialect; no granted table is ever suggested; the fix
+  rebuilt from a redacted list.
+- README example and `tests/readme_examples.rs` assert the fix.
+
 ## [4.5.0] — 2026-10-23
 
 **`rewrite_limit`: bounded reads as a business policy** (design "Business
@@ -2087,7 +2127,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.5.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.6.0...HEAD
+[4.6.0]: https://github.com/vericto/vericto-engine/compare/v4.5.0...v4.6.0
 [4.5.0]: https://github.com/vericto/vericto-engine/compare/v4.4.0...v4.5.0
 [4.4.0]: https://github.com/vericto/vericto-engine/compare/v4.3.0...v4.4.0
 [4.3.0]: https://github.com/vericto/vericto-engine/compare/v4.2.0...v4.3.0

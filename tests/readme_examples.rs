@@ -183,6 +183,12 @@ fn agent_access_example() {
         Some("AccessPolicy > customers.email (read)")
     );
     assert_eq!(probe.access_denied[0].column.as_deref(), Some("email"));
+    assert!(
+        probe
+            .suggested_safe_query
+            .unwrap()
+            .contains("Dashboard > Agent access")
+    );
 }
 
 #[test]

@@ -15,7 +15,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.5.0" }
+//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.6.0" }
 //! ```
 //!
 //! ```rust
@@ -81,7 +81,7 @@ pub mod sensitive;
 // Re-export the most commonly used types at the crate root for ergonomics.
 pub use access::{
     ACCESS_RULE_CODE, AccessColumns, AccessEntry, AccessLevel, AccessMode, AccessPolicy,
-    AccessPolicyMap, DdlPolicy, DeniedRef, Needed,
+    AccessPolicyMap, DdlPolicy, DeniedRef, Needed, access_suggested_fix,
 };
 pub use error::{ProxyError, Result};
 pub use parser::Dialect;
