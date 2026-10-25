@@ -51,5 +51,8 @@ High-priority issues for this engine include:
 
 Security fixes are applied to the latest released version. Older versions are
 patched at the maintainers' discretion.
+Versions released under the Elastic License 2.0 (vericto-engine 4.2.0 and
+earlier) are no longer maintained and receive no security fixes; upgrade to a
+current release.
 
 Thank you for helping keep Vericto and its users safe.

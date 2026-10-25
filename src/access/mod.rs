@@ -645,7 +645,7 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, policy: &AccessPolicy) -> Option<Ac
     let unanalysable = |e: &dyn std::fmt::Display| AccessVerdict {
         mode: policy.mode,
         ast_node_path: format!("AccessPolicy > query could not be analysed for access ({e})"),
-        suggested_safe_query: None,
+        suggested_safe_query: Some(UNANALYSABLE_FIX.to_string()),
         denied: Vec::new(),
     };
     let one = |dialect: Dialect, walk: &dyn Fn(&Tags) -> crate::error::Result<()>, fold_quoted| {
@@ -745,13 +745,83 @@ pub(crate) fn evaluate(parsed: &ParsedQuery, policy: &AccessPolicy) -> Option<Ac
     if denied.len() > 1 {
         path.push_str(&format!(" (+{} more)", denied.len() - 1));
     }
-    let star = denied.iter().any(|d| d.column.as_deref() == Some("*"));
+    let suggested_safe_query = Some(fix(&denied, &ambiguous));
     Some(AccessVerdict {
         mode: policy.mode,
         ast_node_path: path,
-        suggested_safe_query: star.then(|| LIST_COLUMNS.to_string()),
+        suggested_safe_query,
         denied,
     })
+}
+
+/// Denied references a fix names before it counts the rest.
+const FIX_NAMED: usize = 3;
+
+const GRANT: &str = "An admin must grant it to this identity in Dashboard > Agent access; until then do not run it, and do not reach the same data through another table, identity or connection";
+const DDL_FIX: &str = "is always denied under an agent-access allowlist (DDL and statements that change the session identity or name resolution). Do not retry it in another form: ask a person to run it";
+const UNANALYSABLE_FIX: &str = "This statement could not be checked against the agent-access allowlist of this identity, so it is refused. Split it into simpler statements, each checked against the allowlist, or ask a person";
+
+/// The VERICTO-087 `suggested_safe_query` of a list of denials, for a host
+/// that redacts names of `access_denied` before reporting them (a MySQL
+/// double-quoted string the engine also reads as a column can be a literal):
+/// rebuilt from the redacted list, the fix carries no more than the list. The
+/// same text `evaluate` gives, without the hint to qualify an ambiguous
+/// column, which needs the query. `None` for an empty list.
+pub fn access_suggested_fix(denied: &[DeniedRef]) -> Option<String> {
+    (!denied.is_empty()).then(|| fix(denied, &BTreeSet::new()))
+}
+
+/// The `suggested_safe_query` of a denial: what is missing and who can grant
+/// it, never a way around the allowlist. Built from the sorted denied
+/// references only, so the same statement and policy always get the same
+/// text. No quotes or apostrophes: hosts store it through their SQL literal
+/// sanitizer. The names are the query's, as in `access_denied`.
+fn fix(denied: &[DeniedRef], ambiguous: &BTreeSet<String>) -> String {
+    let (ddl, data): (Vec<&DeniedRef>, Vec<&DeniedRef>) =
+        denied.iter().partition(|d| d.needed == Needed::Ddl);
+    let mut parts = Vec::new();
+    if !data.is_empty() {
+        let named: Vec<String> = data
+            .iter()
+            .take(FIX_NAMED)
+            .map(|d| {
+                let grant = if d.needed == Needed::Write {
+                    "read_write"
+                } else {
+                    "read"
+                };
+                format!("`{}` (needs {grant})", display(d))
+            })
+            .collect();
+        let more = data.len().saturating_sub(FIX_NAMED);
+        let more = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        parts.push(format!(
+            "Not in the agent-access allowlist of this identity: {}{more}. {GRANT}",
+            named.join(", ")
+        ));
+        if data.iter().any(|d| d.column.as_deref() == Some("*")) {
+            parts.push(LIST_COLUMNS.to_string());
+        }
+        let unqualified: Vec<&str> = data
+            .iter()
+            .filter(|d| d.needed == Needed::Read)
+            .filter_map(|d| d.column.as_deref())
+            .filter(|c| ambiguous.contains(&c.to_ascii_lowercase()))
+            .collect();
+        if let Some(c) = unqualified.first() {
+            parts.push(format!(
+                "`{c}` is unqualified and may belong to several tables: qualify it with its table, which must also be granted"
+            ));
+        }
+    }
+    if let Some(d) = ddl.first() {
+        parts.push(format!("`{}` {DDL_FIX}", d.table));
+    }
+    parts.join(". ")
 }
 
 /// Every reference one top-level Postgres statement makes, as the access
