@@ -658,6 +658,16 @@ impl SqlNumber {
         self.digits == "0"
     }
 
+    /// Position of the leading digit relative to the decimal point:
+    /// `digits.len() - scale`. Both terms are bounded by the query size (see
+    /// `parse`), so the saturating arithmetic never actually saturates; it
+    /// only keeps this runtime path free of a panic.
+    fn magnitude(&self) -> i128 {
+        i128::try_from(self.digits.len())
+            .unwrap_or(i128::MAX)
+            .saturating_sub(self.scale)
+    }
+
     fn cmp_abs(&self, other: &Self) -> std::cmp::Ordering {
         match (self.is_zero(), other.is_zero()) {
             (true, true) => return std::cmp::Ordering::Equal,
@@ -665,12 +675,7 @@ impl SqlNumber {
             (false, true) => return std::cmp::Ordering::Greater,
             (false, false) => {}
         }
-        let self_magnitude =
-            i128::try_from(self.digits.len()).expect("query size bounds digit count") - self.scale;
-        let other_magnitude = i128::try_from(other.digits.len())
-            .expect("query size bounds digit count")
-            - other.scale;
-        self_magnitude.cmp(&other_magnitude).then_with(|| {
+        self.magnitude().cmp(&other.magnitude()).then_with(|| {
             let len = self.digits.len().max(other.digits.len());
             (0..len)
                 .map(|index| {
@@ -1033,5 +1038,56 @@ mod constant_tests {
         assert_eq!(Truth::Unknown.not(), Truth::Unknown);
         assert_eq!(Truth::False.not(), Truth::True);
         assert_eq!(Truth::true_or_unknown(false), Truth::Unknown);
+    }
+
+    #[test]
+    fn extreme_exponents_and_long_digit_strings_compare_exactly() {
+        use crate::error::MAX_QUERY_SIZE_BYTES;
+        let n = |x: &str| Const::number(x);
+        let max = MAX_QUERY_SIZE_BYTES;
+        let huge = format!("1e{max}");
+        let tiny = format!("1e-{max}");
+        assert!(matches!(n(&huge), Const::Num(_)));
+        assert!(matches!(n(&tiny), Const::Num(_)));
+        assert_eq!(compare(&n(&huge), CmpOp::Gt, &n("1")), Truth::True);
+        assert_eq!(compare(&n(&tiny), CmpOp::Lt, &n("1")), Truth::True);
+        assert_eq!(compare(&n(&tiny), CmpOp::Gt, &n("0")), Truth::True);
+        assert_eq!(
+            compare(&n(&format!("-{huge}")), CmpOp::Lt, &n(&format!("-{tiny}"))),
+            Truth::True
+        );
+        assert_eq!(
+            compare(&n(&huge), CmpOp::Eq, &n(&format!("10e{}", max - 1))),
+            Truth::True
+        );
+
+        // A digit string as long as the size limit allows, against values that
+        // differ only in its last digit or in its magnitude.
+        let long = "9".repeat(max - 2);
+        let long_minus_one = format!("{}8", "9".repeat(max - 3));
+        assert_eq!(
+            compare(&n(&long), CmpOp::Gt, &n(&long_minus_one)),
+            Truth::True
+        );
+        assert_eq!(
+            compare(&n(&long), CmpOp::Eq, &n(&format!("{long}.0"))),
+            Truth::True
+        );
+        assert_eq!(
+            compare(&n(&long), CmpOp::Lt, &n(&format!("1e{}", max - 2))),
+            Truth::True
+        );
+        assert_eq!(
+            compare(&n(&format!("0.{long}")), CmpOp::Lt, &n("1")),
+            Truth::True
+        );
+        assert_eq!(
+            compare(&n(&format!("{long}e-{max}")), CmpOp::Gt, &n(&tiny)),
+            Truth::True
+        );
+        assert_eq!(
+            compare(&n(&format!("{long}e{max}")), CmpOp::Gt, &n(&huge)),
+            Truth::True
+        );
     }
 }
