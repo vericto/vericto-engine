@@ -75,16 +75,12 @@ pub(crate) fn from_statements(
         )));
     }
 
-    let cx = Cx {
-        dialect: which,
-        snowflake: which == Dialect::Snowflake,
-        sqlite: which == Dialect::Sqlite,
-    };
+    let cx = Cx { dialect: which };
     let mut collected: Vec<StatementInfo> = Vec::new();
     for stmt in &statements {
         walk_statement(stmt, false, 0, cx, &mut collected)?;
     }
-    let unread = if cx.snowflake {
+    let unread = if cx.snowflake() {
         statements
             .iter()
             .find_map(snowflake_unread)
@@ -117,11 +113,22 @@ pub(crate) const UNSUPPORTED_STATEMENT: &str = "statement not supported by the e
 #[derive(Clone, Copy)]
 struct Cx {
     dialect: Dialect,
-    snowflake: bool,
+}
+
+impl Cx {
+    /// Snowflake: its statement kinds (`SWAP WITH`, `INSERT OVERWRITE`,
+    /// shares, scripting blocks), its `QUALIFY` clause and its row-count
+    /// `SAMPLE` bound.
+    fn snowflake(self) -> bool {
+        self.dialect == Dialect::Snowflake
+    }
+
     /// SQLite: its statement kinds (`ATTACH`, `PRAGMA`, `VACUUM`), its
     /// truthiness (`WHERE '1abc'` is true) and its time probe
     /// (`randomblob(N)`).
-    sqlite: bool,
+    fn sqlite(self) -> bool {
+        self.dialect == Dialect::Sqlite
+    }
 }
 
 /// Snowflake code the engine does not read: a scripting block (`BEGIN … END`,
@@ -629,7 +636,7 @@ fn walk_statement(
                     }
                     // Snowflake's `ALTER TABLE a SWAP WITH b` exchanges the
                     // two names: a rename of both tables.
-                    AlterTableOperation::SwapWith { .. } if cx.snowflake => {
+                    AlterTableOperation::SwapWith { .. } if cx.snowflake() => {
                         (AlterTableKind::Rename, "AlterTableStmt > SwapWith")
                     }
                     // MySQL's `DROP FOREIGN KEY fk` is its spelling of
@@ -673,7 +680,7 @@ fn walk_statement(
         // The generic sqlparser paths model CTAS as CreateTable { query }.
         // SQLite and Snowflake keep their specialized walkers below: Snowflake
         // also classifies CREATE OR REPLACE / CLONE, and SQLite trigger bodies.
-        Statement::CreateTable(ct) if !cx.sqlite && !cx.snowflake && ct.query.is_some() => {
+        Statement::CreateTable(ct) if !cx.sqlite() && !cx.snowflake() && ct.query.is_some() => {
             out.push(StatementInfo {
                 kind: StatementKind::CreateTableAs,
                 relation: Some(ct.name.to_string()),
@@ -737,7 +744,7 @@ fn walk_statement(
 
             // Snowflake's `INSERT OVERWRITE` empties the target before it
             // inserts: its current rows survive only in Time Travel.
-            if cx.snowflake && insert.overwrite {
+            if cx.snowflake() && insert.overwrite {
                 out.push(StatementInfo {
                     relation: Some(insert.table.to_string()),
                     is_nested,
@@ -784,7 +791,7 @@ fn walk_statement(
         // Still a GRANT, so VERICTO-082 keeps reporting it; the share is
         // recorded on its own, because the data then leaves the account.
         Statement::Grant(grant)
-            if cx.snowflake
+            if cx.snowflake()
                 && grant
                     .grantees
                     .iter()
@@ -860,10 +867,10 @@ fn walk_statement(
             // Other statement types are not (yet) modelled. CREATE TABLE AS is
             // handled above for MySQL/Oracle/MS SQL and by the specialized
             // SQLite/Snowflake walkers below.
-            if cx.snowflake {
+            if cx.snowflake() {
                 walk_snowflake(other, is_nested, depth, cx, out)?;
             }
-            if cx.sqlite {
+            if cx.sqlite() {
                 walk_sqlite(other, is_nested, depth, cx, out)?;
             }
         }
@@ -1442,7 +1449,7 @@ fn insert_set_expr_source(set_expr: &SetExpr, cx: Cx, depth: usize) -> Result<(b
                 .selection
                 .as_ref()
                 .is_some_and(|expr| !is_always_true(expr, cx.dialect));
-            let row_bound = select.top.is_some() || (cx.snowflake && snowflake_bounded(select));
+            let row_bound = select.top.is_some() || (cx.snowflake() && snowflake_bounded(select));
             Ok((true, effective_where || row_bound))
         }
         SetExpr::Query(query) => insert_source(query, cx, depth + 1),
@@ -1505,7 +1512,7 @@ fn walk_set_expr(
             // A `TOP n` clause (MSSQL, Snowflake) also bounds the result set,
             // as does a Snowflake `SAMPLE (n ROWS)` or `RESULT_SCAN` source.
             let has_limit =
-                has_limit || select.top.is_some() || (cx.snowflake && snowflake_bounded(select));
+                has_limit || select.top.is_some() || (cx.snowflake() && snowflake_bounded(select));
 
             // Tautological OR detection in WHERE
             let tautology = select
@@ -1518,7 +1525,7 @@ fn walk_set_expr(
                 walk_expr(expr, depth + 1, cx, out)?;
             }
             // Snowflake's QUALIFY filters on window results; it runs too.
-            if cx.snowflake {
+            if cx.snowflake() {
                 if let Some(expr) = select.qualify.as_ref() {
                     walk_expr(expr, depth + 1, cx, out)?;
                 }
@@ -1589,7 +1596,7 @@ fn walk_set_expr(
             // function arguments, `GROUP BY`, `HAVING`, `WINDOW`, …
             {
                 let mut exprs: Vec<&Expr> = select.selection.iter().collect();
-                if cx.snowflake {
+                if cx.snowflake() {
                     exprs.extend(select.qualify.iter());
                 }
                 for item in &select.projection {
@@ -1686,7 +1693,7 @@ fn record_call(func: &sqlparser::ast::Function, cx: Cx, out: &mut Vec<StatementI
         .and_then(|p| p.as_ident())
         .map(|p| p.value.to_ascii_lowercase())
         .unwrap_or_default();
-    let probe = cx.sqlite
+    let probe = cx.sqlite()
         && matches!(name.as_str(), "randomblob" | "zeroblob")
         && first_arg(func)
             .and_then(const_number)
