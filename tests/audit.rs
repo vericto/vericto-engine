@@ -1777,6 +1777,37 @@ fn exact_numbers_do_not_manufacture_tautologies() {
     );
 }
 
+/// `INSERT INTO t TABLE u` is shorthand for `INSERT INTO t SELECT * FROM u`:
+/// it copies every row, so it is an unbounded INSERT … SELECT for VERICTO-040.
+/// libpg_query already expands `TABLE u` to `SELECT * FROM u`; the sqlparser
+/// dialects keep it as `SetExpr::Table`, which 4.7.0 classifies as a source.
+#[test]
+fn vericto_040_fires_on_an_insert_table_source() {
+    let policy = EnforcementPolicy::default();
+    let sql = "INSERT INTO archive TABLE users";
+    for dialect in EVERY_DIALECT {
+        assert!(
+            parser_for(dialect).parse(sql).is_ok(),
+            "{dialect:?} must accept `{sql}`"
+        );
+        let m = matching_codes(sql, dialect, &ruleset(), &policy);
+        assert!(
+            m.contains(&"VERICTO-040".to_string()),
+            "{dialect:?}: `{sql}` copies every row, got {m:?}"
+        );
+    }
+
+    // A bounded SELECT arm does not hide a TABLE arm that copies everything.
+    let mixed = "INSERT INTO archive SELECT id FROM users WHERE id = 1 UNION ALL TABLE admins";
+    for dialect in EVERY_DIALECT {
+        let m = matching_codes(mixed, dialect, &ruleset(), &policy);
+        assert!(
+            m.contains(&"VERICTO-040".to_string()),
+            "{dialect:?}: the TABLE arm is unbounded in `{mixed}`, got {m:?}"
+        );
+    }
+}
+
 #[test]
 fn set_operators_keep_vericto_040_structural() {
     let policy = EnforcementPolicy::default();

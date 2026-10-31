@@ -39,6 +39,9 @@ could hide in an executed clause or wrapper.
   filters. Parenthesized and set-operated literal VALUES remain non-SELECT
   inserts. SQL Server/Snowflake `TOP` and fixed-row Snowflake `SAMPLE` keep the
   source bounded, matching VERICTO-050.
+- **VERICTO-040 covers `INSERT … TABLE t`.** The shorthand for `INSERT …
+  SELECT * FROM t` copies every row; it now fires on the sqlparser dialects as
+  it already did on PostgreSQL.
 - **VERICTO-061 counts parenthesized VALUES batches.** Parentheses no longer
   hide a batch above the existing 10,000-row threshold on sqlparser dialects.
 - **VERICTO-070 and custom `func_name` rules inspect executed expressions across
