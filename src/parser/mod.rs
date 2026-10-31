@@ -18,7 +18,7 @@ pub mod snowflake;
 pub mod sqlite;
 pub(crate) mod walk;
 
-use crate::error::{ProxyError, Result};
+use crate::error::{MAX_QUERY_SIZE_BYTES, ProxyError, Result};
 
 /// Supported SQL dialect.
 ///
@@ -92,7 +92,8 @@ pub enum StatementKind {
     Grant,
     /// `MERGE INTO …` — can mass-mutate rows like an UPDATE/DELETE without WHERE.
     Merge,
-    /// `CREATE TABLE … AS SELECT …` / `SELECT … INTO` — bulk data copy.
+    /// `CREATE TABLE … AS SELECT …`, materialized-view creation or
+    /// `SELECT … INTO` — bulk data copy.
     /// On Snowflake also `CREATE TABLE|SCHEMA|DATABASE … CLONE`.
     CreateTableAs,
     Other,
@@ -268,10 +269,10 @@ pub struct StatementInfo {
     /// recorded as a separate (nested) statement, so the rule predicate cannot
     /// reach its `where_presence` from the INSERT entry.
     ///
-    /// Conservatively `false` when the source is a set operation
-    /// (`UNION`/`INTERSECT`/`EXCEPT`), even if every arm is filtered: the
-    /// set-op node carries no WHERE of its own and the arms are not inspected.
-    /// Over-reporting is the safe direction for a blocking rule.
+    /// Set operations and parenthesized queries are inspected recursively.
+    /// UNION requires every SELECT/TABLE arm to be bounded unless an enclosing
+    /// row limit applies; INTERSECT/EXCEPT are structural filters. Literal
+    /// VALUES arms are ignored because they do not copy table rows.
     pub insert_select_has_filter: bool,
     /// Whether SELECT uses LIMIT.
     pub select_has_limit: bool,
@@ -519,16 +520,16 @@ pub(crate) fn is_sleep_function(name: &str) -> bool {
 /// The truth value of a predicate the engine evaluates without a row, under
 /// SQL's three-valued logic.
 ///
-/// `Unknown` covers SQL's UNKNOWN (any comparison with NULL) and "the engine
-/// cannot decide it" (a string ordering, which depends on the collation). For
-/// a blocking rule the two are the same: neither is *always true*, and the
-/// NOT of either is not always true either. Only [`Truth::True`] makes a
-/// tautology; reading "not decided" as "false" is how `NOT ('a' < 'b')` was
-/// once taken for one.
+/// `SqlNull` is SQL UNKNOWN produced by a known NULL expression. `Unknown`
+/// means the analysis cannot decide, for example because comparison depends on
+/// collation or a row. Keeping them separate lets `IS UNKNOWN` fold known NULL
+/// expressions without turning an unresolved expression into a tautology. Only
+/// [`Truth::True`] makes a tautology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Truth {
     True,
     False,
+    SqlNull,
     Unknown,
 }
 
@@ -537,22 +538,174 @@ impl Truth {
         if b { Truth::True } else { Truth::False }
     }
 
-    /// SQL `NOT`: true and false swap, unknown stays unknown.
+    /// SQL `NOT`: true and false swap; SQL NULL and unresolved stay as-is.
     pub(crate) fn not(self) -> Self {
         match self {
             Truth::True => Truth::False,
             Truth::False => Truth::True,
+            Truth::SqlNull => Truth::SqlNull,
             Truth::Unknown => Truth::Unknown,
         }
     }
 
-    /// `AND` / `OR` as the walkers read them: only a provably true result is
-    /// kept. Kleene logic would also make `1 = 2 AND x` provably false, which
-    /// would widen what `NOT (…)` reports; the walkers deliberately do not
-    /// decide that (narrow scope on a blocking rule), so a non-true result is
-    /// `Unknown`.
+    pub(crate) fn tested_as(self, expected: Truth, negated: bool) -> Truth {
+        match self {
+            Truth::Unknown => Truth::Unknown,
+            known => Truth::from_bool((known == expected) != negated),
+        }
+    }
+
+    pub(crate) fn and(self, other: Truth) -> Truth {
+        match (self, other) {
+            (Truth::False, _) | (_, Truth::False) => Truth::False,
+            (Truth::True, value) | (value, Truth::True) => value,
+            (Truth::SqlNull, Truth::SqlNull) => Truth::SqlNull,
+            _ => Truth::Unknown,
+        }
+    }
+
+    pub(crate) fn or(self, other: Truth) -> Truth {
+        match (self, other) {
+            (Truth::True, _) | (_, Truth::True) => Truth::True,
+            (Truth::False, value) | (value, Truth::False) => value,
+            (Truth::SqlNull, Truth::SqlNull) => Truth::SqlNull,
+            _ => Truth::Unknown,
+        }
+    }
+
+    /// Conservative helper for forms where only a proof of TRUE is kept.
     pub(crate) fn true_or_unknown(b: bool) -> Self {
         if b { Truth::True } else { Truth::Unknown }
+    }
+}
+
+/// Exact base-10 number used for proofs. SQL integer and decimal literals are
+/// exact on the target engines, so converting them to `f64` can collapse
+/// distinct values above 2^53 and manufacture a tautology.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SqlNumber {
+    negative: bool,
+    digits: String,
+    /// `digits × 10^-scale`, after leading and trailing zero normalization.
+    scale: i128,
+}
+
+impl SqlNumber {
+    fn parse(text: &str) -> Option<Self> {
+        let (negative, unsigned) = match text.as_bytes().first() {
+            Some(b'-') => (true, &text[1..]),
+            Some(b'+') => (false, &text[1..]),
+            _ => (false, text),
+        };
+        let mut exponent_parts = unsigned.split(['e', 'E']);
+        let mantissa = exponent_parts.next()?;
+        let exponent = exponent_parts
+            .next()
+            .map(|value| value.parse::<i128>())
+            .transpose()
+            .ok()?
+            .unwrap_or(0);
+        if exponent_parts.next().is_some()
+            || !(-(MAX_QUERY_SIZE_BYTES as i128)..=MAX_QUERY_SIZE_BYTES as i128).contains(&exponent)
+        {
+            return None;
+        }
+
+        let mut decimal_parts = mantissa.split('.');
+        let whole = decimal_parts.next()?;
+        let fraction = decimal_parts.next().unwrap_or_default();
+        if decimal_parts.next().is_some()
+            || (whole.is_empty() && fraction.is_empty())
+            || !whole
+                .bytes()
+                .chain(fraction.bytes())
+                .all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+
+        let combined = format!("{whole}{fraction}");
+        let significant = combined.trim_start_matches('0');
+        if significant.is_empty() {
+            return Some(Self {
+                negative: false,
+                digits: "0".to_string(),
+                scale: 0,
+            });
+        }
+
+        let mut digits = significant.to_string();
+        let mut scale = i128::try_from(fraction.len()).ok()?.checked_sub(exponent)?;
+        while digits.ends_with('0') {
+            digits.pop();
+            scale = scale.checked_sub(1)?;
+        }
+        Some(Self {
+            negative,
+            digits,
+            scale,
+        })
+    }
+
+    fn negated(mut self) -> Self {
+        if !self.is_zero() {
+            self.negative = !self.negative;
+        }
+        self
+    }
+
+    fn is_zero(&self) -> bool {
+        self.digits == "0"
+    }
+
+    /// Position of the leading digit relative to the decimal point:
+    /// `digits.len() - scale`. Both terms are bounded by the query size (see
+    /// `parse`), so the saturating arithmetic never actually saturates; it
+    /// only keeps this runtime path free of a panic.
+    fn magnitude(&self) -> i128 {
+        i128::try_from(self.digits.len())
+            .unwrap_or(i128::MAX)
+            .saturating_sub(self.scale)
+    }
+
+    fn cmp_abs(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.is_zero(), other.is_zero()) {
+            (true, true) => return std::cmp::Ordering::Equal,
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            (false, false) => {}
+        }
+        self.magnitude().cmp(&other.magnitude()).then_with(|| {
+            let len = self.digits.len().max(other.digits.len());
+            (0..len)
+                .map(|index| {
+                    self.digits
+                        .as_bytes()
+                        .get(index)
+                        .copied()
+                        .unwrap_or(b'0')
+                        .cmp(&other.digits.as_bytes().get(index).copied().unwrap_or(b'0'))
+                })
+                .find(|ordering| !ordering.is_eq())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+}
+
+impl Ord for SqlNumber {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.negative, other.negative) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => self.cmp_abs(other),
+            (true, true) => self.cmp_abs(other).reverse(),
+        }
+    }
+}
+
+impl PartialOrd for SqlNumber {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -561,26 +714,24 @@ impl Truth {
 pub(crate) enum Const {
     /// `NULL`.
     Null,
-    /// A number literal, its sign folded in by [`Const::negated`].
-    Num(f64),
+    /// An exact integer, decimal or exponent-form number literal.
+    Num(SqlNumber),
     /// `TRUE` / `FALSE`.
     Bool(bool),
     /// The text of a string literal.
     Text(String),
-    /// Any other literal (a bit or hex string, a number that does not read
-    /// as a finite `f64`, a `"…"` that MySQL may take for a string or, under
-    /// `ANSI_QUOTES`, for a column), by an identity key: equal to itself,
-    /// undecided against anything else.
+    /// Any other unambiguous literal (a bit or hex string, or a number outside
+    /// the supported decimal grammar), by an identity key: equal to itself,
+    /// undecided against anything else. Ambiguous syntax such as MySQL's
+    /// `"…"` is not a constant because `ANSI_QUOTES` can make it a column.
     Opaque(String),
 }
 
 impl Const {
-    /// A number literal's text: a finite number, or an opaque literal.
+    /// A number literal's text, parsed without precision loss or kept opaque
+    /// when it falls outside the supported decimal grammar.
     pub(crate) fn number(text: &str) -> Const {
-        match text.parse::<f64>() {
-            Ok(x) if x.is_finite() => Const::Num(x),
-            _ => Const::Opaque(text.to_string()),
-        }
+        SqlNumber::parse(text).map_or_else(|| Const::Opaque(text.to_string()), Const::Num)
     }
 
     /// Unary minus over a literal: the one fold both walkers use.
@@ -592,7 +743,7 @@ impl Const {
     /// coercion is the dialect's).
     pub(crate) fn negated(self) -> Option<Const> {
         match self {
-            Const::Num(x) => Some(Const::Num(-x)),
+            Const::Num(x) => Some(Const::Num(x.negated())),
             _ => None,
         }
     }
@@ -603,7 +754,8 @@ impl Const {
     /// matches no row, so it is never true.
     pub(crate) fn truth(&self) -> Truth {
         match self {
-            Const::Num(x) => Truth::from_bool(*x != 0.0),
+            Const::Null => Truth::SqlNull,
+            Const::Num(x) => Truth::from_bool(!x.is_zero()),
             Const::Bool(b) => Truth::from_bool(*b),
             _ => Truth::Unknown,
         }
@@ -650,7 +802,7 @@ impl CmpOp {
 
 /// `<a> <op> <b>` over two literals, under three-valued logic.
 ///
-/// - Any comparison with NULL is UNKNOWN, never true: `NULL = NULL` and
+/// - Any comparison with NULL is SQL UNKNOWN ([`Truth::SqlNull`]), never true: `NULL = NULL` and
 ///   `NULL <> 1` match no row (the IN-list readings already excluded NULL).
 /// - Numbers compare numerically, under every operator.
 /// - Strings and booleans decide only `=` and `<>`; an ordering between
@@ -662,11 +814,9 @@ impl CmpOp {
 ///   tautology.
 pub(crate) fn compare(a: &Const, op: CmpOp, b: &Const) -> Truth {
     let eq = match (a, b) {
-        (Const::Null, _) | (_, Const::Null) => return Truth::Unknown,
+        (Const::Null, _) | (_, Const::Null) => return Truth::SqlNull,
         (Const::Num(x), Const::Num(y)) => {
-            return x
-                .partial_cmp(y)
-                .map_or(Truth::Unknown, |o| Truth::from_bool(op.holds(o)));
+            return Truth::from_bool(op.holds(x.cmp(y)));
         }
         (Const::Bool(x), Const::Bool(y)) => Truth::from_bool(x == y),
         (Const::Text(x), Const::Text(y)) => text_equality(x, y),
@@ -677,6 +827,23 @@ pub(crate) fn compare(a: &Const, op: CmpOp, b: &Const) -> Truth {
         CmpOp::Eq => eq,
         CmpOp::NotEq => eq.not(),
         _ => Truth::Unknown,
+    }
+}
+
+/// SQL `IS [NOT] DISTINCT FROM` over constants. Unlike ordinary equality,
+/// NULL is a value here: two NULLs are not distinct, one NULL and one non-NULL
+/// are distinct. Non-NULL constants reuse [`compare`], preserving its
+/// collation/coercion conservatism; `not_distinct` negates the distinct result.
+pub(crate) fn compare_distinct(a: &Const, b: &Const, not_distinct: bool) -> Truth {
+    let distinct = match (a, b) {
+        (Const::Null, Const::Null) => Truth::False,
+        (Const::Null, _) | (_, Const::Null) => Truth::True,
+        _ => compare(a, CmpOp::Eq, b).not(),
+    };
+    if not_distinct {
+        distinct.not()
+    } else {
+        distinct
     }
 }
 
@@ -769,10 +936,11 @@ pub(crate) fn resolve_snowflake_order_by_all(statements: &mut [sqlparser::ast::S
 
 #[cfg(test)]
 mod constant_tests {
-    use super::{CmpOp, Const, Truth, compare};
+    use super::{CmpOp, Const, Truth, compare, compare_distinct};
 
     #[test]
     fn null_is_never_compared() {
+        let one = Const::number("1");
         for op in [
             CmpOp::Eq,
             CmpOp::NotEq,
@@ -781,19 +949,43 @@ mod constant_tests {
             CmpOp::Gt,
             CmpOp::GtEq,
         ] {
-            assert_eq!(compare(&Const::Null, op, &Const::Null), Truth::Unknown);
-            assert_eq!(compare(&Const::Null, op, &Const::Num(1.0)), Truth::Unknown);
-            assert_eq!(compare(&Const::Num(1.0), op, &Const::Null), Truth::Unknown);
+            assert_eq!(compare(&Const::Null, op, &Const::Null), Truth::SqlNull);
+            assert_eq!(compare(&Const::Null, op, &one), Truth::SqlNull);
+            assert_eq!(compare(&one, op, &Const::Null), Truth::SqlNull);
         }
     }
 
     #[test]
+    fn distinct_comparison_treats_null_as_a_value() {
+        let one = Const::number("1");
+        assert_eq!(compare_distinct(&Const::Null, &one, false), Truth::True);
+        assert_eq!(compare_distinct(&Const::Null, &one, true), Truth::False);
+        assert_eq!(
+            compare_distinct(&Const::Null, &Const::Null, false),
+            Truth::False
+        );
+        assert_eq!(
+            compare_distinct(&Const::Null, &Const::Null, true),
+            Truth::True
+        );
+        assert_eq!(compare_distinct(&one, &one, true), Truth::True);
+    }
+
+    #[test]
     fn numbers_compare_and_strings_only_by_equality() {
-        let n = |x: f64| Const::Num(x);
+        let n = |x: &str| Const::number(x);
         let t = |s: &str| Const::Text(s.to_string());
-        assert_eq!(compare(&n(-1.0), CmpOp::Lt, &n(0.0)), Truth::True);
-        assert_eq!(compare(&n(1.0), CmpOp::GtEq, &n(2.0)), Truth::False);
-        assert_eq!(compare(&n(1.0), CmpOp::LtEq, &n(1.0)), Truth::True);
+        assert_eq!(compare(&n("-1"), CmpOp::Lt, &n("0")), Truth::True);
+        assert_eq!(compare(&n("1"), CmpOp::GtEq, &n("2")), Truth::False);
+        assert_eq!(compare(&n("1"), CmpOp::LtEq, &n("1.0")), Truth::True);
+        assert_eq!(
+            compare(&n("9007199254740992"), CmpOp::Eq, &n("9007199254740993")),
+            Truth::False
+        );
+        assert_eq!(compare(&n("1.25e2"), CmpOp::Eq, &n("125")), Truth::True);
+        assert_eq!(compare(&n("0"), CmpOp::Lt, &n("0.5")), Truth::True);
+        assert_eq!(compare(&n("0.5"), CmpOp::Gt, &n("0")), Truth::True);
+        assert_eq!(compare(&n("-0.5"), CmpOp::Lt, &n("0")), Truth::True);
         assert_eq!(compare(&t("a"), CmpOp::Eq, &t("a")), Truth::True);
         assert_eq!(compare(&t("a"), CmpOp::NotEq, &t("b")), Truth::True);
         assert_eq!(compare(&t("a"), CmpOp::Lt, &t("b")), Truth::Unknown);
@@ -813,9 +1005,9 @@ mod constant_tests {
             );
         }
         // Different kinds coerce per dialect.
-        assert_eq!(compare(&n(1.0), CmpOp::Eq, &t("1")), Truth::Unknown);
+        assert_eq!(compare(&n("1"), CmpOp::Eq, &t("1")), Truth::Unknown);
         assert_eq!(
-            compare(&Const::Bool(true), CmpOp::Eq, &n(1.0)),
+            compare(&Const::Bool(true), CmpOp::Eq, &n("1")),
             Truth::Unknown
         );
         assert_eq!(
@@ -833,14 +1025,69 @@ mod constant_tests {
 
     #[test]
     fn only_numbers_negate_and_truth_survives_not() {
-        assert_eq!(Const::Num(1.0).negated(), Some(Const::Num(-1.0)));
+        assert_eq!(Const::number("1").negated(), Some(Const::number("-1")));
         assert_eq!(Const::Text("1".into()).negated(), None);
-        assert_eq!(Const::number("1e999"), Const::Opaque("1e999".into()));
-        assert_eq!(Const::Null.truth(), Truth::Unknown);
-        assert_eq!(Const::Num(-1.0).truth(), Truth::True);
-        assert_eq!(Const::Num(0.0).truth(), Truth::False);
+        assert_eq!(
+            Const::number("1e999999999999999999999999999999999999999"),
+            Const::Opaque("1e999999999999999999999999999999999999999".into())
+        );
+        assert_eq!(Const::Null.truth(), Truth::SqlNull);
+        assert_eq!(Const::number("-1").truth(), Truth::True);
+        assert_eq!(Const::number("0").truth(), Truth::False);
+        assert_eq!(Truth::SqlNull.not(), Truth::SqlNull);
         assert_eq!(Truth::Unknown.not(), Truth::Unknown);
         assert_eq!(Truth::False.not(), Truth::True);
         assert_eq!(Truth::true_or_unknown(false), Truth::Unknown);
+    }
+
+    #[test]
+    fn extreme_exponents_and_long_digit_strings_compare_exactly() {
+        use crate::error::MAX_QUERY_SIZE_BYTES;
+        let n = |x: &str| Const::number(x);
+        let max = MAX_QUERY_SIZE_BYTES;
+        let huge = format!("1e{max}");
+        let tiny = format!("1e-{max}");
+        assert!(matches!(n(&huge), Const::Num(_)));
+        assert!(matches!(n(&tiny), Const::Num(_)));
+        assert_eq!(compare(&n(&huge), CmpOp::Gt, &n("1")), Truth::True);
+        assert_eq!(compare(&n(&tiny), CmpOp::Lt, &n("1")), Truth::True);
+        assert_eq!(compare(&n(&tiny), CmpOp::Gt, &n("0")), Truth::True);
+        assert_eq!(
+            compare(&n(&format!("-{huge}")), CmpOp::Lt, &n(&format!("-{tiny}"))),
+            Truth::True
+        );
+        assert_eq!(
+            compare(&n(&huge), CmpOp::Eq, &n(&format!("10e{}", max - 1))),
+            Truth::True
+        );
+
+        // A digit string as long as the size limit allows, against values that
+        // differ only in its last digit or in its magnitude.
+        let long = "9".repeat(max - 2);
+        let long_minus_one = format!("{}8", "9".repeat(max - 3));
+        assert_eq!(
+            compare(&n(&long), CmpOp::Gt, &n(&long_minus_one)),
+            Truth::True
+        );
+        assert_eq!(
+            compare(&n(&long), CmpOp::Eq, &n(&format!("{long}.0"))),
+            Truth::True
+        );
+        assert_eq!(
+            compare(&n(&long), CmpOp::Lt, &n(&format!("1e{}", max - 2))),
+            Truth::True
+        );
+        assert_eq!(
+            compare(&n(&format!("0.{long}")), CmpOp::Lt, &n("1")),
+            Truth::True
+        );
+        assert_eq!(
+            compare(&n(&format!("{long}e-{max}")), CmpOp::Gt, &n(&tiny)),
+            Truth::True
+        );
+        assert_eq!(
+            compare(&n(&format!("{long}e{max}")), CmpOp::Gt, &n(&huge)),
+            Truth::True
+        );
     }
 }

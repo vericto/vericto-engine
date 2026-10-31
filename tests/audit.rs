@@ -279,6 +279,84 @@ fn vericto_040_does_not_fire_on_a_filtered_insert_select() {
             m.contains(&"VERICTO-040".to_string()),
             "{dialect:?}: tautological WHERE is not a filter, got {m:?}"
         );
+
+        // A set-operation source is still INSERT … SELECT. Before 4.7.0 the
+        // sqlparser walker marked only a direct SetExpr::Select as such, so this
+        // bypassed 040 on MySQL and the other non-Postgres dialects.
+        let m = matching_codes(
+            "INSERT INTO archive SELECT id FROM users UNION ALL SELECT id FROM admins",
+            dialect,
+            &ruleset(),
+            &policy,
+        );
+        assert!(
+            m.contains(&"VERICTO-040".to_string()),
+            "{dialect:?}: unbounded set-operation source must fire, got {m:?}"
+        );
+
+        let m = matching_codes(
+            "INSERT INTO archive SELECT id FROM users UNION ALL SELECT id FROM admins LIMIT 10",
+            dialect,
+            &ruleset(),
+            &policy,
+        );
+        assert!(
+            !m.contains(&"VERICTO-040".to_string()),
+            "{dialect:?}: an outer LIMIT bounds the whole source, got {m:?}"
+        );
+    }
+
+    // Parentheses and set operators can also wrap literal VALUES. Those forms
+    // do not read source rows and must not be reclassified as INSERT … SELECT.
+    for sql in [
+        "INSERT INTO archive (id) (VALUES (1))",
+        "INSERT INTO archive (id) VALUES (1) UNION ALL VALUES (2)",
+    ] {
+        for dialect in [Dialect::Postgres, Dialect::Mysql] {
+            let m = matching_codes(sql, dialect, &ruleset(), &policy);
+            assert!(
+                !m.contains(&"VERICTO-040".to_string()),
+                "{dialect:?} literal source must not fire: `{sql}` got {m:?}"
+            );
+        }
+    }
+
+    // Every arm is bounded, so the union cannot copy every row from either
+    // table. Inspecting the arms closes the bypass without over-reporting this
+    // legitimate form. One bounded arm does not hide an unbounded sibling.
+    let filtered = "INSERT INTO archive SELECT id FROM users WHERE id = 1 \
+                    UNION ALL SELECT id FROM admins WHERE id = 1";
+    let partly_unbounded =
+        "INSERT INTO archive SELECT id FROM users WHERE id = 1 UNION ALL SELECT id FROM admins";
+    for dialect in [Dialect::Postgres, Dialect::Mysql] {
+        let m = matching_codes(filtered, dialect, &ruleset(), &policy);
+        assert!(
+            !m.contains(&"VERICTO-040".to_string()),
+            "{dialect:?} filtered set-operation must not fire: {m:?}"
+        );
+
+        let m = matching_codes(partly_unbounded, dialect, &ruleset(), &policy);
+        assert!(
+            m.contains(&"VERICTO-040".to_string()),
+            "{dialect:?} unbounded arm must still fire: {m:?}"
+        );
+    }
+
+    for (dialect, sql) in [
+        (
+            Dialect::MsSql,
+            "INSERT INTO archive SELECT TOP 10 id FROM users",
+        ),
+        (
+            Dialect::Snowflake,
+            "INSERT INTO archive SELECT id FROM users SAMPLE (100 ROWS)",
+        ),
+    ] {
+        let m = matching_codes(sql, dialect, &ruleset(), &policy);
+        assert!(
+            !m.contains(&"VERICTO-040".to_string()),
+            "a fixed row bound scopes the source on {dialect:?}: {m:?}"
+        );
     }
 }
 
@@ -309,6 +387,22 @@ fn eng_005_nested_select_attrs_pg() {
         Dialect::Postgres,
         vec!["VERICTO-051"],
     );
+}
+
+#[test]
+fn qualified_wildcard_is_still_select_star() {
+    for dialect in EVERY_DIALECT {
+        let codes = matching_codes(
+            "SELECT users.* FROM users",
+            dialect,
+            &ruleset(),
+            &EnforcementPolicy::default(),
+        );
+        assert!(
+            codes.contains(&"VERICTO-051".to_string()),
+            "qualified wildcard on {dialect:?} got {codes:?}"
+        );
+    }
 }
 
 #[test]
@@ -372,6 +466,25 @@ fn vericto_070_detects_every_sleep_variant_on_every_dialect() {
 }
 
 #[test]
+fn vericto_070_cannot_be_bypassed_by_expression_placement() {
+    for sql in [
+        "SELECT id FROM users ORDER BY sleep(1)",
+        "SELECT id FROM users GROUP BY id HAVING sleep(1) = 0",
+        "SELECT t.id FROM t JOIN u ON sleep(1) = 0",
+        "UPDATE users SET active = sleep(1) WHERE id = 1",
+        "INSERT INTO users (id) VALUES (sleep(1))",
+    ] {
+        for dialect in [Dialect::Mysql, Dialect::Oracle, Dialect::MsSql] {
+            let codes = matching_codes(sql, dialect, &ruleset(), &EnforcementPolicy::default());
+            assert!(
+                codes.contains(&"VERICTO-070".to_string()),
+                "{sql} on {dialect:?} got {codes:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn vericto_019_detects_rls_disable_on_every_dialect() {
     // The regression this pins: `pg_ast.rs` mapped only the three trigger subtypes,
     // so `AtDisableRowSecurity` hit its `_ => continue` and PostgreSQL emitted no
@@ -427,7 +540,7 @@ fn vericto_019_leaves_protection_enabling_alone() {
 }
 
 #[test]
-fn eng_007_dangerous_pg_statements() {
+fn eng_007_dangerous_statements() {
     assert_matches(
         "ENG-007 copy program",
         "COPY users TO PROGRAM 'curl evil'",
@@ -459,6 +572,62 @@ fn eng_007_dangerous_pg_statements() {
         &EnforcementPolicy::default(),
     );
     assert!(m.contains(&"VERICTO-084".to_string()), "ctas got {m:?}");
+    for dialect in [Dialect::Mysql, Dialect::Oracle] {
+        let m = matching_codes(
+            "CREATE TABLE leak AS SELECT * FROM users",
+            dialect,
+            &ruleset(),
+            &EnforcementPolicy::default(),
+        );
+        assert!(
+            m.contains(&"VERICTO-084".to_string()),
+            "{dialect:?} CTAS got {m:?}"
+        );
+    }
+    for dialect in [Dialect::Postgres, Dialect::Oracle, Dialect::Snowflake] {
+        let sql = "CREATE MATERIALIZED VIEW leak_mv AS SELECT * FROM users";
+        if parser_for(dialect).parse(sql).is_ok() {
+            let m = matching_codes(sql, dialect, &ruleset(), &EnforcementPolicy::default());
+            assert!(
+                m.contains(&"VERICTO-084".to_string()),
+                "{dialect:?} materialized view copy got {m:?}"
+            );
+        }
+        let ordinary = "CREATE VIEW safe_view AS SELECT * FROM users";
+        let m = matching_codes(ordinary, dialect, &ruleset(), &EnforcementPolicy::default());
+        assert!(
+            !m.contains(&"VERICTO-084".to_string()),
+            "ordinary view stores no rows on {dialect:?}: {m:?}"
+        );
+    }
+    for dialect in [Dialect::Postgres, Dialect::MsSql] {
+        let m = matching_codes(
+            "SELECT * INTO leak FROM users",
+            dialect,
+            &ruleset(),
+            &EnforcementPolicy::default(),
+        );
+        assert!(
+            m.contains(&"VERICTO-084".to_string()),
+            "{dialect:?} SELECT INTO got {m:?}"
+        );
+        assert!(
+            !m.contains(&"VERICTO-050".to_string()),
+            "the table-copy source is nested, not a client read on {dialect:?}: {m:?}"
+        );
+    }
+    // MySQL SELECT INTO assigns variables or writes a file; it does not create
+    // a table and must not be mistaken for SQL Server's spelling.
+    let m = matching_codes(
+        "SELECT id INTO @saved_id FROM users LIMIT 1",
+        Dialect::Mysql,
+        &ruleset(),
+        &EnforcementPolicy::default(),
+    );
+    assert!(
+        !m.contains(&"VERICTO-084".to_string()),
+        "MySQL INTO got {m:?}"
+    );
     // Plain COPY TO STDOUT is not the PROGRAM form → no VERICTO-080.
     let m = matching_codes(
         "COPY users TO STDOUT",
@@ -580,10 +749,10 @@ fn no_regressions_on_safe_queries() {
 
 // ── Constant-only tautologies: IN / BETWEEN / LIKE '%' ───────────────────────
 //
-// A predicate whose operands are all literals cannot depend on the row, so it
-// filters nothing and the statement is effectively WHERE-less. Verified against
-// PostgreSQL on a 3-row table with one NULL row: `1 IN (1,2)`,
-// `1 BETWEEN 0 AND 2` and `'x' LIKE '%'` each return all 3 rows.
+// A predicate proved true without reading a row filters nothing and makes the
+// statement effectively WHERE-less. For positive IN, one matching constant is
+// enough even when another item is NULL or row-dependent: TRUE OR UNKNOWN is TRUE.
+// Verified against PostgreSQL on a 3-row table including a NULL row.
 //
 // These fire on every dialect because both walkers implement the same three
 // forms. The negatives matter more than the positives here: this predicate feeds
@@ -622,11 +791,31 @@ fn constant_only_in_between_like_are_where_less() {
 }
 
 #[test]
+fn the_same_tautologies_do_not_scope_an_update() {
+    for sql in [
+        "UPDATE users SET active = false WHERE 1 IS NOT NULL",
+        "UPDATE users SET active = false WHERE NULL IS NULL",
+        "UPDATE users SET active = false WHERE 1 IN (1, NULL)",
+        "UPDATE users SET active = false WHERE 1 IN (1, id)",
+    ] {
+        for d in ALL_DIALECTS {
+            let codes = matching_codes(sql, d, &ruleset(), &EnforcementPolicy::default());
+            assert!(
+                codes.contains(&"VERICTO-042".to_string()),
+                "`{sql}` does not scope the UPDATE on {d:?}: {codes:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn constant_only_tautologies_reach_the_or_branch_rule() {
     // The same forms as an OR branch are the injection shape VERICTO-090 exists
     // for: the left side looks like a real filter, the right side neutralises it.
     for sql in [
         "SELECT * FROM users WHERE id = $1 OR 1 IN (1, 2)",
+        "SELECT * FROM users WHERE id = $1 OR 1 IN (1, NULL)",
+        "SELECT * FROM users WHERE id = $1 OR 1 IS NOT NULL",
         "SELECT * FROM users WHERE id = $1 OR 1 BETWEEN 0 AND 2",
         "SELECT * FROM users WHERE id = $1 OR 'x' LIKE '%'",
     ] {
@@ -645,15 +834,15 @@ fn constant_only_tautologies_reach_the_or_branch_rule() {
 
 #[test]
 fn a_column_operand_disqualifies_the_predicate() {
-    // The invariant Property 9 locks, asserted end-to-end through the rules: the
-    // moment a column appears the predicate filters rows, so it is a real WHERE.
+    // Property 9's end-to-end guard: a row-dependent operand normally makes
+    // this a real WHERE. Positive IN is the narrow exception tested above: one
+    // known matching item makes the OR true regardless of later items.
     //
     // `id IS NOT NULL` and `name LIKE '%'` are the sharp cases — both read as
     // tautologies but drop rows where the column is NULL (2 of 3 in PostgreSQL),
     // so treating them as WHERE-less would reject a legitimate DELETE.
     for sql in [
         "DELETE FROM users WHERE id IN (1, 2)",
-        "DELETE FROM users WHERE 1 IN (1, id)",
         "DELETE FROM users WHERE id BETWEEN 0 AND 2",
         "DELETE FROM users WHERE name LIKE '%'",
         "DELETE FROM users WHERE id IS NOT NULL",
@@ -665,6 +854,14 @@ fn a_column_operand_disqualifies_the_predicate() {
             );
         }
     }
+
+    // MySQL's `"id"` is a string by default but a column under ANSI_QUOTES.
+    // The engine cannot observe the server/session mode, so it must not prove
+    // the expression constant and block a DELETE that may be scoped.
+    assert!(
+        !fires_003("DELETE FROM users WHERE \"id\" IS NOT NULL", Dialect::Mysql),
+        "ambiguous double-quoted MySQL value must remain undecided"
+    );
 }
 
 #[test]
@@ -674,14 +871,9 @@ fn negated_and_false_constant_forms_are_not_tautologies() {
     // matches no rows at all (verified against PostgreSQL). A naive negation
     // would make it a false positive on exactly the input an attacker can shape,
     // so the walkers decide only the positive form.
-    //
-    // `1 IN (1, NULL)` is genuinely all-rows, but is skipped by the same
-    // conservative rule that rejects any NULL in the list — a deliberate false
-    // negative, which is the safe direction for a blocking rule.
     for sql in [
         "DELETE FROM users WHERE 1 NOT IN (2, 3)",
         "DELETE FROM users WHERE 1 NOT IN (2, NULL)",
-        "DELETE FROM users WHERE 1 IN (1, NULL)",
         "DELETE FROM users WHERE 1 IN (2, 3)",
         "DELETE FROM users WHERE 5 BETWEEN 0 AND 2",
         "DELETE FROM users WHERE 1 NOT BETWEEN 0 AND 2",
@@ -703,17 +895,19 @@ fn constant_only_source_filter_does_not_bound_an_insert_select() {
     // VERICTO-040 asks whether the source SELECT bounds the rows it copies. A
     // constant-only WHERE does not, so an unfiltered copy must still be reported
     // rather than being excused by a decorative predicate.
-    for d in [Dialect::Postgres, Dialect::Mysql] {
-        let m = matching_codes(
-            "INSERT INTO archive SELECT * FROM users WHERE 1 IN (1, 2)",
-            d,
-            &ruleset(),
-            &EnforcementPolicy::default(),
-        );
-        assert!(
-            m.contains(&"VERICTO-040".to_string()),
-            "constant-only WHERE must not count as a filter on {d:?}, got {m:?}"
-        );
+    for sql in [
+        "INSERT INTO archive SELECT * FROM users WHERE 1 IN (1, 2)",
+        "INSERT INTO archive SELECT * FROM users WHERE 1 IN (1, NULL)",
+        "INSERT INTO archive SELECT * FROM users WHERE 1 IN (1, id)",
+        "INSERT INTO archive SELECT * FROM users WHERE 1 IS NOT NULL",
+    ] {
+        for d in [Dialect::Postgres, Dialect::Mysql] {
+            let m = matching_codes(sql, d, &ruleset(), &EnforcementPolicy::default());
+            assert!(
+                m.contains(&"VERICTO-040".to_string()),
+                "constant-true WHERE must not count as a filter on {d:?}: `{sql}` got {m:?}"
+            );
+        }
     }
 }
 
@@ -1091,6 +1285,19 @@ fn vericto_061_flags_copy_from_a_server_file() {
 }
 
 #[test]
+fn vericto_061_counts_parenthesized_values() {
+    let rows = (0..=10_000).map(|_| "(1)").collect::<Vec<_>>().join(",");
+    let sql = format!("INSERT INTO t (id) (VALUES {rows})");
+    for dialect in [Dialect::Postgres, Dialect::Mysql] {
+        let codes = matching_codes(&sql, dialect, &ruleset(), &EnforcementPolicy::default());
+        assert!(
+            codes.contains(&"VERICTO-061".to_string()),
+            "parentheses must not hide a 10,001-row batch on {dialect:?}: {codes:?}"
+        );
+    }
+}
+
+#[test]
 fn copy_from_stdin_and_copy_to_keep_their_verdict() {
     // FROM STDIN is the bulk path VERICTO-061 recommends; TO STDOUT / TO a
     // file are outside its scope. None of them matches a rule.
@@ -1197,6 +1404,42 @@ fn numeric_and_negated_constant_comparisons_are_where_less_on_every_dialect() {
             EVERY_DIALECT,
             "`{sql}` is constant-true and must trip VERICTO-003 on every dialect"
         );
+    }
+}
+
+#[test]
+fn null_in_boolean_and_distinct_tautologies_are_where_less() {
+    for sql in [
+        "DELETE FROM users WHERE 1 IS NOT NULL",
+        "DELETE FROM users WHERE NULL IS NULL",
+        "DELETE FROM users WHERE NOT (1 IS NULL)",
+        "DELETE FROM users WHERE 1 IN (1, NULL)",
+        "DELETE FROM users WHERE 1 IN (1, id)",
+        "DELETE FROM users WHERE NULL IS UNKNOWN",
+        "DELETE FROM users WHERE NULL IS NOT TRUE",
+        "DELETE FROM users WHERE 1 IS DISTINCT FROM NULL",
+        "DELETE FROM users WHERE NULL IS NOT DISTINCT FROM NULL",
+        "DELETE FROM users WHERE 1 IS NOT DISTINCT FROM 1",
+    ] {
+        assert_eq!(
+            dialects_firing_003(sql),
+            EVERY_DIALECT,
+            "`{sql}` is true independently of every row"
+        );
+    }
+
+    // T-SQL has no TRUE/FALSE literal; its parser reads them as identifiers.
+    // Every other parser can prove these boolean tests from constants.
+    let except_mssql: Vec<Dialect> = EVERY_DIALECT
+        .into_iter()
+        .filter(|d| *d != Dialect::MsSql)
+        .collect();
+    for sql in [
+        "DELETE FROM users WHERE TRUE IS TRUE",
+        "DELETE FROM users WHERE FALSE IS FALSE",
+        "DELETE FROM users WHERE TRUE IS NOT FALSE",
+    ] {
+        assert_eq!(dialects_firing_003(sql), except_mssql, "`{sql}`");
     }
 }
 
@@ -1445,5 +1688,224 @@ fn bind_parameters_are_not_constants_on_every_dialect() {
                 "`{sql}` must NOT trip VERICTO-003 on {d:?}"
             );
         }
+    }
+}
+
+#[test]
+fn oracle_empty_strings_follow_null_semantics() {
+    assert!(
+        fires_003("DELETE FROM users WHERE '' IS NULL", Dialect::Oracle),
+        "Oracle treats an empty character value as NULL"
+    );
+    assert!(
+        !fires_003("DELETE FROM users WHERE '' IS NOT NULL", Dialect::Oracle),
+        "Oracle empty-string IS NOT NULL matches no rows"
+    );
+}
+
+#[test]
+fn folded_and_numeric_boolean_tests_are_not_bypasses() {
+    for sql in [
+        "DELETE FROM users WHERE (1 = 1) IS TRUE",
+        "DELETE FROM users WHERE (1 = 2) IS FALSE",
+        "DELETE FROM users WHERE ((1 = 2) OR (2 = 3)) IS FALSE",
+        "DELETE FROM users WHERE (NULL = 1) IS UNKNOWN",
+    ] {
+        for dialect in EVERY_DIALECT {
+            if parser_for(dialect).parse(sql).is_ok() {
+                assert!(
+                    fires_003(sql, dialect),
+                    "`{sql}` is constant true on {dialect:?}"
+                );
+            }
+        }
+    }
+
+    for sql in [
+        "DELETE FROM users WHERE 1 IS TRUE",
+        "DELETE FROM users WHERE 0 IS FALSE",
+    ] {
+        for dialect in [Dialect::Mysql, Dialect::Sqlite] {
+            assert!(
+                fires_003(sql, dialect),
+                "`{sql}` is constant true on {dialect:?}"
+            );
+        }
+    }
+    assert!(
+        !fires_003("DELETE FROM users WHERE 1 IS TRUE", Dialect::Postgres),
+        "PostgreSQL rejects numeric IS TRUE and must not fold it"
+    );
+
+    // Recursive BooleanTest folding is constant-only. The engine's historical
+    // `id = id` heuristic must not leak through `IS TRUE`, which filters NULLs.
+    for dialect in [Dialect::Postgres, Dialect::Mysql, Dialect::Sqlite] {
+        assert!(
+            !fires_003("DELETE FROM users WHERE (id = id) IS TRUE", dialect),
+            "row-dependent BooleanTest on {dialect:?}"
+        );
+    }
+}
+
+#[test]
+fn exact_numbers_do_not_manufacture_tautologies() {
+    for sql in [
+        "DELETE FROM users WHERE 9007199254740992 IS NOT DISTINCT FROM 9007199254740993",
+        "DELETE FROM users WHERE 9007199254740992 IN (9007199254740993, id)",
+        "DELETE FROM users WHERE 0 > 0.5",
+    ] {
+        for dialect in EVERY_DIALECT {
+            assert!(
+                !fires_003(sql, dialect),
+                "`{sql}` is not always true on {dialect:?}"
+            );
+        }
+    }
+
+    let sql = "DELETE FROM users WHERE 9007199254740993 IS NOT DISTINCT FROM 9007199254740993";
+    for dialect in EVERY_DIALECT {
+        assert!(fires_003(sql, dialect), "exact equality on {dialect:?}");
+        assert!(
+            fires_003("DELETE FROM users WHERE 0 < 0.5", dialect),
+            "zero is below a positive fraction on {dialect:?}"
+        );
+    }
+    assert_eq!(
+        dialects_firing_090("SELECT * FROM users WHERE id = 1 OR 0.5 > 0"),
+        EVERY_DIALECT,
+        "a positive fraction is an always-true OR branch"
+    );
+}
+
+/// `INSERT INTO t TABLE u` is shorthand for `INSERT INTO t SELECT * FROM u`:
+/// it copies every row, so it is an unbounded INSERT … SELECT for VERICTO-040.
+/// libpg_query already expands `TABLE u` to `SELECT * FROM u`; the sqlparser
+/// dialects keep it as `SetExpr::Table`, which 4.7.0 classifies as a source.
+#[test]
+fn vericto_040_fires_on_an_insert_table_source() {
+    let policy = EnforcementPolicy::default();
+    let sql = "INSERT INTO archive TABLE users";
+    for dialect in EVERY_DIALECT {
+        assert!(
+            parser_for(dialect).parse(sql).is_ok(),
+            "{dialect:?} must accept `{sql}`"
+        );
+        let m = matching_codes(sql, dialect, &ruleset(), &policy);
+        assert!(
+            m.contains(&"VERICTO-040".to_string()),
+            "{dialect:?}: `{sql}` copies every row, got {m:?}"
+        );
+    }
+
+    // A bounded SELECT arm does not hide a TABLE arm that copies everything.
+    let mixed = "INSERT INTO archive SELECT id FROM users WHERE id = 1 UNION ALL TABLE admins";
+    for dialect in EVERY_DIALECT {
+        let m = matching_codes(mixed, dialect, &ruleset(), &policy);
+        assert!(
+            m.contains(&"VERICTO-040".to_string()),
+            "{dialect:?}: the TABLE arm is unbounded in `{mixed}`, got {m:?}"
+        );
+    }
+}
+
+#[test]
+fn set_operators_keep_vericto_040_structural() {
+    let policy = EnforcementPolicy::default();
+    for operator in ["INTERSECT", "EXCEPT"] {
+        let sql = format!(
+            "INSERT INTO archive SELECT id FROM candidates {operator} SELECT id FROM approved"
+        );
+        for dialect in [Dialect::Postgres, Dialect::Mysql] {
+            if parser_for(dialect).parse(&sql).is_ok() {
+                let codes = matching_codes(&sql, dialect, &ruleset(), &policy);
+                assert!(
+                    !codes.contains(&"VERICTO-040".to_string()),
+                    "{operator} structurally filters the source on {dialect:?}: {codes:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn executable_wrappers_cannot_hide_sleep_calls() {
+    let policy = EnforcementPolicy::default();
+    let set_codes = matching_codes("SET @probe = SLEEP(5)", Dialect::Mysql, &ruleset(), &policy);
+    assert!(
+        set_codes.contains(&"VERICTO-070".to_string()),
+        "{set_codes:?}"
+    );
+
+    let analyzed = matching_codes(
+        "EXPLAIN ANALYZE SELECT SLEEP(5)",
+        Dialect::Mysql,
+        &ruleset(),
+        &policy,
+    );
+    assert!(
+        analyzed.contains(&"VERICTO-070".to_string()),
+        "{analyzed:?}"
+    );
+
+    let planned = matching_codes(
+        "EXPLAIN SELECT SLEEP(5)",
+        Dialect::Mysql,
+        &ruleset(),
+        &policy,
+    );
+    assert!(
+        !planned.contains(&"VERICTO-070".to_string()),
+        "plain EXPLAIN does not execute the call: {planned:?}"
+    );
+
+    let prepared = matching_codes(
+        "PREPARE delayed AS SELECT pg_sleep(5)",
+        Dialect::Postgres,
+        &ruleset(),
+        &policy,
+    );
+    assert!(
+        prepared.contains(&"VERICTO-070".to_string()),
+        "a dangerous prepared body must be caught before opaque EXECUTE: {prepared:?}"
+    );
+
+    let analyzed = matching_codes(
+        "EXPLAIN ANALYZE SELECT pg_sleep(5)",
+        Dialect::Postgres,
+        &ruleset(),
+        &policy,
+    );
+    assert!(
+        analyzed.contains(&"VERICTO-070".to_string()),
+        "PostgreSQL EXPLAIN ANALYZE executes its query: {analyzed:?}"
+    );
+    for sql in [
+        "EXPLAIN SELECT pg_sleep(5)",
+        "EXPLAIN (ANALYZE FALSE) SELECT pg_sleep(5)",
+    ] {
+        let planned = matching_codes(sql, Dialect::Postgres, &ruleset(), &policy);
+        assert!(
+            !planned.contains(&"VERICTO-070".to_string()),
+            "non-executing PostgreSQL EXPLAIN must not fire: {planned:?}"
+        );
+    }
+}
+
+#[test]
+fn postgres_sleep_calls_are_found_in_every_executed_clause() {
+    let policy = EnforcementPolicy::default();
+    for sql in [
+        "SELECT CASE WHEN pg_sleep(5) IS NULL THEN 1 ELSE 0 END",
+        "SELECT id FROM users ORDER BY (pg_sleep(5) IS NULL)",
+        "SELECT id FROM users GROUP BY id HAVING pg_sleep(5) IS NULL",
+        "SELECT users.id FROM users JOIN admins ON pg_sleep(5) IS NULL",
+        "UPDATE users SET active = (pg_sleep(5) IS NULL) WHERE id = 1",
+        "INSERT INTO users (active) VALUES (pg_sleep(5) IS NULL)",
+    ] {
+        let codes = matching_codes(sql, Dialect::Postgres, &ruleset(), &policy);
+        assert!(
+            codes.contains(&"VERICTO-070".to_string()),
+            "PostgreSQL placement bypass for `{sql}`: {codes:?}"
+        );
     }
 }

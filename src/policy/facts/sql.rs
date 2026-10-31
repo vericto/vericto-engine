@@ -97,7 +97,6 @@ fn walked(op: &'static str, kind: &str) -> Shape {
 }
 
 fn shape_of(s: &Statement, dialect: Dialect) -> Shape {
-    let sqlite = dialect == Dialect::Sqlite;
     match s {
         Statement::Query(q) if select_into(q) => {
             let mut sh = Shape::new("ddl", "SelectStmt");
@@ -130,7 +129,7 @@ fn shape_of(s: &Statement, dialect: Dialect) -> Shape {
                 for t in &sel.from {
                     scope_twj(t, &mut sh.scope);
                 }
-                set_where(&mut sh, sel.selection.as_ref(), sqlite);
+                set_where(&mut sh, sel.selection.as_ref(), dialect);
             }
             sh
         }
@@ -201,7 +200,7 @@ fn shape_of(s: &Statement, dialect: Dialect) -> Shape {
                 None => {}
             }
             sh.assign = assignments(&u.assignments);
-            set_where(&mut sh, u.selection.as_ref(), sqlite);
+            set_where(&mut sh, u.selection.as_ref(), dialect);
             sh
         }
         Statement::Delete(d) => {
@@ -223,7 +222,7 @@ fn shape_of(s: &Statement, dialect: Dialect) -> Shape {
             for t in d.using.iter().flatten() {
                 scope_twj(t, &mut sh.scope);
             }
-            set_where(&mut sh, d.selection.as_ref(), sqlite);
+            set_where(&mut sh, d.selection.as_ref(), dialect);
             sh
         }
         Statement::Merge(m) => {
@@ -400,10 +399,10 @@ fn table_factor_alias(tf: &TableFactor) -> Option<String> {
     }
 }
 
-fn set_where(sh: &mut Shape, w: Option<&Expr>, sqlite: bool) {
+fn set_where(sh: &mut Shape, w: Option<&Expr>, dialect: Dialect) {
     let Some(w) = w else { return };
     sh.where_always_true =
-        crate::parser::walk::where_presence(Some(w), sqlite) == WherePresence::AlwaysTrue;
+        crate::parser::walk::where_presence(Some(w), dialect) == WherePresence::AlwaysTrue;
     sh.where_pred = Some(pred(w, 0));
 }
 

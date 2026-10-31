@@ -33,7 +33,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.6.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.7.0" }
 ```
 
 ### Quick example
@@ -98,8 +98,8 @@ severity to, and `engine_driven` for VERICTO-085, 086 and 087, which the policy
 drives and the rules slice neither enables nor disables. A test keeps the table
 equal to the catalogue below.
 
-`ENGINE_VERSION` is this crate's version (`"4.6.0"`) and
-`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@4.6.0"`):
+`ENGINE_VERSION` is this crate's version (`"4.7.0"`) and
+`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@4.7.0"`):
 a built-in rule's predicate lives in the engine, so what the standard ruleset
 detects changes with the engine version. Print them with a verdict to say what
 it was evaluated with.
@@ -204,7 +204,7 @@ Low/Informational → Monitor).
 | Code | Name | What it detects |
 |---|---|---|
 | VERICTO-001 | DELETE without WHERE | A `DELETE` with no `WHERE` — removes every row of the table. |
-| VERICTO-003 | DELETE with always-true WHERE | A `DELETE` whose `WHERE` is trivially true (`1=1`, `id = id`, `NOT FALSE`, `WHERE 1`, `1 IN (1,2)`, `1 BETWEEN 0 AND 2`, `'x' LIKE '%'`) — semantically WHERE-less. See [what counts as always-true](#what-counts-as-always-true). |
+| VERICTO-003 | DELETE with always-true WHERE | A `DELETE` whose `WHERE` is trivially true (`1=1`, `id = id`, `NOT FALSE`, `WHERE 1`, `NULL IS NULL`, `1 IS NOT NULL`, `TRUE IS TRUE`, `1 IS DISTINCT FROM NULL`, `1 IN (1,NULL)`, `1 BETWEEN 0 AND 2`, `'x' LIKE '%'`) — semantically WHERE-less. See [what counts as always-true](#what-counts-as-always-true). |
 | VERICTO-010 | DROP TABLE / DATABASE | `DROP TABLE` or `DROP DATABASE` — irreversible loss of a relation/database. Excludes `INDEX` (VERICTO-013) and `SCHEMA` (VERICTO-012). |
 | VERICTO-011 | TRUNCATE TABLE | `TRUNCATE` — empties a table, non-transactional/unfiltered by design. |
 | VERICTO-012 | DROP SCHEMA | `DROP SCHEMA` — drops a whole namespace and everything in it. |
@@ -233,10 +233,10 @@ Low/Informational → Monitor).
 | VERICTO-031 | UPDATE in CTE without WHERE | A data-modifying CTE (`WITH x AS (UPDATE … )`) whose `UPDATE` has no WHERE. |
 | VERICTO-033 | DELETE in subquery/CTE without WHERE | A nested `DELETE` with no WHERE inside a subquery or CTE. |
 | VERICTO-040 | INSERT INTO … SELECT without filter | `INSERT … SELECT` whose source has no filter — copies every source row. |
-| VERICTO-070 | SLEEP() / PG_SLEEP() | A sleep-family call (`sleep`, `pg_sleep`, `pg_sleep_for`, `pg_sleep_until`, Snowflake's `system$wait`) anywhere in the query — DoS / time-based blind injection probing. SQLite has no sleep: there, a `randomblob(N)` / `zeroblob(N)` with a constant `N` of 10,000,000 bytes or more (`randomblob(500000000/2)`), in any clause SQLite evaluates (`WHERE … IS NULL`, `CASE`, `IN (…)`, subqueries, CTEs, `ORDER BY` / `GROUP BY` / `HAVING`, `UPDATE … SET`, `INSERT … VALUES`, `RETURNING`, trigger bodies and their `WHEN`). |
+| VERICTO-070 | SLEEP() / PG_SLEEP() | A sleep-family call (`sleep`, `pg_sleep`, `pg_sleep_for`, `pg_sleep_until`, Snowflake's `system$wait`) in an executed expression, including joins, grouping/order clauses, DML values, `SET` assignments, prepared statement bodies and `EXPLAIN ANALYZE` — DoS / time-based blind injection probing. Plain `EXPLAIN` does not execute its query and is excluded. SQLite has no sleep: there, a `randomblob(N)` / `zeroblob(N)` with a constant `N` of 10,000,000 bytes or more (`randomblob(500000000/2)`) is the equivalent probe. |
 | VERICTO-082 | GRANT / REVOKE | A `GRANT` or `REVOKE` — privilege escalation or accidental lockout. |
 | VERICTO-083 | MERGE | `MERGE INTO …` — can mass-mutate the target like an UPDATE/DELETE with no effective WHERE. |
-| VERICTO-084 | CREATE TABLE AS SELECT | `CREATE TABLE … AS SELECT …` / `SELECT … INTO` — bulk data copy that can duplicate a whole table. |
+| VERICTO-084 | CREATE TABLE AS SELECT | `CREATE TABLE … AS SELECT …`, PostgreSQL/SQL Server `SELECT … INTO`, or `CREATE MATERIALIZED VIEW … AS SELECT` — bulk data copy that can duplicate a whole table. |
 | VERICTO-085 | Read of a sensitive column | A query projects (or copies elsewhere) a column the host tagged as sensitive. Driven by `EnforcementPolicy::sensitive_columns`, not by the rules slice; High for `block`/`mask`, Medium for `flag`. See [Sensitive columns](#sensitive-columns-vericto-085). |
 | VERICTO-094 | Recovery reduced | `DATA_RETENTION_TIME_IN_DAYS = 0` (table, schema, database, account), `ALTER ACCOUNT`, `CREATE OR REPLACE TABLE \| SCHEMA \| DATABASE` (drops an existing object of that name), `INSERT OVERWRITE` (replaces every row), `UNDROP` (can shadow a newer object). SchemaMigration: a CI channel's `schema_migration_cap` softens it like DROP TABLE. (Snowflake.) |
 | VERICTO-095 | Warehouse cost | `CREATE`/`ALTER WAREHOUSE` setting `WAREHOUSE_SIZE`, a cluster count, a type, a scaling policy, query acceleration or a never-suspend `AUTO_SUSPEND` (`0`/`NULL`); `ALTER RESOURCE MONITOR`. A warehouse created with the defaults is not reported. Performance. (Snowflake.) |
@@ -272,17 +272,20 @@ mirrors this table verbatim.
 Several rules turn on whether a `WHERE` clause actually filters anything.
 VERICTO-003/030/042 treat an always-true `WHERE` as WHERE-less, VERICTO-090 looks
 for one as an `OR` branch, and VERICTO-040 asks whether an `INSERT … SELECT`
-source is bounded. All four share one predicate, so what it recognises is worth
+source is bounded. All five share one predicate, so what it recognises is worth
 stating precisely.
 
-**A predicate qualifies only when every operand is a literal.** Its truth value
-then cannot depend on the row, so it filters nothing:
+**A predicate qualifies only when constants prove it true for every row.** Most
+forms are constant-only. Positive `IN` is the narrow exception: one matching
+constant makes the OR true even if another item is a column or `NULL`.
 
 | Form | Example |
 |---|---|
 | boolean / truthy literal | `WHERE TRUE`, `WHERE 1` |
 | constant comparison | `1=1`, `2 > 1`, `-1 < 0`, `'a'='a'` |
-| constant `IN` list | `1 IN (1, 2)` |
+| constant null / boolean test | `NULL IS NULL`, `1 IS NOT NULL`, `(1=1) IS TRUE`, `NULL IS UNKNOWN` |
+| null-safe comparison | `1 IS DISTINCT FROM NULL`, `NULL IS NOT DISTINCT FROM NULL` |
+| `IN` with a known match | `1 IN (1, 2)`, `1 IN (1, NULL)`, `1 IN (1, id)` |
 | constant `BETWEEN` | `1 BETWEEN 0 AND 2` |
 | constant `LIKE '%'` | `'x' LIKE '%'` |
 | `NOT <always-false>` | `NOT FALSE`, `NOT 1=2` |
@@ -295,7 +298,14 @@ trick for neutralising a `WHERE`, which has no legitimate use.
 prefix: `'1abc'` is 1), so on SQLite a string literal with a non-zero numeric
 prefix is always-true too (`WHERE '1abc'`, `OR '1'`), and so is a double-quoted
 name spelling one (`WHERE "1"`), which SQLite reads as a string when no column
-has that name.
+has that name. MySQL also treats numeric operands as booleans for `IS TRUE` /
+`IS FALSE` (`1 IS TRUE`, `0 IS FALSE`). Numeric `IS` tests stay undecided on
+the other sqlparser dialects; PostgreSQL rejects them as a type error.
+
+**Oracle** treats an empty character value as `NULL`, so `'' IS NULL` is
+always-true while `'' IS NOT NULL` is not. MySQL double-quoted values remain
+undecided because the engine cannot observe whether `ANSI_QUOTES` makes `"id"`
+a column rather than a string.
 
 ### What does not count, and why
 
@@ -307,6 +317,7 @@ column is `NULL`:
 WHERE id IS NOT NULL   -- filters: NULL rows are excluded
 WHERE name LIKE '%'    -- filters: NULL names are excluded
 WHERE id IN (1, 2)     -- filters, obviously
+WHERE 1 IN (2, id)      -- no known match: the column can change the result
 ```
 
 Reporting those would be a false positive on rules that reject live traffic, so
@@ -327,16 +338,15 @@ WHERE ? = ?                -- bind parameters are values the engine does not see
 
 Two string literals are decided equal when they are identical, and different
 only when both are plain ASCII letters and digits that differ beyond case
-(`'a' <> 'b'`).
+(`'a' <> 'b'`). Numeric literals are compared as exact base-10 values rather
+than binary floating point, so adjacent integers above 2^53 remain distinct.
 
-Two further cases are **deliberate false negatives**, since over-reporting is the
+One further case is a **deliberate false negative**, since over-reporting is the
 dangerous direction for a blocking rule:
 
 - **`NOT IN` is never treated as the negation of `IN`.** With a `NULL` in the list
   the predicate evaluates to `NULL`, not true: `1 NOT IN (2, NULL)` matches *no*
   rows. Only the positive form is decided.
-- **A `NULL` anywhere in an `IN` list disqualifies it**, so `1 IN (1, NULL)` is not
-  reported even though it does match every row.
 
 Semantic tautologies over columns (`WHERE id = 1 OR id > 0`) are out of scope:
 deciding them needs the column's domain, which a deterministic parser cannot know.

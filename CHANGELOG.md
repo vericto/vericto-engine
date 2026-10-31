@@ -7,6 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.7.0] — 2026-10-31
+
+**Existing rules see the same destructive operation through more equivalent SQL
+forms.** No rule, severity or policy default changes. The release closes bypasses
+where an always-true predicate looked like a real `WHERE`, where table-copy syntax
+was normalized as an ordinary read (or no statement at all), and where a sleep call
+could hide in an executed clause or wrapper.
+
+### Security
+
+- **VERICTO-003/030/042 now treat constant null, boolean and null-safe predicates
+  as WHERE-less.** Examples include `NULL IS NULL`, `1 IS NOT NULL`, `NOT (1 IS
+  NULL)`, `(1=1) IS TRUE`, `TRUE IS TRUE`, `NULL IS UNKNOWN`, `1 IS DISTINCT
+  FROM NULL` and `NULL IS NOT DISTINCT FROM NULL`. The same forms inside an
+  `OR` reach VERICTO-090, and on an `INSERT … SELECT` they do not count as a
+  filter for VERICTO-040.
+- **A known match makes positive `IN` true regardless of later items.** `1 IN
+  (1, NULL)` and `1 IN (1, id)` are TRUE for every row (`TRUE OR UNKNOWN` is
+  TRUE), so they no longer bypass the same five rules. `1 IN (2, id)` and every
+  `NOT IN` remain undecided: the column/NULL can still change their result.
+- **VERICTO-084 covers table-copy syntax on every parser path.** MySQL and Oracle
+  `CREATE TABLE … AS SELECT …`, PostgreSQL/SQL Server `SELECT … INTO <table>`,
+  and materialized-view creation on sqlparser dialects were previously accepted
+  without an 084 finding. MySQL `SELECT … INTO @variable` and ordinary views
+  remain non-table-copy forms.
+- **VERICTO-040 covers set-operation and parenthesized SELECT sources.**
+  `INSERT … SELECT … UNION SELECT …` no longer looks like a VALUES insert on
+  MySQL/Oracle/SQL Server/Snowflake. An enclosing limit or effective filters on
+  every UNION arm bound that source; INTERSECT/EXCEPT count as structural
+  filters. Parenthesized and set-operated literal VALUES remain non-SELECT
+  inserts. SQL Server/Snowflake `TOP` and fixed-row Snowflake `SAMPLE` keep the
+  source bounded, matching VERICTO-050.
+- **VERICTO-040 covers `INSERT … TABLE t`.** The shorthand for `INSERT …
+  SELECT * FROM t` copies every row; it now fires on the sqlparser dialects as
+  it already did on PostgreSQL.
+- **VERICTO-061 counts parenthesized VALUES batches.** Parentheses no longer
+  hide a batch above the existing 10,000-row threshold on sqlparser dialects.
+- **VERICTO-070 and custom `func_name` rules inspect executed expressions across
+  both parser backends.** A known sleep-family call can no longer hide in `JOIN …
+  ON`, `GROUP BY`/`HAVING`, `ORDER BY`, `UPDATE … SET`, `INSERT … VALUES`, window
+  clauses, RETURNING, ON CONFLICT, MySQL `SET`, prepared statement bodies,
+  PostgreSQL expression wrappers or a nested query. `EXPLAIN ANALYZE` is inspected because it executes the wrapped
+  statement; plain `EXPLAIN` remains non-executing.
+- **VERICTO-051 treats a qualified wildcard (`table.*`) as SELECT star.** A
+  qualifier changes where the columns come from, not whether all of them are
+  selected.
+
+### False-positive controls
+
+- Constant folding stays deliberately narrow. It does not evaluate functions,
+  arithmetic, a correlated subquery or a row-dependent predicate. `id IS NOT
+  NULL`, `name LIKE '%'`, `1 IN (2, id)` and `NOT IN` remain real/unknown filters.
+- Null-safe equality reuses the existing collation- and coercion-aware constant
+  comparison. Numbers use exact base-10 comparison, including zero versus
+  fractions, so adjacent integers above 2^53 cannot collapse into equality.
+  Oracle empty character values normalize to NULL; ambiguous MySQL double-quoted
+  values and Boolean tests with column references stay undecided.
+- The corpus and property tests pin the negative controls above, MySQL's
+  ambiguous double-quoted values and non-table `SELECT … INTO`, literal VALUES
+  inside parentheses/set operations, bounded set-operation sources, and ordinary
+  non-sleep functions.
+
+### Upgrade note
+
+- dbt-snowflake's parenthesized incremental `INSERT … (SELECT …)` now matches
+  VERICTO-040, and SQL Server `SELECT … INTO #temp` matches VERICTO-084. Both
+  copy rows by design. Trial 4.7.0 with `monitor_mode`, then set the affected
+  rule action explicitly if those copies are approved workflow operations.
+- An optional-filter expression rendered with a literal NULL branch, such as
+  `status = 'active' OR NULL IS NULL`, now matches VERICTO-090 because it is
+  unconditionally true. Keep runtime values as bind parameters when the branch
+  is data-dependent; approve intentional all-row operations through policy
+  rather than disguising them as a filter.
+
+### Tests
+
+- Cross-dialect regressions for DELETE, UPDATE, OR-injection and INSERT … SELECT;
+  CTAS/SELECT-INTO and qualified wildcard coverage; sleep placement across both
+  parser trees and execution-aware wrappers; Oracle empty strings, exact-number
+  boundaries and shared `IS [NOT] DISTINCT FROM` truth-table tests.
+- Snowflake's 1,165-statement corpus changes four outcomes: two dbt
+  parenthesized INSERT … SELECT forms now reach VERICTO-040, and two parsed
+  materialized-view copies now reach VERICTO-084. On the INSERT OVERWRITE case,
+  VERICTO-094 remains a violation while VERICTO-040 wins the deterministic tie.
+  Parse/recognition rates are unchanged.
+- The policy benchmark exercises full `evaluate` / `evaluate_with_context`
+  calls, including parse and walk, for PostgreSQL and MySQL; the CI factor-2
+  budget remains green.
+
 ## [4.6.0] — 2026-10-24
 
 **VERICTO-087 tells the agent what is missing and who can grant it.** Until
@@ -2127,7 +2216,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.6.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.7.0...HEAD
+[4.7.0]: https://github.com/vericto/vericto-engine/compare/v4.6.0...v4.7.0
 [4.6.0]: https://github.com/vericto/vericto-engine/compare/v4.5.0...v4.6.0
 [4.5.0]: https://github.com/vericto/vericto-engine/compare/v4.4.0...v4.5.0
 [4.4.0]: https://github.com/vericto/vericto-engine/compare/v4.3.0...v4.4.0
