@@ -11,14 +11,14 @@
 use crate::error::{MAX_AST_DEPTH, ProxyError, Result, guard_nesting_depth};
 use crate::parser::{
     AlterTableKind, CmpOp, Const, Dialect, DropObjectKind, ParsedQuery, SnowflakeRisk, SqliteRisk,
-    StatementInfo, StatementKind, Truth, WherePresence, compare,
+    StatementInfo, StatementKind, Truth, WherePresence, compare, compare_distinct,
 };
 
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     Expr, FromTable, FunctionArguments, LimitClause, ObjectType, Query, SelectItem, SetExpr,
-    Statement, TableFactor, TableWithJoins, Value, ValueWithSpan, Visit, Visitor,
+    SetOperator, Statement, TableFactor, TableWithJoins, Value, ValueWithSpan, Visit, Visitor,
 };
 use sqlparser::dialect::Dialect as SqlDialect;
 use sqlparser::parser::Parser as SqlAstParser;
@@ -76,9 +76,9 @@ pub(crate) fn from_statements(
     }
 
     let cx = Cx {
+        dialect: which,
         snowflake: which == Dialect::Snowflake,
         sqlite: which == Dialect::Sqlite,
-        complete: which == Dialect::Sqlite,
     };
     let mut collected: Vec<StatementInfo> = Vec::new();
     for stmt in &statements {
@@ -111,25 +111,17 @@ pub(crate) fn from_statements(
 /// unknown statement.
 pub(crate) const UNSUPPORTED_STATEMENT: &str = "statement not supported by the engine";
 
-/// What the walk needs to know about the dialect. Only Snowflake and SQLite
-/// change what is recorded; every other dialect walks exactly as before.
+/// What the walk needs to know about the dialect. Snowflake and SQLite change
+/// specialized readings; the full dialect controls constant semantics and
+/// SQL Server's `SELECT … INTO` table-copy form.
 #[derive(Clone, Copy)]
 struct Cx {
+    dialect: Dialect,
     snowflake: bool,
     /// SQLite: its statement kinds (`ATTACH`, `PRAGMA`, `VACUUM`), its
     /// truthiness (`WHERE '1abc'` is true) and its time probe
     /// (`randomblob(N)`).
     sqlite: bool,
-    /// Walk every expression a statement runs, not only the projection,
-    /// `WHERE` and call arguments: `IS [NOT] NULL`, `CASE`, `IN (…)`,
-    /// `BETWEEN`, `CAST`, `ORDER BY` / `GROUP BY` / `HAVING`, `JOIN … ON`,
-    /// `LIMIT`, window specifications, `UPDATE … SET`, `INSERT … VALUES`,
-    /// `ON CONFLICT`, `RETURNING`, a trigger's `WHEN`, and every subquery
-    /// they hold (see [`Rest`]). SQLite only since 4.1.1, where VERICTO-070
-    /// otherwise missed a wrapped `randomblob(N)`; turning it on for the other
-    /// sqlparser dialects reports more calls and subqueries there, a verdict
-    /// change left to a minor release.
-    complete: bool,
 }
 
 /// Snowflake code the engine does not read: a scripting block (`BEGIN … END`,
@@ -487,13 +479,13 @@ fn walk_statement(
     match stmt {
         // ── DELETE ─────────────────────────────────────────────────────────
         Statement::Delete(delete) => {
-            let presence = where_presence(delete.selection.as_ref(), cx.sqlite);
+            let presence = where_presence(delete.selection.as_ref(), cx.dialect);
             let relation = relation_from_delete(delete);
             let delete_limit = delete.limit.as_ref().and_then(expr_as_i64);
             let tautology = delete
                 .selection
                 .as_ref()
-                .is_some_and(|e| has_or_tautology(e, cx.sqlite));
+                .is_some_and(|e| has_or_tautology(e, cx.dialect));
 
             out.push(StatementInfo {
                 kind: StatementKind::Delete,
@@ -511,18 +503,16 @@ fn walk_statement(
                 walk_expr(expr, depth + 1, cx, out)?;
             }
             walk_with_from_ctes(&delete.from, depth + 1, cx, out)?;
-            if cx.complete {
-                let walked_queries = match &delete.from {
-                    FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
-                        tables.iter().filter_map(|t| derived(&t.relation)).collect()
-                    }
-                };
-                let walked = Walked {
-                    exprs: delete.selection.iter().collect(),
-                    queries: walked_queries,
-                };
-                walk_rest(delete, walked, depth + 1, cx, out)?;
-            }
+            let walked_queries = match &delete.from {
+                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
+                    tables.iter().filter_map(|t| derived(&t.relation)).collect()
+                }
+            };
+            let walked = Walked {
+                exprs: delete.selection.iter().collect(),
+                queries: walked_queries,
+            };
+            walk_rest(delete, walked, depth + 1, cx, out)?;
         }
 
         // ── UPDATE ─────────────────────────────────────────────────────────
@@ -530,11 +520,11 @@ fn walk_statement(
             let sqlparser::ast::Update {
                 selection, table, ..
             } = update;
-            let presence = where_presence(selection.as_ref(), cx.sqlite);
+            let presence = where_presence(selection.as_ref(), cx.dialect);
             let relation = relation_from_table_with_joins(table);
             let tautology = selection
                 .as_ref()
-                .is_some_and(|e| has_or_tautology(e, cx.sqlite));
+                .is_some_and(|e| has_or_tautology(e, cx.dialect));
             out.push(StatementInfo {
                 kind: StatementKind::Update,
                 relation,
@@ -547,14 +537,12 @@ fn walk_statement(
             if let Some(expr) = selection.as_ref() {
                 walk_expr(expr, depth + 1, cx, out)?;
             }
-            // `SET x = zeroblob(…)`, `FROM`, `RETURNING`, `ORDER BY`, `LIMIT`.
-            if cx.complete {
-                let walked = Walked {
-                    exprs: selection.iter().collect(),
-                    queries: Vec::new(),
-                };
-                walk_rest(update, walked, depth + 1, cx, out)?;
-            }
+            // `SET x = sleep(…)`, `FROM`, `RETURNING`, `ORDER BY`, `LIMIT`.
+            let walked = Walked {
+                exprs: selection.iter().collect(),
+                queries: Vec::new(),
+            };
+            walk_rest(update, walked, depth + 1, cx, out)?;
         }
 
         // ── DROP ───────────────────────────────────────────────────────────
@@ -681,45 +669,58 @@ fn walk_statement(
             }
         }
 
+        // ── CREATE TABLE … AS SELECT (VERICTO-084) ────────────────────────
+        // The generic sqlparser paths model CTAS as CreateTable { query }.
+        // SQLite and Snowflake keep their specialized walkers below: Snowflake
+        // also classifies CREATE OR REPLACE / CLONE, and SQLite trigger bodies.
+        Statement::CreateTable(ct) if !cx.sqlite && !cx.snowflake && ct.query.is_some() => {
+            out.push(StatementInfo {
+                kind: StatementKind::CreateTableAs,
+                relation: Some(ct.name.to_string()),
+                is_nested,
+                ast_node_path: "CreateTableAsStmt".to_string(),
+                ..Default::default()
+            });
+            walk_query(
+                ct.query.as_deref().expect("guarded by is_some"),
+                true,
+                depth + 1,
+                cx,
+                out,
+            )?;
+        }
+
+        Statement::CreateView(view) if view.materialized => {
+            out.push(StatementInfo {
+                kind: StatementKind::CreateTableAs,
+                relation: Some(view.name.to_string()),
+                is_nested,
+                ast_node_path: "CreateMaterializedViewStmt".to_string(),
+                ..Default::default()
+            });
+            walk_query(&view.query, true, depth + 1, cx, out)?;
+        }
+
         // ── INSERT ─────────────────────────────────────────────────────────
         Statement::Insert(insert) => {
             let has_columns = !insert.columns.is_empty();
 
-            // COUNT the number of value-tuples in VALUES(…)
+            // Count direct or parenthesized literal tuples for VERICTO-061.
+            // A LIMIT/OFFSET/FETCH can reduce the result, so that shape remains
+            // undecided rather than over-reporting a bulk insert.
             let insert_row_count = match insert.source.as_deref() {
-                Some(Query { body, .. }) => match body.as_ref() {
-                    SetExpr::Values(vals) => Some(vals.rows.len()),
-                    _ => None,
-                },
+                Some(query) => insert_values_row_count(query, depth + 1)?,
                 None => None,
             };
 
-            // True if the source is a SELECT (not a literal VALUES list)
-            let insert_has_select = match insert.source.as_deref() {
-                Some(Query { body, .. }) => match body.as_ref() {
-                    SetExpr::Values(_) | SetExpr::Query(_) => false,
-                    SetExpr::Select(_) => true,
-                    _ => false,
-                },
-                None => false,
-            };
-
-            // Does the source bound the rows it copies? An effective WHERE or a
-            // row limit both do; a tautological WHERE (`1=1`) does not. Mirrors
-            // the pg_query path so VERICTO-040 behaves the same per dialect.
-            let insert_select_has_filter = match insert.source.as_deref() {
-                Some(query) => match query.body.as_ref() {
-                    SetExpr::Select(select) => {
-                        let effective_where = select
-                            .selection
-                            .as_ref()
-                            .map(|e| !is_always_true(e, cx.sqlite))
-                            .unwrap_or(false);
-                        effective_where || has_row_limit(query) || query.fetch.is_some()
-                    }
-                    _ => false,
-                },
-                None => false,
+            // Classify the source recursively. A set operation or
+            // parenthesized SELECT is still INSERT … SELECT, while a
+            // parenthesized VALUES expression is not. UNION arms must each be
+            // bounded unless an enclosing query has a row limit; filtering set
+            // operators are bounded by their own structure.
+            let (insert_has_select, insert_select_has_filter) = match insert.source.as_deref() {
+                Some(query) => insert_source(query, cx, depth + 1)?,
+                None => (false, false),
             };
 
             out.push(StatementInfo {
@@ -752,13 +753,11 @@ fn walk_statement(
                 walk_query(source.as_ref(), true, depth + 1, cx, out)?;
             }
             // `ON CONFLICT … DO UPDATE SET`, `RETURNING`, MySQL's `SET` form.
-            if cx.complete {
-                let walked = Walked {
-                    exprs: Vec::new(),
-                    queries: insert.source.iter().map(|q| q.as_ref()).collect(),
-                };
-                walk_rest(insert, walked, depth + 1, cx, out)?;
-            }
+            let walked = Walked {
+                exprs: Vec::new(),
+                queries: insert.source.iter().map(|q| q.as_ref()).collect(),
+            };
+            walk_rest(insert, walked, depth + 1, cx, out)?;
         }
 
         // ── COPY … TO/FROM PROGRAM (VERICTO-080) ─────────────────────────────
@@ -824,10 +823,33 @@ fn walk_statement(
                 ast_node_path: "MergeStmt".to_string(),
                 ..Default::default()
             });
-            if cx.complete {
-                walk_rest(merge, Walked::default(), depth + 1, cx, out)?;
-            }
+            walk_rest(merge, Walked::default(), depth + 1, cx, out)?;
         }
+
+        // PREPARE does not execute immediately, but accepting a dangerous body
+        // lets a later opaque EXECUTE bypass every statement rule. Inspect the
+        // body now and mark its SELECT as nested so read-only LIMIT advice does
+        // not fire merely for preparing it.
+        Statement::Prepare { statement, .. } => {
+            walk_statement(statement, true, depth + 1, cx, out)?;
+        }
+
+        // SET assignment values execute immediately. Walking the accepted
+        // forms closes placements such as MySQL `SET @x = SLEEP(5)`.
+        Statement::Set(set) => {
+            walk_rest(set, Walked::default(), depth + 1, cx, out)?;
+        }
+
+        // EXPLAIN ANALYZE executes the wrapped statement; plain EXPLAIN only
+        // plans it and must not inherit execution-time findings.
+        Statement::Explain {
+            analyze: true,
+            statement,
+            ..
+        } => {
+            walk_statement(statement, is_nested, depth + 1, cx, out)?;
+        }
+        Statement::Explain { .. } => {}
 
         // ── SELECT ─────────────────────────────────────────────────────────
         Statement::Query(query) => {
@@ -836,10 +858,8 @@ fn walk_statement(
 
         other => {
             // Other statement types are not (yet) modelled. CREATE TABLE AS is
-            // handled on the PostgreSQL (pg_query) path; sqlparser models it as
-            // a CreateTable with a `query`, which the non-PG dialects we target
-            // do not commonly emit, so it is intentionally left unflagged here.
-            // Snowflake records it, and its own statement kinds, here:
+            // handled above for MySQL/Oracle/MS SQL and by the specialized
+            // SQLite/Snowflake walkers below.
             if cx.snowflake {
                 walk_snowflake(other, is_nested, depth, cx, out)?;
             }
@@ -1358,7 +1378,7 @@ fn walk_query(
     // `ORDER BY`, `LIMIT` / `OFFSET`, `FETCH` and the rest of the query
     // around its body. Destructured without `..`: a field a sqlparser upgrade
     // adds fails to compile here until it is classified.
-    if cx.complete {
+    {
         let Query {
             with: _,
             body: _,
@@ -1381,6 +1401,70 @@ fn walk_query(
         walk_rest(format_clause, Walked::default(), d, cx, out)?;
     }
     Ok(())
+}
+
+fn insert_values_row_count(query: &Query, depth: usize) -> Result<Option<usize>> {
+    if depth > MAX_AST_DEPTH {
+        return Err(ProxyError::AstTooDeep);
+    }
+    if query.limit_clause.is_some() || query.fetch.is_some() {
+        return Ok(None);
+    }
+    match query.body.as_ref() {
+        SetExpr::Values(values) => Ok(Some(values.rows.len())),
+        SetExpr::Query(inner) => insert_values_row_count(inner, depth + 1),
+        _ => Ok(None),
+    }
+}
+
+/// Classifies the query sourcing an INSERT for VERICTO-040.
+///
+/// `has_select` is true when at least one arm reads through SELECT/TABLE rather
+/// than supplying literal VALUES. UNION requires every contributing arm to be
+/// bounded, while INTERSECT/EXCEPT are structural filters. A limit on an
+/// enclosing query bounds the complete source.
+fn insert_source(query: &Query, cx: Cx, depth: usize) -> Result<(bool, bool)> {
+    if depth > MAX_AST_DEPTH {
+        return Err(ProxyError::AstTooDeep);
+    }
+    let (has_select, arms_bounded) = insert_set_expr_source(query.body.as_ref(), cx, depth + 1)?;
+    let outer_bound = has_row_limit(query) || query.fetch.is_some();
+    Ok((has_select, has_select && (outer_bound || arms_bounded)))
+}
+
+fn insert_set_expr_source(set_expr: &SetExpr, cx: Cx, depth: usize) -> Result<(bool, bool)> {
+    if depth > MAX_AST_DEPTH {
+        return Err(ProxyError::AstTooDeep);
+    }
+    match set_expr {
+        SetExpr::Select(select) => {
+            let effective_where = select
+                .selection
+                .as_ref()
+                .is_some_and(|expr| !is_always_true(expr, cx.dialect));
+            let row_bound = select.top.is_some() || (cx.snowflake && snowflake_bounded(select));
+            Ok((true, effective_where || row_bound))
+        }
+        SetExpr::Query(query) => insert_source(query, cx, depth + 1),
+        SetExpr::SetOperation {
+            left, op, right, ..
+        } => {
+            let left = insert_set_expr_source(left, cx, depth + 1)?;
+            let right = insert_set_expr_source(right, cx, depth + 1)?;
+            let has_select = left.0 || right.0;
+            let operator_bounds = match op {
+                SetOperator::Union => (!left.0 || left.1) && (!right.0 || right.1),
+                SetOperator::Intersect | SetOperator::Except | SetOperator::Minus => true,
+            };
+            Ok((has_select, has_select && operator_bounds))
+        }
+        SetExpr::Table(_) => Ok((true, false)),
+        SetExpr::Values(_)
+        | SetExpr::Insert(_)
+        | SetExpr::Update(_)
+        | SetExpr::Delete(_)
+        | SetExpr::Merge(_) => Ok((false, false)),
+    }
 }
 
 /// True when the query carries a row bound: `LIMIT n` or MySQL's
@@ -1411,10 +1495,12 @@ fn walk_set_expr(
     match set_expr {
         SetExpr::Select(select) => {
             // SELECT * detection
-            let is_star = select
-                .projection
-                .iter()
-                .any(|item| matches!(item, SelectItem::Wildcard(_)));
+            let is_star = select.projection.iter().any(|item| {
+                matches!(
+                    item,
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+                )
+            });
 
             // A `TOP n` clause (MSSQL, Snowflake) also bounds the result set,
             // as does a Snowflake `SAMPLE (n ROWS)` or `RESULT_SCAN` source.
@@ -1425,7 +1511,7 @@ fn walk_set_expr(
             let tautology = select
                 .selection
                 .as_ref()
-                .is_some_and(|e| has_or_tautology(e, cx.sqlite));
+                .is_some_and(|e| has_or_tautology(e, cx.dialect));
 
             // WHERE recursion (subqueries and sleep-family calls)
             if let Some(expr) = select.selection.as_ref() {
@@ -1452,15 +1538,30 @@ fn walk_set_expr(
                 }
             }
 
+            // SQL Server's `SELECT … INTO <table>` creates and fills a table;
+            // without this record it looked like an ordinary SELECT and only
+            // the advisory 050/051 rules fired, bypassing VERICTO-084.
+            let copies_into_table = cx.dialect == Dialect::MsSql && select.into.is_some();
+            if copies_into_table && let Some(into) = &select.into {
+                out.push(StatementInfo {
+                    kind: StatementKind::CreateTableAs,
+                    relation: into.targets.first().map(ToString::to_string),
+                    is_nested,
+                    ast_node_path: "SelectStmt > IntoClause".to_string(),
+                    ..Default::default()
+                });
+            }
+
             // Record EVERY select, nested or not (ENG-005). A `SELECT *` or an
             // `OR 1=1` tautology hiding in a subquery / CTE body must be seen by
             // VERICTO-051 / VERICTO-090. `is_nested` is preserved so VERICTO-050
             // (unbounded read) can stay scoped to the client-visible top-level
             // query and not flag every inner scan as missing a LIMIT.
+            let select_is_nested = is_nested || copies_into_table;
             out.push(StatementInfo {
                 kind: StatementKind::Select,
-                is_nested,
-                ast_node_path: if is_nested {
+                is_nested: select_is_nested,
+                ast_node_path: if select_is_nested {
                     "SubSelect > SelectStmt".to_string()
                 } else {
                     "SelectStmt".to_string()
@@ -1470,7 +1571,7 @@ fn walk_set_expr(
                 has_or_tautology: tautology,
                 where_presence: match select.selection.as_ref() {
                     None => WherePresence::Absent,
-                    Some(e) if is_always_true(e, cx.sqlite) => WherePresence::AlwaysTrue,
+                    Some(e) if is_always_true(e, cx.dialect) => WherePresence::AlwaysTrue,
                     Some(_) => WherePresence::Present,
                 },
                 ..Default::default()
@@ -1486,7 +1587,7 @@ fn walk_set_expr(
 
             // Everything else the SELECT evaluates: `JOIN … ON`, table-valued
             // function arguments, `GROUP BY`, `HAVING`, `WINDOW`, …
-            if cx.complete {
+            {
                 let mut exprs: Vec<&Expr> = select.selection.iter().collect();
                 if cx.snowflake {
                     exprs.extend(select.qualify.iter());
@@ -1536,11 +1637,11 @@ fn walk_set_expr(
             walk_statement(stmt, true, depth + 1, cx, out)?;
         }
         // `VALUES (…)` (an `INSERT`'s rows): its expressions run.
-        SetExpr::Values(values) if cx.complete => {
+        SetExpr::Values(values) => {
             walk_rest(values, Walked::default(), depth + 1, cx, out)?;
         }
-        // VALUES and TABLE t: no statement, no call.
-        SetExpr::Values(_) | SetExpr::Table(_) => {}
+        // TABLE t has no expression of its own.
+        SetExpr::Table(_) => {}
     }
 
     Ok(())
@@ -1569,45 +1670,7 @@ fn walk_expr(expr: &Expr, depth: usize, cx: Cx, out: &mut Vec<StatementInfo>) ->
     if depth > MAX_AST_DEPTH {
         return Err(ProxyError::AstTooDeep);
     }
-    if cx.complete {
-        return walk_rest(expr, Walked::default(), depth, cx, out);
-    }
-
-    match expr {
-        Expr::Subquery(query) => {
-            walk_query(query.as_ref(), true, depth + 1, cx, out)?;
-        }
-
-        // Function call — check for the sleep family (VERICTO-070)
-        Expr::Function(func) => {
-            record_call(func, cx, out);
-
-            // Recurse into function arguments
-            if let FunctionArguments::List(arg_list) = &func.args {
-                for arg in &arg_list.args {
-                    if let sqlparser::ast::FunctionArg::Unnamed(
-                        sqlparser::ast::FunctionArgExpr::Expr(e),
-                    ) = arg
-                    {
-                        walk_expr(e, depth + 1, cx, out)?;
-                    }
-                }
-            }
-        }
-
-        Expr::BinaryOp { left, right, .. } => {
-            walk_expr(left.as_ref(), depth + 1, cx, out)?;
-            walk_expr(right.as_ref(), depth + 1, cx, out)?;
-        }
-
-        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
-            walk_expr(expr.as_ref(), depth + 1, cx, out)?;
-        }
-
-        _ => {}
-    }
-
-    Ok(())
+    walk_rest(expr, Walked::default(), depth, cx, out)
 }
 
 /// Records a function call: every call, not just the sleep family, so a
@@ -1661,10 +1724,9 @@ fn derived(factor: &TableFactor) -> Option<&Query> {
     }
 }
 
-/// Walks every expression under `node` but the ones in `walked` (see
-/// [`Cx::complete`]): each call is recorded, and each subquery is walked as a
-/// nested query (by [`walk_query`], which records its SELECT and walks what
-/// it holds in turn).
+/// Walks every expression under `node` but the ones in `walked`: each call is
+/// recorded, and each subquery is walked as a nested query (by [`walk_query`],
+/// which records its SELECT and walks what it holds in turn).
 fn walk_rest<V: Visit + ?Sized>(
     node: &V,
     walked: Walked<'_>,
@@ -1829,45 +1891,45 @@ fn walk_with_from_ctes(
     Ok(())
 }
 
-pub(crate) fn where_presence(selection: Option<&Expr>, sqlite: bool) -> WherePresence {
+pub(crate) fn where_presence(selection: Option<&Expr>, dialect: Dialect) -> WherePresence {
     match selection {
         None => WherePresence::Absent,
-        Some(expr) if is_always_true(expr, sqlite) => WherePresence::AlwaysTrue,
+        Some(expr) if is_always_true(expr, dialect) => WherePresence::AlwaysTrue,
         Some(_) => WherePresence::Present,
     }
 }
 
 /// Detect trivially-true predicates (see the pg_ast.rs counterpart for the full
 /// rationale — ENG-009). Recognises boolean/numeric truthy literals, constant
-/// comparisons under any of `= <> != < <= > >=`, constant-only `IN` / `BETWEEN` /
-/// `LIKE '%'`, column self-equality (`id = id`), `NOT <always_false>`, and AND/OR
-/// combinations thereof.
+/// comparisons under any of `= <> != < <= > >=`, proven-true `IN`, constant-only
+/// `BETWEEN` / `LIKE '%'`, column self-equality (`id = id`), `NOT <always_false>`, and AND/OR
+/// combinations thereof. Constant `IS NULL` / `IS NOT NULL`,
+/// `IS [NOT] TRUE/FALSE/UNKNOWN` and `IS [NOT] DISTINCT FROM` are also folded.
 ///
-/// Every form other than `id = id` is constant-only: a column operand disqualifies
-/// the predicate, since its truth value then depends on the row. Property 9
-/// (`rules::properties`) locks that invariant across both walkers.
+/// Every form other than `id = id` and a positive `IN` with additional
+/// items is constant-only: a column operand disqualifies the predicate because
+/// its truth depends on the row. For `1 IN (1, id)`, the known matching item
+/// makes the OR true whatever `id` is. Property 9 (`rules::properties`) locks
+/// that distinction across both walkers.
 ///
-/// `sqlite`: SQLite reads a text value as a number in a boolean context
-/// (its numeric prefix, `'1abc'` → 1), so a string literal with a non-zero
-/// numeric prefix is true; so is a double-quoted name spelling one, which
-/// SQLite takes for a string when no column has that name (its
-/// double-quoted-string fallback).
+/// Dialect-specific literal semantics stay narrow: SQLite reads text by its
+/// numeric prefix in a boolean context, MySQL/SQLite accept numeric `IS TRUE`
+/// tests, and Oracle treats empty character values as NULL.
 ///
 /// The literal comparisons themselves are [`crate::parser::compare`], shared
 /// with the pg_query walker, under three-valued logic: a comparison with NULL
-/// (`NULL = NULL`, `NOT (NULL = 1)`) or a string ordering is
-/// [`Truth::Unknown`], and so is its `NOT`.
-fn is_always_true(expr: &Expr, sqlite: bool) -> bool {
-    truth(expr, sqlite) == Truth::True
+/// (`NULL = NULL`, `NOT (NULL = 1)`) is [`Truth::SqlNull`], while an unresolved
+/// string ordering is [`Truth::Unknown`]; neither is always true.
+fn is_always_true(expr: &Expr, dialect: Dialect) -> bool {
+    truth(expr, dialect) == Truth::True
 }
 
 /// The truth value of a predicate without a row (see `is_always_true` for the
-/// forms). `NOT x` is true only when `x` is provably false; anything undecided
-/// is [`Truth::Unknown`], *not* false. `AND` / `OR` keep only a provably true
-/// result ([`Truth::true_or_unknown`]), as these walkers always have.
-fn truth(expr: &Expr, sqlite: bool) -> Truth {
+/// forms). `NOT x` is true only when `x` is provably false; an unresolved value
+/// stays [`Truth::Unknown`] and a known SQL NULL stays [`Truth::SqlNull`].
+fn truth(expr: &Expr, dialect: Dialect) -> Truth {
     use sqlparser::ast::{BinaryOperator, UnaryOperator};
-    if sqlite {
+    if dialect == Dialect::Sqlite {
         if let Some(b) = sqlite_text_truth(expr) {
             return Truth::from_bool(b);
         }
@@ -1888,13 +1950,40 @@ fn truth(expr: &Expr, sqlite: bool) -> Truth {
         | Expr::UnaryOp {
             op: UnaryOperator::Minus,
             ..
-        } => constant(expr).map_or(Truth::Unknown, |c| c.truth()),
-        Expr::Nested(inner) => truth(inner, sqlite),
+        } => constant_for_dialect(expr, dialect).map_or(Truth::Unknown, |c| c.truth()),
+        Expr::Nested(inner) => truth(inner, dialect),
+        Expr::IsNull(inner) => match constant_for_dialect(inner, dialect) {
+            Some(Const::Null) => Truth::True,
+            Some(_) => Truth::False,
+            None => Truth::Unknown,
+        },
+        Expr::IsNotNull(inner) => match constant_for_dialect(inner, dialect) {
+            Some(Const::Null) => Truth::False,
+            Some(_) => Truth::True,
+            None => Truth::Unknown,
+        },
+        Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
+            match (
+                constant_for_dialect(left, dialect),
+                constant_for_dialect(right, dialect),
+            ) {
+                (Some(a), Some(b)) => {
+                    compare_distinct(&a, &b, matches!(expr, Expr::IsNotDistinctFrom(_, _)))
+                }
+                _ => Truth::Unknown,
+            }
+        }
+        Expr::IsTrue(inner) => boolean_test(inner, dialect, Truth::True, false),
+        Expr::IsNotTrue(inner) => boolean_test(inner, dialect, Truth::True, true),
+        Expr::IsFalse(inner) => boolean_test(inner, dialect, Truth::False, false),
+        Expr::IsNotFalse(inner) => boolean_test(inner, dialect, Truth::False, true),
+        Expr::IsUnknown(inner) => boolean_test(inner, dialect, Truth::SqlNull, false),
+        Expr::IsNotUnknown(inner) => boolean_test(inner, dialect, Truth::SqlNull, true),
         // SQL `NOT`: an undecided operand stays undecided.
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr: inner,
-        } => truth(inner, sqlite).not(),
+        } => truth(inner, dialect).not(),
 
         // `<const> IN (<const>, …)`. Only the positive form: `NOT IN` is not the
         // negation of `IN` under three-valued logic — with a NULL in the list the
@@ -1904,7 +1993,7 @@ fn truth(expr: &Expr, sqlite: bool) -> Truth {
             expr,
             list,
             negated: false,
-        } => Truth::true_or_unknown(const_in_list_true(expr, list)),
+        } => Truth::true_or_unknown(const_in_list_true(expr, list, dialect)),
 
         // `<const> BETWEEN <const> AND <const>`, numeric bounds only.
         Expr::Between {
@@ -1912,7 +2001,7 @@ fn truth(expr: &Expr, sqlite: bool) -> Truth {
             negated: false,
             low,
             high,
-        } => Truth::true_or_unknown(const_between_true(expr, low, high)),
+        } => Truth::true_or_unknown(const_between_true(expr, low, high, dialect)),
 
         // `<const> LIKE '%'` — the match-everything pattern. `any: false` keeps
         // this off Snowflake's `LIKE ANY (…)` form, whose semantics differ.
@@ -1922,7 +2011,7 @@ fn truth(expr: &Expr, sqlite: bool) -> Truth {
             expr,
             pattern,
             escape_char: None,
-        } => Truth::true_or_unknown(const_like_matches_all(expr, pattern)),
+        } => Truth::true_or_unknown(const_like_matches_all(expr, pattern, dialect)),
 
         Expr::BinaryOp { left, op, right } => {
             let cmp = match op {
@@ -1934,18 +2023,17 @@ fn truth(expr: &Expr, sqlite: bool) -> Truth {
                 BinaryOperator::Gt => CmpOp::Gt,
                 BinaryOperator::GtEq => CmpOp::GtEq,
                 BinaryOperator::Or => {
-                    return Truth::true_or_unknown(
-                        is_always_true(left, sqlite) || is_always_true(right, sqlite),
-                    );
+                    return truth(left, dialect).or(truth(right, dialect));
                 }
                 BinaryOperator::And => {
-                    return Truth::true_or_unknown(
-                        is_always_true(left, sqlite) && is_always_true(right, sqlite),
-                    );
+                    return truth(left, dialect).and(truth(right, dialect));
                 }
                 _ => return Truth::Unknown,
             };
-            match (constant(left), constant(right)) {
+            match (
+                constant_for_dialect(left, dialect),
+                constant_for_dialect(right, dialect),
+            ) {
                 (Some(a), Some(b)) => compare(&a, cmp, &b),
                 _ => Truth::Unknown,
             }
@@ -1982,6 +2070,48 @@ fn unwrap_nested(expr: &Expr) -> &Expr {
     }
 }
 
+struct ColumnReference;
+
+impl Visitor for ColumnReference {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+}
+
+fn has_column_reference(expr: &Expr) -> bool {
+    expr.visit(&mut ColumnReference).is_break()
+}
+
+fn boolean_test(expr: &Expr, dialect: Dialect, expected: Truth, negated: bool) -> Truth {
+    if has_column_reference(expr) {
+        return Truth::Unknown;
+    }
+    let value = match unwrap_nested(expr) {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(_, _),
+            ..
+        }) if !matches!(dialect, Dialect::Mysql | Dialect::Sqlite) => Truth::Unknown,
+        other => truth(other, dialect),
+    };
+    value.tested_as(expected, negated)
+}
+
+/// Applies dialect literal semantics after parsing. Oracle treats an empty
+/// character literal as NULL; MySQL's double-quoted values are already left
+/// undecided by [`constant`] because `ANSI_QUOTES` may make them columns.
+fn constant_for_dialect(expr: &Expr, dialect: Dialect) -> Option<Const> {
+    match constant(expr)? {
+        Const::Text(value) if dialect == Dialect::Oracle && value.is_empty() => Some(Const::Null),
+        value => Some(value),
+    }
+}
+
 /// The literal behind an expression, as the shared comparison reads it: a
 /// value, or a unary minus over one, folded by the shared [`Const::negated`]
 /// (sqlparser reads `-1` as `UnaryOp(Minus, 1)` where libpg_query folds it;
@@ -1999,11 +2129,15 @@ fn constant(expr: &Expr) -> Option<Const> {
             Value::Null => Const::Null,
             Value::Number(n, _) => Const::number(n),
             Value::Boolean(b) => Const::Bool(*b),
-            Value::SingleQuotedString(s) => Const::Text(s.clone()),
-            Value::Placeholder(_) => return None,
-            // `"x"` included: MySQL reads it as a string, or as the column `x`
-            // under ANSI_QUOTES, so it only equals itself. So does `N'x'`,
-            // which libpg_query reads as a cast, not a constant.
+            Value::SingleQuotedString(s) | Value::NationalStringLiteral(s) => {
+                Const::Text(s.clone())
+            }
+            Value::QuoteDelimitedStringLiteral(s)
+            | Value::NationalQuoteDelimitedStringLiteral(s) => Const::Text(s.value.clone()),
+            Value::Placeholder(_) | Value::DoubleQuotedString(_) => return None,
+            // Every remaining `Value` variant is unambiguously a literal. A
+            // double-quoted value is excluded above because MySQL may read it
+            // as a column under `ANSI_QUOTES`, which the engine cannot observe.
             other => Const::Opaque(format!("{other:?}")),
         }),
         Expr::UnaryOp {
@@ -2019,31 +2153,27 @@ fn constant(expr: &Expr) -> Option<Const> {
 /// NULL is excluded deliberately: no comparison against NULL is *true*, it is
 /// NULL, which matches no row. Admitting it is how `NOT IN (…, NULL)` would be
 /// mistaken for a tautology.
-fn non_null_constant(expr: &Expr) -> Option<Const> {
-    constant(expr).filter(|c| *c != Const::Null)
+fn non_null_constant(expr: &Expr, dialect: Dialect) -> Option<Const> {
+    constant_for_dialect(expr, dialect).filter(|c| *c != Const::Null)
 }
 
-/// `<const> IN (<const>, …)` — true when the left literal equals at least one
-/// literal in the list. Every element must be a non-NULL literal: a column
-/// anywhere makes the result row-dependent, and `1 IN (1, col)` would need the
-/// column's domain to decide.
-fn const_in_list_true(expr: &Expr, list: &[Expr]) -> bool {
-    let Some(needle) = non_null_constant(expr) else {
+/// `<const> IN (<expr>, …)` — true as soon as one non-NULL constant item
+/// equals the constant needle. Other items may be row-dependent or NULL: SQL
+/// `IN` is an OR, and a known TRUE comparison dominates FALSE and UNKNOWN.
+fn const_in_list_true(expr: &Expr, list: &[Expr], dialect: Dialect) -> bool {
+    let Some(needle) = non_null_constant(expr, dialect) else {
         return false;
     };
-    if list.is_empty() || !list.iter().all(|e| non_null_constant(e).is_some()) {
-        return false;
-    }
     list.iter()
-        .filter_map(non_null_constant)
+        .filter_map(|item| non_null_constant(item, dialect))
         .any(|item| compare(&needle, CmpOp::Eq, &item) == Truth::True)
 }
 
 /// `<const> BETWEEN <lo> AND <hi>` — true when all three are numeric literals and
 /// `lo <= x <= hi`. Numeric only: string `BETWEEN` depends on the database's
 /// collation, which is not knowable here.
-fn const_between_true(expr: &Expr, low: &Expr, high: &Expr) -> bool {
-    let num = |e: &Expr| match non_null_constant(e) {
+fn const_between_true(expr: &Expr, low: &Expr, high: &Expr, dialect: Dialect) -> bool {
+    let num = |e: &Expr| match non_null_constant(e, dialect) {
         Some(Const::Num(x)) => Some(x),
         _ => None,
     };
@@ -2057,9 +2187,9 @@ fn const_between_true(expr: &Expr, low: &Expr, high: &Expr) -> bool {
 /// exactly `%`; deciding `'abc' LIKE 'a%'` would mean implementing LIKE matching,
 /// which is more bug surface than the case is worth. The left side must be a
 /// literal, since `col LIKE '%'` drops NULL rows and is a real filter.
-fn const_like_matches_all(expr: &Expr, pattern: &Expr) -> bool {
-    non_null_constant(expr).is_some()
-        && matches!(non_null_constant(pattern), Some(Const::Text(s)) if s == "%")
+fn const_like_matches_all(expr: &Expr, pattern: &Expr, dialect: Dialect) -> bool {
+    non_null_constant(expr, dialect).is_some()
+        && matches!(non_null_constant(pattern, dialect), Some(Const::Text(s)) if s == "%")
 }
 
 /// Returns true if `expr` contains a tautological OR branch at any depth —
@@ -2069,27 +2199,27 @@ fn const_like_matches_all(expr: &Expr, pattern: &Expr) -> bool {
 ///
 /// Note: `is_always_true` already covers the case where the entire predicate
 /// is trivial. This function catches the mixed case where only an OR branch is.
-fn has_or_tautology(expr: &Expr, sqlite: bool) -> bool {
+fn has_or_tautology(expr: &Expr, dialect: Dialect) -> bool {
     match expr {
         Expr::BinaryOp { left, op, right } => {
             use sqlparser::ast::BinaryOperator;
             match op {
                 // `a OR always_true` or `always_true OR a`
                 BinaryOperator::Or => {
-                    is_always_true(left.as_ref(), sqlite)
-                        || is_always_true(right.as_ref(), sqlite)
-                        || has_or_tautology(left.as_ref(), sqlite)
-                        || has_or_tautology(right.as_ref(), sqlite)
+                    is_always_true(left.as_ref(), dialect)
+                        || is_always_true(right.as_ref(), dialect)
+                        || has_or_tautology(left.as_ref(), dialect)
+                        || has_or_tautology(right.as_ref(), dialect)
                 }
                 // Recurse into AND branches
                 BinaryOperator::And => {
-                    has_or_tautology(left.as_ref(), sqlite)
-                        || has_or_tautology(right.as_ref(), sqlite)
+                    has_or_tautology(left.as_ref(), dialect)
+                        || has_or_tautology(right.as_ref(), dialect)
                 }
                 _ => false,
             }
         }
-        Expr::Nested(inner) => has_or_tautology(inner, sqlite),
+        Expr::Nested(inner) => has_or_tautology(inner, dialect),
         _ => false,
     }
 }

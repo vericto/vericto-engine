@@ -547,16 +547,17 @@ mod examples {
 // `is_always_true` is the shared input to five blocking rules — it drives
 // `where_presence` (VERICTO-003/030/042), `has_or_tautology` (VERICTO-090) and
 // `insert_select_has_filter` (VERICTO-040) — so widening it widens all of them at
-// once. The invariant that keeps that safe is structural: only predicates whose
-// operands are *all literals* may qualify, because their truth value cannot
-// depend on the row.
+// once. The invariant that keeps that safe is semantic: a form qualifies only
+// when constants prove it true regardless of every row-dependent operand. Most
+// such forms are constant-only. The narrow exception is positive `IN`: one
+// known matching item makes the OR true even if another item is a column or
+// NULL (`1 IN (1, id)` is TRUE for every row).
 //
-// The moment a `ColumnRef` appears, the predicate filters something and the
-// engine must not treat it as WHERE-less. SQL's three-valued logic is what makes
-// this sharp rather than pedantic: `id IS NOT NULL` and `name LIKE '%'` both read
-// as tautologies but drop every row where the column is NULL — verified against
-// PostgreSQL, 2 of 3 rows for a table with one NULL. Blocking those would be a
-// false positive on a Critical rule that rejects live traffic.
+// A `ColumnRef` that can still affect the result must not be treated as
+// WHERE-less. SQL's three-valued logic is what makes this sharp rather than
+// pedantic: `id IS NOT NULL`, `name LIKE '%'` and `1 IN (2, id)` all filter
+// some rows. Blocking those would be a false positive on a Critical rule that
+// rejects live traffic.
 //
 // This property is the guard rail for future widening: any new form added to
 // `is_always_true` must keep it passing.
@@ -582,6 +583,7 @@ mod column_predicates_are_not_tautologies {
         "{c} >= 0",
         "{c} < 100",
         "{c} IN (1, 2)",
+        "1 IN (2, {c})",
         "{c} NOT IN (1, 2)",
         "{c} BETWEEN 0 AND 100",
         "{c} LIKE '%'",

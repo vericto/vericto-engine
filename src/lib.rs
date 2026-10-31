@@ -15,7 +15,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.6.0" }
+//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.7.0" }
 //! ```
 //!
 //! ```rust

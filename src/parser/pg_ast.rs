@@ -12,12 +12,13 @@
 
 use crate::error::{MAX_AST_DEPTH, ProxyError, Result, guard_nesting_depth};
 use crate::parser::{
-    AlterTableKind, CmpOp, Const, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, Truth,
-    WherePresence, compare,
+    AlterTableKind, CmpOp, Const, DropObjectKind, ParsedQuery, SqlNumber, StatementInfo,
+    StatementKind, Truth, WherePresence, compare, compare_distinct,
 };
 
 use pg_query::protobuf::node::Node as NodeEnum;
-use pg_query::protobuf::{Node, ObjectType, RangeVar, WithClause};
+use pg_query::protobuf::{Node, ObjectType, RangeVar, SelectStmt, WithClause};
+use pg_query::{Context, NodeRef};
 
 /// Parse a PostgreSQL query with libpg_query and return the normalized
 /// representation. Returns `ParseError` on invalid syntax.
@@ -73,6 +74,12 @@ fn walk_node(
                 ..Default::default()
             });
             walk_with_clause(stmt.with_clause.as_ref(), depth + 1, out)?;
+            for expression in stmt.using_clause.iter().chain(&stmt.returning_list) {
+                scan_expr(expression.node.as_ref(), depth + 1, out)?;
+            }
+            if let Some(expression) = stmt.where_clause.as_deref() {
+                scan_expr(expression.node.as_ref(), depth + 1, out)?;
+            }
         }
 
         NodeEnum::UpdateStmt(stmt) => {
@@ -87,6 +94,17 @@ fn walk_node(
                 ..Default::default()
             });
             walk_with_clause(stmt.with_clause.as_ref(), depth + 1, out)?;
+            for expression in stmt
+                .target_list
+                .iter()
+                .chain(&stmt.from_clause)
+                .chain(&stmt.returning_list)
+            {
+                scan_expr(expression.node.as_ref(), depth + 1, out)?;
+            }
+            if let Some(expression) = stmt.where_clause.as_deref() {
+                scan_expr(expression.node.as_ref(), depth + 1, out)?;
+            }
         }
 
         NodeEnum::DropStmt(stmt) => {
@@ -284,6 +302,43 @@ fn walk_node(
                 ..Default::default()
             });
             walk_with_clause(stmt.with_clause.as_ref(), depth + 1, out)?;
+            for expression in &stmt.returning_list {
+                scan_expr(expression.node.as_ref(), depth + 1, out)?;
+            }
+            for expression in [&stmt.source_relation, &stmt.join_condition]
+                .into_iter()
+                .filter_map(|expression| expression.as_deref())
+            {
+                scan_expr(expression.node.as_ref(), depth + 1, out)?;
+            }
+            for clause in &stmt.merge_when_clauses {
+                if let Some(NodeEnum::MergeWhenClause(clause)) = clause.node.as_ref() {
+                    for expression in clause.target_list.iter().chain(&clause.values) {
+                        scan_expr(expression.node.as_ref(), depth + 1, out)?;
+                    }
+                    if let Some(expression) = clause.condition.as_deref() {
+                        scan_expr(expression.node.as_ref(), depth + 1, out)?;
+                    }
+                }
+            }
+        }
+
+        NodeEnum::PrepareStmt(stmt) => {
+            if let Some(query) = stmt.query.as_deref()
+                && let Some(inner) = query.node.as_ref()
+            {
+                walk_node(inner, true, depth + 1, out)?;
+            }
+        }
+
+        // EXPLAIN ANALYZE executes the wrapped statement; plain EXPLAIN and
+        // `ANALYZE FALSE` only plan it.
+        NodeEnum::ExplainStmt(stmt) if explain_runs(&stmt.options) => {
+            if let Some(query) = stmt.query.as_deref()
+                && let Some(inner) = query.node.as_ref()
+            {
+                walk_node(inner, is_nested, depth + 1, out)?;
+            }
         }
 
         // ── CREATE TABLE … AS SELECT … / SELECT … INTO (VERICTO-084) ─────────
@@ -320,20 +375,13 @@ fn walk_node(
             let mut insert_has_select = false;
             let mut insert_row_count = None;
             let mut insert_select_has_filter = false;
-            if let Some(sel) = stmt.select_stmt.as_deref() {
-                if let Some(NodeEnum::SelectStmt(inner)) = sel.node.as_ref() {
-                    if !inner.values_lists.is_empty() {
-                        insert_row_count = Some(inner.values_lists.len());
-                    } else {
-                        insert_has_select = true;
-                        // Does the source bound the rows it copies? An effective
-                        // WHERE or a LIMIT both do; a tautological WHERE does
-                        // not (`where_presence` reports it as AlwaysTrue).
-                        insert_select_has_filter = where_presence(inner.where_clause.as_deref())
-                            == WherePresence::Present
-                            || inner.limit_count.is_some();
-                    }
+            if let Some(sel) = stmt.select_stmt.as_deref()
+                && let Some(NodeEnum::SelectStmt(inner)) = sel.node.as_ref()
+            {
+                if !inner.values_lists.is_empty() && inner.larg.is_none() && inner.rarg.is_none() {
+                    insert_row_count = Some(inner.values_lists.len());
                 }
+                (insert_has_select, insert_select_has_filter) = insert_source(inner, depth + 1)?;
             }
 
             out.push(StatementInfo {
@@ -350,9 +398,20 @@ fn walk_node(
             walk_with_clause(stmt.with_clause.as_ref(), depth + 1, out)?;
             // Always descend into the source so nested tautologies / sleeps /
             // sub-selects inside `INSERT … SELECT …` are still detected.
-            if let Some(sel) = stmt.select_stmt.as_deref() {
-                if let Some(inner) = sel.node.as_ref() {
-                    walk_node(inner, true, depth + 1, out)?;
+            if let Some(sel) = stmt.select_stmt.as_deref()
+                && let Some(inner) = sel.node.as_ref()
+            {
+                walk_node(inner, true, depth + 1, out)?;
+            }
+            for expression in &stmt.returning_list {
+                scan_expr(expression.node.as_ref(), depth + 1, out)?;
+            }
+            if let Some(conflict) = stmt.on_conflict_clause.as_deref() {
+                for expression in &conflict.target_list {
+                    scan_expr(expression.node.as_ref(), depth + 1, out)?;
+                }
+                if let Some(expression) = conflict.where_clause.as_deref() {
+                    scan_expr(expression.node.as_ref(), depth + 1, out)?;
                 }
             }
         }
@@ -361,6 +420,71 @@ fn walk_node(
     }
 
     Ok(())
+}
+
+fn explain_runs(options: &[Node]) -> bool {
+    options.iter().any(|option| {
+        let Some(NodeEnum::DefElem(option)) = option.node.as_ref() else {
+            return false;
+        };
+        if !option.defname.eq_ignore_ascii_case("analyze") {
+            return false;
+        }
+        match option.arg.as_deref().and_then(|arg| arg.node.as_ref()) {
+            None => true,
+            Some(NodeEnum::String(value)) => {
+                matches!(
+                    value.sval.to_ascii_lowercase().as_str(),
+                    "true" | "on" | "1"
+                )
+            }
+            Some(NodeEnum::AConst(value)) => matches!(aconst(value), Const::Bool(true)),
+            _ => false,
+        }
+    })
+}
+
+/// Classifies a PostgreSQL INSERT source for VERICTO-040. UNION is bounded
+/// when an outer LIMIT applies or every SELECT arm has an effective WHERE/LIMIT;
+/// INTERSECT and EXCEPT are structural filters. Literal VALUES arms do not copy
+/// table rows.
+fn insert_source(stmt: &SelectStmt, depth: usize) -> Result<(bool, bool)> {
+    if depth > MAX_AST_DEPTH {
+        return Err(ProxyError::AstTooDeep);
+    }
+
+    if stmt.larg.is_some() || stmt.rarg.is_some() {
+        let left = match stmt.larg.as_deref() {
+            Some(arm) => insert_source(arm, depth + 1)?,
+            None => (false, false),
+        };
+        let right = match stmt.rarg.as_deref() {
+            Some(arm) => insert_source(arm, depth + 1)?,
+            None => (false, false),
+        };
+        let has_select = left.0 || right.0;
+        let operator_bounds = match pg_query::protobuf::SetOperation::try_from(stmt.op) {
+            Ok(pg_query::protobuf::SetOperation::SetopUnion) => {
+                (!left.0 || left.1) && (!right.0 || right.1)
+            }
+            Ok(
+                pg_query::protobuf::SetOperation::SetopIntersect
+                | pg_query::protobuf::SetOperation::SetopExcept,
+            ) => true,
+            _ => false,
+        };
+        return Ok((
+            has_select,
+            has_select && (stmt.limit_count.is_some() || operator_bounds),
+        ));
+    }
+
+    if !stmt.values_lists.is_empty() && stmt.from_clause.is_empty() && stmt.target_list.is_empty() {
+        return Ok((false, false));
+    }
+
+    let effective_where = where_presence(stmt.where_clause.as_deref()) == WherePresence::Present;
+    Ok((true, effective_where || stmt.limit_count.is_some()))
 }
 
 /// Walk the CTEs of a WITH clause. Each CTE body (`ctequery`) can be a
@@ -443,12 +567,24 @@ fn walk_select_stmt_inner(
         return Ok(());
     }
 
+    let copies_into_table = stmt.into_clause.is_some();
+    if let Some(into) = stmt.into_clause.as_deref() {
+        out.push(StatementInfo {
+            kind: StatementKind::CreateTableAs,
+            relation: relname(into.rel.as_ref()),
+            is_nested,
+            ast_node_path: "SelectStmt > IntoClause".to_string(),
+            ..Default::default()
+        });
+    }
+
+    let select_is_nested = is_nested || copies_into_table;
     let presence = where_presence(stmt.where_clause.as_deref());
     out.push(StatementInfo {
         kind: StatementKind::Select,
         where_presence: presence,
-        is_nested,
-        ast_node_path: if is_nested {
+        is_nested: select_is_nested,
+        ast_node_path: if select_is_nested {
             "SubSelect > SelectStmt".to_string()
         } else {
             "SelectStmt".to_string()
@@ -470,134 +606,120 @@ fn walk_select_stmt_inner(
     if let Some(wc) = stmt.where_clause.as_deref() {
         scan_expr(wc.node.as_ref(), depth + 1, out)?;
     }
-    // FROM clause: derived tables (`FROM (SELECT …) x`) and joins.
+    // FROM clause: derived tables (`FROM (SELECT …) x`), joins and table
+    // functions. The remaining clauses all evaluate expression trees too.
     for from in &stmt.from_clause {
         scan_from_item(from.node.as_ref(), depth + 1, out)?;
+    }
+    for expression in stmt
+        .distinct_clause
+        .iter()
+        .chain(&stmt.group_clause)
+        .chain(&stmt.window_clause)
+        .chain(&stmt.sort_clause)
+        .chain(&stmt.values_lists)
+    {
+        scan_expr(expression.node.as_ref(), depth + 1, out)?;
+    }
+    for expression in [&stmt.having_clause, &stmt.limit_offset, &stmt.limit_count]
+        .into_iter()
+        .filter_map(|expression| expression.as_deref())
+    {
+        scan_expr(expression.node.as_ref(), depth + 1, out)?;
     }
 
     Ok(())
 }
 
-/// Recurse a FROM-clause item, descending into derived-table subqueries and
-/// both sides of a join (plus its ON-condition, which may carry a sub-link).
+/// Recurse through a FROM-clause item. The generic protobuf traversal covers
+/// derived queries, joins, table functions and their executable expressions.
 fn scan_from_item(
     node: Option<&NodeEnum>,
     depth: usize,
     out: &mut Vec<StatementInfo>,
 ) -> Result<()> {
-    if depth > MAX_AST_DEPTH {
-        return Err(ProxyError::AstTooDeep);
-    }
-    match node {
-        Some(NodeEnum::RangeSubselect(rs)) => {
-            if let Some(sub) = rs.subquery.as_deref() {
-                if let Some(NodeEnum::SelectStmt(inner)) = sub.node.as_ref() {
-                    walk_select_stmt(inner, true, depth + 1, out)?;
-                }
-            }
-        }
-        Some(NodeEnum::JoinExpr(je)) => {
-            scan_from_item(
-                je.larg.as_deref().and_then(|n| n.node.as_ref()),
-                depth + 1,
-                out,
-            )?;
-            scan_from_item(
-                je.rarg.as_deref().and_then(|n| n.node.as_ref()),
-                depth + 1,
-                out,
-            )?;
-            if let Some(q) = je.quals.as_deref() {
-                scan_expr(q.node.as_ref(), depth + 1, out)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
+    scan_expr(node, depth, out)
 }
 
-/// Recursively scan an expression node for (a) sleep-family function calls
-/// (VERICTO-070) and (b) sub-link sub-selects (so a tautology/star inside a
-/// scalar/IN/EXISTS subquery is recorded). Bounded by `MAX_AST_DEPTH`.
+/// Scans a protobuf subtree for function calls and nested SELECTs. `pg_query`
+/// exposes a breadth-first raw-AST traversal, which covers expression wrappers
+/// such as NULL/Boolean tests, CASE arms, casts, joins and table functions.
+/// Nodes inside a discovered SELECT carry `Context::Select`; they are skipped
+/// here because `walk_select_stmt` processes that query once with full facts.
 fn scan_expr(node: Option<&NodeEnum>, depth: usize, out: &mut Vec<StatementInfo>) -> Result<()> {
     if depth > MAX_AST_DEPTH {
         return Err(ProxyError::AstTooDeep);
     }
-    let Some(node) = node else { return Ok(()) };
-    match node {
-        NodeEnum::ResTarget(rt) => {
-            if let Some(val) = rt.val.as_deref() {
-                scan_expr(val.node.as_ref(), depth + 1, out)?;
-            }
+    let Some(root) = node else { return Ok(()) };
+    for (node, relative_depth, context, _) in root.nodes() {
+        let relative_depth = usize::try_from(relative_depth).unwrap_or(usize::MAX);
+        let node_depth = depth.saturating_add(relative_depth);
+        if node_depth > MAX_AST_DEPTH {
+            return Err(ProxyError::AstTooDeep);
         }
-        NodeEnum::FuncCall(fc) => {
-            // Record EVERY function call, not just the sleep family. A custom
-            // rule's `func_name:` predicate is documented as matching any
-            // function by name, but only sleep calls used to reach the
-            // evaluator, so `func_name: pg_read_file` matched nothing — the rule
-            // saved, synced, listed, and silently never fired.
-            //
-            // The sleep-family filter now lives in VERICTO-070's own predicate,
-            // which is where a rule-specific concern belongs.
-            if let Some(name) = func_call_name(&fc.funcname) {
-                out.push(StatementInfo {
-                    kind: StatementKind::FunctionCall,
-                    ast_node_path: format!("FunctionCall > {name}()"),
-                    function_name: Some(name),
-                    ..Default::default()
-                });
-            }
-            for arg in &fc.args {
-                scan_expr(arg.node.as_ref(), depth + 1, out)?;
-            }
+        if context == Context::Select {
+            continue;
         }
-        NodeEnum::AExpr(e) => {
-            if let Some(l) = e.lexpr.as_deref() {
-                scan_expr(l.node.as_ref(), depth + 1, out)?;
-            }
-            if let Some(r) = e.rexpr.as_deref() {
-                scan_expr(r.node.as_ref(), depth + 1, out)?;
-            }
-        }
-        NodeEnum::BoolExpr(b) => {
-            for arg in &b.args {
-                scan_expr(arg.node.as_ref(), depth + 1, out)?;
-            }
-        }
-        NodeEnum::TypeCast(tc) => {
-            if let Some(arg) = tc.arg.as_deref() {
-                scan_expr(arg.node.as_ref(), depth + 1, out)?;
-            }
-        }
-        NodeEnum::SubLink(sl) => {
-            if let Some(tx) = sl.testexpr.as_deref() {
-                scan_expr(tx.node.as_ref(), depth + 1, out)?;
-            }
-            if let Some(sub) = sl.subselect.as_deref() {
-                if let Some(NodeEnum::SelectStmt(inner)) = sub.node.as_ref() {
-                    walk_select_stmt(inner, true, depth + 1, out)?;
+        match node {
+            NodeRef::FuncCall(call) => {
+                record_pg_call(call, out);
+                for extra in &call.agg_order {
+                    scan_expr(extra.node.as_ref(), node_depth + 1, out)?;
+                }
+                if let Some(extra) = call.agg_filter.as_deref() {
+                    scan_expr(extra.node.as_ref(), node_depth + 1, out)?;
+                }
+                if let Some(window) = call.over.as_deref() {
+                    scan_window(window, node_depth + 1, out)?;
                 }
             }
-        }
-        NodeEnum::List(list) => {
-            for item in &list.items {
-                scan_expr(item.node.as_ref(), depth + 1, out)?;
+            NodeRef::NamedArgExpr(arg) => {
+                if let Some(value) = arg.arg.as_deref() {
+                    scan_expr(value.node.as_ref(), node_depth + 1, out)?;
+                }
             }
-        }
-        NodeEnum::CaseExpr(c) => {
-            for arg in &c.args {
-                scan_expr(arg.node.as_ref(), depth + 1, out)?;
+            NodeRef::WindowDef(window) => scan_window(window, node_depth + 1, out)?,
+            NodeRef::SubLink(link) => {
+                if let Some(test) = link.testexpr.as_deref() {
+                    scan_expr(test.node.as_ref(), node_depth + 1, out)?;
+                }
             }
-            if let Some(d) = c.defresult.as_deref() {
-                scan_expr(d.node.as_ref(), depth + 1, out)?;
+            NodeRef::SelectStmt(select) => {
+                // The nested walker applies its own depth accounting. Using the
+                // flattened traversal depth here would count every enclosing
+                // expression again at each subquery level.
+                walk_select_stmt(select, true, depth + 1, out)?;
             }
+            _ => {}
         }
-        NodeEnum::CoalesceExpr(c) => {
-            for arg in &c.args {
-                scan_expr(arg.node.as_ref(), depth + 1, out)?;
-            }
-        }
-        _ => {}
+    }
+    Ok(())
+}
+
+fn record_pg_call(call: &pg_query::protobuf::FuncCall, out: &mut Vec<StatementInfo>) {
+    if let Some(name) = func_call_name(&call.funcname) {
+        out.push(StatementInfo {
+            kind: StatementKind::FunctionCall,
+            ast_node_path: format!("FunctionCall > {name}()"),
+            function_name: Some(name),
+            ..Default::default()
+        });
+    }
+}
+
+fn scan_window(
+    window: &pg_query::protobuf::WindowDef,
+    depth: usize,
+    out: &mut Vec<StatementInfo>,
+) -> Result<()> {
+    for node in window.partition_clause.iter().chain(&window.order_clause) {
+        scan_expr(node.node.as_ref(), depth + 1, out)?;
+    }
+    for node in [&window.start_offset, &window.end_offset]
+        .into_iter()
+        .filter_map(|node| node.as_deref())
+    {
+        scan_expr(node.node.as_ref(), depth + 1, out)?;
     }
     Ok(())
 }
@@ -642,7 +764,11 @@ pub(crate) fn where_presence(where_clause: Option<&Node>) -> WherePresence {
 ///   filter expression in some contexts)
 /// - `<const> <cmp> <const>` for `=`, `<>`/`!=`, `<`, `<=`, `>`, `>=`
 ///   evaluated over numeric/boolean literals (`1=1`, `2 > 1`, `'a'='a'`)
-/// - `<const> IN (<const>, …)` where the left side equals one of the items
+/// - `<const> IS NULL` / `IS NOT NULL` when the constant makes it true
+///   (`NULL IS NULL`, `1 IS NOT NULL`)
+/// - constant `IS [NOT] TRUE/FALSE/UNKNOWN` and null-safe
+///   `IS [NOT] DISTINCT FROM` when they are provably true
+/// - `<const> IN (<expr>, …)` where one constant item equals the constant left side
 ///   (`1 IN (1, 2)`)
 /// - `<const> BETWEEN <const> AND <const>` where the bounds hold (`1 BETWEEN 0 AND 2`)
 /// - `<const> LIKE '%'` — the match-everything pattern
@@ -651,27 +777,32 @@ pub(crate) fn where_presence(where_clause: Option<&Node>) -> WherePresence {
 /// - `NOT <always_false>` (e.g. `NOT FALSE`, `NOT 1=2`)
 /// - AND where every operand is always-true; OR where any operand is
 ///
-/// Every form above other than `col = col` is **constant-only**: if any operand
-/// is a column reference the predicate does not qualify, because its truth value
-/// then depends on the row. Property 9 (`rules::properties`) locks that
-/// invariant — `id IS NOT NULL` and `name LIKE '%'` read as tautologies but drop
-/// rows where the column is NULL, so classifying them here would be a false
+/// Every form above other than `col = col` is decided from constants alone.
+/// A positive `IN` may contain additional row-dependent items, but one known
+/// matching constant makes the OR true regardless of them. In every other form,
+/// if an operand is a column reference the predicate does not qualify, because
+/// its truth value depends on the row. Property 9 (`rules::properties`) locks
+/// that invariant — `id IS NOT NULL` and `name LIKE '%'` read as tautologies but
+/// drop rows where the column is NULL, so classifying them here would be a false
 /// positive on a rule that rejects live traffic.
 ///
 /// The literal comparisons themselves are [`crate::parser::compare`], shared
-/// with the sqlparser walker, under three-valued logic: a comparison with
-/// NULL (`NULL = NULL`, `NOT (NULL = 1)`) or a string ordering is
-/// [`Truth::Unknown`], and so is its `NOT`.
+/// with the sqlparser walker, under three-valued logic: a comparison with NULL
+/// (`NULL = NULL`, `NOT (NULL = 1)`) is [`Truth::SqlNull`], while an unresolved
+/// string ordering is [`Truth::Unknown`]; neither is always true.
 fn is_always_true(node: &NodeEnum) -> bool {
     truth(node) == Truth::True
 }
 
-/// The truth value of a predicate without a row (see `is_always_true` for the
-/// forms). `NOT x` is true only when `x` is provably false: only a handful of
-/// forms are (`FALSE`, `0`, a false constant comparison), and anything
-/// undecided is [`Truth::Unknown`], *not* false. `AND` / `OR` keep only a
-/// provably true result ([`Truth::true_or_unknown`]), as these walkers always
-/// have.
+fn has_column_reference(node: &NodeEnum) -> bool {
+    node.nodes()
+        .iter()
+        .any(|(node, ..)| matches!(node, NodeRef::ColumnRef(_)))
+}
+
+/// The truth value of a predicate without a row. `NOT x` is true only when `x`
+/// is provably false. A known SQL NULL stays [`Truth::SqlNull`] and an unresolved
+/// expression stays [`Truth::Unknown`].
 fn truth(node: &NodeEnum) -> Truth {
     match node {
         NodeEnum::AConst(c) => aconst(c).truth(),
@@ -687,6 +818,14 @@ fn truth(node: &NodeEnum) -> Truth {
             // comparison path below (where `IN` would otherwise look like `=`
             // against a List and `NOT IN` like `<>`).
             match AExprKind::try_from(expr.kind) {
+                Ok(kind @ (AExprKind::AexprDistinct | AExprKind::AexprNotDistinct)) => {
+                    return match (constant(l), constant(r)) {
+                        (Some(a), Some(b)) => {
+                            compare_distinct(&a, &b, kind == AExprKind::AexprNotDistinct)
+                        }
+                        _ => Truth::Unknown,
+                    };
+                }
                 Ok(AExprKind::AexprIn) => {
                     // `1 IN (…)` carries name "=", `1 NOT IN (…)` carries "<>".
                     //
@@ -726,19 +865,61 @@ fn truth(node: &NodeEnum) -> Truth {
                 None => Truth::Unknown,
             }
         }
+        NodeEnum::NullTest(test) if !test.argisrow => {
+            use pg_query::protobuf::NullTestType;
+            let value = test.arg.as_deref().and_then(constant);
+            match (NullTestType::try_from(test.nulltesttype), value) {
+                (Ok(NullTestType::IsNull), Some(Const::Null))
+                | (
+                    Ok(NullTestType::IsNotNull),
+                    Some(Const::Num(_) | Const::Bool(_) | Const::Text(_) | Const::Opaque(_)),
+                ) => Truth::True,
+                (Ok(NullTestType::IsNotNull), Some(Const::Null))
+                | (
+                    Ok(NullTestType::IsNull),
+                    Some(Const::Num(_) | Const::Bool(_) | Const::Text(_) | Const::Opaque(_)),
+                ) => Truth::False,
+                _ => Truth::Unknown,
+            }
+        }
+        NodeEnum::BooleanTest(test) => {
+            use pg_query::protobuf::BoolTestType;
+            let value = test
+                .arg
+                .as_deref()
+                .and_then(|arg| arg.node.as_ref())
+                .filter(|arg| !has_column_reference(arg))
+                .map_or(Truth::Unknown, |arg| {
+                    if matches!(constant_node(arg), Some(Const::Num(_))) {
+                        Truth::Unknown
+                    } else {
+                        truth(arg)
+                    }
+                });
+            match BoolTestType::try_from(test.booltesttype) {
+                Ok(BoolTestType::IsTrue) => value.tested_as(Truth::True, false),
+                Ok(BoolTestType::IsNotTrue) => value.tested_as(Truth::True, true),
+                Ok(BoolTestType::IsFalse) => value.tested_as(Truth::False, false),
+                Ok(BoolTestType::IsNotFalse) => value.tested_as(Truth::False, true),
+                Ok(BoolTestType::IsUnknown) => value.tested_as(Truth::SqlNull, false),
+                Ok(BoolTestType::IsNotUnknown) => value.tested_as(Truth::SqlNull, true),
+                _ => Truth::Unknown,
+            }
+        }
         NodeEnum::BoolExpr(b) => {
             use pg_query::protobuf::BoolExprType;
             let mut args = b.args.iter().filter_map(|n| n.node.as_ref());
             match BoolExprType::try_from(b.boolop) {
-                Ok(BoolExprType::AndExpr) => Truth::true_or_unknown(
-                    !b.args.is_empty() && args.all(|a| truth(a) == Truth::True),
-                ),
-                Ok(BoolExprType::OrExpr) => {
-                    Truth::true_or_unknown(args.any(|a| truth(a) == Truth::True))
-                }
-                // SQL `NOT`: an undecided operand stays undecided.
+                Ok(BoolExprType::AndExpr) => args
+                    .next()
+                    .map(|first| args.fold(truth(first), |value, arg| value.and(truth(arg))))
+                    .unwrap_or(Truth::Unknown),
+                Ok(BoolExprType::OrExpr) => args
+                    .next()
+                    .map(|first| args.fold(truth(first), |value, arg| value.or(truth(arg))))
+                    .unwrap_or(Truth::Unknown),
                 Ok(BoolExprType::NotExpr) => match (args.next(), args.next()) {
-                    (Some(a), None) => truth(a).not(),
+                    (Some(arg), None) => truth(arg).not(),
                     _ => Truth::Unknown,
                 },
                 _ => Truth::Unknown,
@@ -756,7 +937,7 @@ fn aconst(c: &pg_query::protobuf::AConst) -> Const {
     }
     match c.val.as_ref() {
         None => Const::Null,
-        Some(Val::Ival(i)) => Const::Num(f64::from(i.ival)),
+        Some(Val::Ival(i)) => Const::number(&i.ival.to_string()),
         Some(Val::Fval(f)) => Const::number(&f.fval),
         Some(Val::Boolval(b)) => Const::Bool(b.boolval),
         Some(Val::Sval(s)) => Const::Text(s.sval.clone()),
@@ -768,8 +949,8 @@ fn aconst(c: &pg_query::protobuf::AConst) -> Const {
 /// by the shared [`Const::negated`]. libpg_query folds `-<number>` into the
 /// constant itself, so the second form only reaches here when it did not; the
 /// sqlparser walker folds the same way, so both decide `-1 < 0` alike.
-fn constant(node: &Node) -> Option<Const> {
-    match node.node.as_ref()? {
+fn constant_node(node: &NodeEnum) -> Option<Const> {
+    match node {
         NodeEnum::AConst(c) => Some(aconst(c)),
         NodeEnum::AExpr(e)
             if e.lexpr.is_none() && operator_name(&e.name).as_deref() == Some("-") =>
@@ -778,6 +959,10 @@ fn constant(node: &Node) -> Option<Const> {
         }
         _ => None,
     }
+}
+
+fn constant(node: &Node) -> Option<Const> {
+    constant_node(node.node.as_ref()?)
 }
 
 /// The literal behind a node, if it is one and is not NULL.
@@ -790,12 +975,13 @@ fn non_null_const(node: &Node) -> Option<Const> {
     constant(node).filter(|c| *c != Const::Null)
 }
 
-/// `<const> IN (<const>, …)` — true when the left literal equals at least one
-/// literal in the list.
+/// `<const> IN (<expr>, …)` — true as soon as one non-NULL constant item
+/// equals the constant needle.
 ///
-/// Requires *every* element to be a non-NULL literal. A column anywhere makes the
-/// result row-dependent; a NULL element cannot make the predicate true and is
-/// rejected so the caller never has to reason about three-valued logic here.
+/// Other items may be columns, parameters or NULL: SQL `IN` is an OR. Once one
+/// comparison is TRUE, neither FALSE nor UNKNOWN from another item can change
+/// the result (`TRUE OR UNKNOWN = TRUE`). Requiring every item to be a non-NULL
+/// literal let `1 IN (1, NULL)` and `1 IN (1, id)` disguise an all-rows filter.
 fn const_in_list_true(left: &Node, right: &Node) -> bool {
     let Some(needle) = non_null_const(left) else {
         return false;
@@ -803,14 +989,6 @@ fn const_in_list_true(left: &Node, right: &Node) -> bool {
     let Some(NodeEnum::List(list)) = right.node.as_ref() else {
         return false;
     };
-    if list.items.is_empty() {
-        return false;
-    }
-    // All items must be literals: `1 IN (1, col)` still matches every row, but
-    // proving that needs the column's domain, so it stays undecided.
-    if !list.items.iter().all(|i| non_null_const(i).is_some()) {
-        return false;
-    }
     list.items
         .iter()
         .filter_map(non_null_const)
@@ -818,7 +996,7 @@ fn const_in_list_true(left: &Node, right: &Node) -> bool {
 }
 
 /// A non-NULL number literal's value.
-fn const_number(node: &Node) -> Option<f64> {
+fn const_number(node: &Node) -> Option<SqlNumber> {
     match non_null_const(node)? {
         Const::Num(x) => Some(x),
         _ => None,
