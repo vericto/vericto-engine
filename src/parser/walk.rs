@@ -75,7 +75,12 @@ pub(crate) fn from_statements(
         )));
     }
 
-    let cx = Cx { dialect: which };
+    from_statements_cx(statements, Cx::new(which), original)
+}
+
+/// [`from_statements`] under a given walk configuration.
+fn from_statements_cx(statements: Vec<Statement>, cx: Cx, original: &str) -> Result<ParsedQuery> {
+    let which = cx.dialect;
     let mut collected: Vec<StatementInfo> = Vec::new();
     for stmt in &statements {
         walk_statement(stmt, false, 0, cx, &mut collected)?;
@@ -113,9 +118,35 @@ pub(crate) const UNSUPPORTED_STATEMENT: &str = "statement not supported by the e
 #[derive(Clone, Copy)]
 struct Cx {
     dialect: Dialect,
+    /// Tests only: walk every clause through [`walk_rest`] alone, exactly as
+    /// 4.7.0 did, as the reference the targeted walk ([`Fast`]) is checked
+    /// against (`walk::equivalence` tests).
+    #[cfg(test)]
+    reference: bool,
 }
 
 impl Cx {
+    fn new(dialect: Dialect) -> Self {
+        Cx {
+            dialect,
+            #[cfg(test)]
+            reference: false,
+        }
+    }
+
+    /// True only in the tests' reference walk.
+    #[inline(always)]
+    fn reference(self) -> bool {
+        #[cfg(test)]
+        {
+            self.reference
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
     /// Snowflake: its statement kinds (`SWAP WITH`, `INSERT OVERWRITE`,
     /// shares, scripting blocks), its `QUALIFY` clause and its row-count
     /// `SAMPLE` bound.
@@ -510,16 +541,20 @@ fn walk_statement(
                 walk_expr(expr, depth + 1, cx, out)?;
             }
             walk_with_from_ctes(&delete.from, depth + 1, cx, out)?;
-            let walked_queries = match &delete.from {
-                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
-                    tables.iter().filter_map(|t| derived(&t.relation)).collect()
-                }
-            };
-            let walked = Walked {
-                exprs: delete.selection.iter().collect(),
-                queries: walked_queries,
-            };
-            walk_rest(delete, walked, depth + 1, cx, out)?;
+            if cx.reference() {
+                let walked_queries = match &delete.from {
+                    FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
+                        tables.iter().filter_map(|t| derived(&t.relation)).collect()
+                    }
+                };
+                let walked = Walked {
+                    exprs: delete.selection.iter().collect(),
+                    queries: walked_queries,
+                };
+                walk_rest(delete, walked, depth + 1, cx, out)?;
+            } else {
+                Fast::new(depth + 1, cx, out).delete(delete)?;
+            }
         }
 
         // ── UPDATE ─────────────────────────────────────────────────────────
@@ -545,11 +580,15 @@ fn walk_statement(
                 walk_expr(expr, depth + 1, cx, out)?;
             }
             // `SET x = sleep(…)`, `FROM`, `RETURNING`, `ORDER BY`, `LIMIT`.
-            let walked = Walked {
-                exprs: selection.iter().collect(),
-                queries: Vec::new(),
-            };
-            walk_rest(update, walked, depth + 1, cx, out)?;
+            if cx.reference() {
+                let walked = Walked {
+                    exprs: selection.iter().collect(),
+                    queries: Vec::new(),
+                };
+                walk_rest(update, walked, depth + 1, cx, out)?;
+            } else {
+                Fast::new(depth + 1, cx, out).update(update)?;
+            }
         }
 
         // ── DROP ───────────────────────────────────────────────────────────
@@ -760,11 +799,15 @@ fn walk_statement(
                 walk_query(source.as_ref(), true, depth + 1, cx, out)?;
             }
             // `ON CONFLICT … DO UPDATE SET`, `RETURNING`, MySQL's `SET` form.
-            let walked = Walked {
-                exprs: Vec::new(),
-                queries: insert.source.iter().map(|q| q.as_ref()).collect(),
-            };
-            walk_rest(insert, walked, depth + 1, cx, out)?;
+            if cx.reference() {
+                let walked = Walked {
+                    exprs: Vec::new(),
+                    queries: insert.source.iter().map(|q| q.as_ref()).collect(),
+                };
+                walk_rest(insert, walked, depth + 1, cx, out)?;
+            } else {
+                Fast::new(depth + 1, cx, out).insert(insert)?;
+            }
         }
 
         // ── COPY … TO/FROM PROGRAM (VERICTO-080) ─────────────────────────────
@@ -1399,13 +1442,30 @@ fn walk_query(
             pipe_operators: _,
         } = query;
         let d = depth + 1;
-        walk_rest(order_by, Walked::default(), d, cx, out)?;
-        walk_rest(limit_clause, Walked::default(), d, cx, out)?;
-        walk_rest(fetch, Walked::default(), d, cx, out)?;
-        walk_rest(locks, Walked::default(), d, cx, out)?;
-        walk_rest(for_clause, Walked::default(), d, cx, out)?;
-        walk_rest(settings, Walked::default(), d, cx, out)?;
-        walk_rest(format_clause, Walked::default(), d, cx, out)?;
+        if cx.reference() {
+            walk_rest(order_by, Walked::default(), d, cx, out)?;
+            walk_rest(limit_clause, Walked::default(), d, cx, out)?;
+            walk_rest(fetch, Walked::default(), d, cx, out)?;
+            walk_rest(locks, Walked::default(), d, cx, out)?;
+            walk_rest(for_clause, Walked::default(), d, cx, out)?;
+            walk_rest(settings, Walked::default(), d, cx, out)?;
+            walk_rest(format_clause, Walked::default(), d, cx, out)?;
+        } else {
+            let mut fast = Fast::new(d, cx, out);
+            if let Some(order_by) = order_by {
+                fast.order_by(order_by)?;
+            }
+            if let Some(limit_clause) = limit_clause {
+                fast.limit_clause(limit_clause)?;
+            }
+            fast.rest_opt(fetch.as_ref())?;
+            if !locks.is_empty() {
+                fast.rest(locks, 0)?;
+            }
+            fast.rest_opt(for_clause.as_ref())?;
+            fast.rest_opt(settings.as_ref())?;
+            fast.rest_opt(format_clause.as_ref())?;
+        }
     }
     Ok(())
 }
@@ -1594,7 +1654,9 @@ fn walk_set_expr(
 
             // Everything else the SELECT evaluates: `JOIN … ON`, table-valued
             // function arguments, `GROUP BY`, `HAVING`, `WINDOW`, …
-            {
+            if !cx.reference() {
+                Fast::new(depth + 1, cx, out).select(select)?;
+            } else {
                 let mut exprs: Vec<&Expr> = select.selection.iter().collect();
                 if cx.snowflake() {
                     exprs.extend(select.qualify.iter());
@@ -1645,7 +1707,11 @@ fn walk_set_expr(
         }
         // `VALUES (…)` (an `INSERT`'s rows): its expressions run.
         SetExpr::Values(values) => {
-            walk_rest(values, Walked::default(), depth + 1, cx, out)?;
+            if cx.reference() {
+                walk_rest(values, Walked::default(), depth + 1, cx, out)?;
+            } else {
+                Fast::new(depth + 1, cx, out).values(values)?;
+            }
         }
         // TABLE t has no expression of its own.
         SetExpr::Table(_) => {}
@@ -1677,7 +1743,10 @@ fn walk_expr(expr: &Expr, depth: usize, cx: Cx, out: &mut Vec<StatementInfo>) ->
     if depth > MAX_AST_DEPTH {
         return Err(ProxyError::AstTooDeep);
     }
-    walk_rest(expr, Walked::default(), depth, cx, out)
+    if cx.reference() {
+        return walk_rest(expr, Walked::default(), depth, cx, out);
+    }
+    Fast::new(depth, cx, out).expr(expr, 0)
 }
 
 /// Records a function call: every call, not just the sleep family, so a
@@ -1699,13 +1768,19 @@ fn record_call(func: &sqlparser::ast::Function, cx: Cx, out: &mut Vec<StatementI
             .and_then(const_number)
             .is_some_and(|n| n >= SQLITE_PROBE_BYTES);
     if !name.is_empty() {
+        const PROBE: &str = " (a huge constant size: a time probe)";
+        let mut path = String::with_capacity(
+            "FunctionCall > ()".len() + name.len() + if probe { PROBE.len() } else { 0 },
+        );
+        path.push_str("FunctionCall > ");
+        path.push_str(&name);
+        path.push_str("()");
+        if probe {
+            path.push_str(PROBE);
+        }
         out.push(StatementInfo {
             kind: StatementKind::FunctionCall,
-            ast_node_path: if probe {
-                format!("FunctionCall > {name}() (a huge constant size: a time probe)")
-            } else {
-                format!("FunctionCall > {name}()")
-            },
+            ast_node_path: path,
             function_name: Some(name),
             sqlite: probe.then_some(SqliteRisk::TimeProbe),
             ..Default::default()
@@ -1741,6 +1816,20 @@ fn walk_rest<V: Visit + ?Sized>(
     cx: Cx,
     out: &mut Vec<StatementInfo>,
 ) -> Result<()> {
+    walk_rest_at(node, walked, depth, 0, cx, out)
+}
+
+/// [`walk_rest`] on a node met `nesting` expressions deep into a walk that
+/// started at `depth`: the same visit, resumed where the targeted walk
+/// ([`Fast`]) hands a node over.
+fn walk_rest_at<V: Visit + ?Sized>(
+    node: &V,
+    walked: Walked<'_>,
+    depth: usize,
+    nesting: usize,
+    cx: Cx,
+    out: &mut Vec<StatementInfo>,
+) -> Result<()> {
     let mut rest = Rest {
         walked,
         depth,
@@ -1748,7 +1837,7 @@ fn walk_rest<V: Visit + ?Sized>(
         out,
         skipped: None,
         in_query: 0,
-        nesting: 0,
+        nesting,
     };
     match node.visit(&mut rest) {
         ControlFlow::Continue(()) => Ok(()),
@@ -1824,6 +1913,587 @@ impl Visitor for Rest<'_, '_> {
             self.nesting -= 1;
         }
         ControlFlow::Continue(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Targeted walk
+// ---------------------------------------------------------------------------
+
+/// The targeted walk: what [`walk_rest`] does on the clauses and expression
+/// kinds statements are made of in practice, without sqlparser's generic
+/// traversal of every field below them (spans, tokens, identifiers, literals)
+/// or a second pass over a part the structural walk already visited.
+///
+/// It records exactly what `walk_rest` records, in the same order, and fails
+/// where it fails: each node is either one it models here (visiting the same
+/// children in the same order, with the same depth accounting) or one it
+/// hands to [`walk_rest_at`] at the same depth and nesting. A part is skipped
+/// only when it cannot hold an expression or a query (an identifier, a
+/// literal, a plain name, a flag) or when the structural walk already visited
+/// it (a `WHERE`, the projection, a `FROM` subquery: what [`Walked`] lists).
+/// The structs are destructured without `..`: a field a sqlparser upgrade
+/// adds fails to compile here until it is classified. The `walk::equivalence`
+/// tests check it against `walk_rest` alone (the 4.7.0 walk).
+struct Fast<'o> {
+    /// The depth `walk_rest` would have started at.
+    depth: usize,
+    cx: Cx,
+    out: &'o mut Vec<StatementInfo>,
+}
+
+impl<'o> Fast<'o> {
+    fn new(depth: usize, cx: Cx, out: &'o mut Vec<StatementInfo>) -> Self {
+        Fast { depth, cx, out }
+    }
+
+    /// `walk_rest` on `node`, `nesting` expressions deep.
+    fn rest<V: Visit + ?Sized>(&mut self, node: &V, nesting: usize) -> Result<()> {
+        walk_rest_at(
+            node,
+            Walked::default(),
+            self.depth,
+            nesting,
+            self.cx,
+            self.out,
+        )
+    }
+
+    /// `walk_rest` on an optional clause at the top of the walk.
+    #[inline]
+    fn rest_opt<V: Visit>(&mut self, node: Option<&V>) -> Result<()> {
+        match node {
+            Some(node) => self.rest(node, 0),
+            None => Ok(()),
+        }
+    }
+
+    /// `walk_rest` on a list of clauses at the top of the walk.
+    #[inline]
+    fn rest_list<V: Visit>(&mut self, nodes: &[V]) -> Result<()> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        nodes.iter().try_for_each(|node| self.rest(node, 0))
+    }
+
+    /// A query `walk_rest` meets `nesting` expressions deep and has not
+    /// walked yet (`Rest::pre_visit_query`).
+    fn query(&mut self, query: &Query, nesting: usize) -> Result<()> {
+        walk_query(query, true, self.depth + nesting + 1, self.cx, self.out)
+    }
+
+    /// A name: nothing to walk unless a part is a function
+    /// (`IDENTIFIER('t')`).
+    #[inline]
+    fn name(&mut self, name: &sqlparser::ast::ObjectName, nesting: usize) -> Result<()> {
+        use sqlparser::ast::ObjectNamePart;
+        if name
+            .0
+            .iter()
+            .all(|part| matches!(part, ObjectNamePart::Identifier(_)))
+        {
+            Ok(())
+        } else {
+            self.rest(name, nesting)
+        }
+    }
+
+    /// An expression `nesting` expressions deep (`Rest::pre_visit_expr`,
+    /// then its children in field order).
+    #[inline]
+    fn expr(&mut self, expr: &Expr, nesting: usize) -> Result<()> {
+        if matches!(
+            expr,
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_)
+        ) {
+            // A leaf: only the depth check of `Rest::pre_visit_expr`.
+            return if self.depth + nesting + 1 > MAX_AST_DEPTH {
+                Err(ProxyError::AstTooDeep)
+            } else {
+                Ok(())
+            };
+        }
+        self.inner_expr(expr, nesting)
+    }
+
+    fn inner_expr(&mut self, expr: &Expr, nesting: usize) -> Result<()> {
+        let n = nesting + 1;
+        if self.depth + n > MAX_AST_DEPTH {
+            return Err(ProxyError::AstTooDeep);
+        }
+        match expr {
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => Ok(()),
+            Expr::Nested(e)
+            | Expr::UnaryOp { expr: e, .. }
+            | Expr::IsFalse(e)
+            | Expr::IsNotFalse(e)
+            | Expr::IsTrue(e)
+            | Expr::IsNotTrue(e)
+            | Expr::IsNull(e)
+            | Expr::IsNotNull(e)
+            | Expr::IsUnknown(e)
+            | Expr::IsNotUnknown(e) => self.expr(e, n),
+            Expr::BinaryOp { left, right, .. }
+            | Expr::IsDistinctFrom(left, right)
+            | Expr::IsNotDistinctFrom(left, right) => {
+                self.expr(left, n)?;
+                self.expr(right, n)
+            }
+            Expr::InList { expr, list, .. } => {
+                self.expr(expr, n)?;
+                list.iter().try_for_each(|e| self.expr(e, n))
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.expr(expr, n)?;
+                self.expr(low, n)?;
+                self.expr(high, n)
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                escape_char,
+                ..
+            }
+            | Expr::ILike {
+                expr,
+                pattern,
+                escape_char,
+                ..
+            } => {
+                self.expr(expr, n)?;
+                self.expr(pattern, n)?;
+                match escape_char {
+                    Some(e) => self.expr(e, n),
+                    None => Ok(()),
+                }
+            }
+            Expr::InSubquery { expr, subquery, .. } => {
+                self.expr(expr, n)?;
+                self.query(subquery, n)
+            }
+            Expr::Subquery(query)
+            | Expr::Exists {
+                subquery: query, ..
+            } => self.query(query, n),
+            Expr::Tuple(list) => list.iter().try_for_each(|e| self.expr(e, n)),
+            Expr::Case {
+                case_token: _,
+                end_token: _,
+                operand,
+                conditions,
+                else_result,
+            } => {
+                if let Some(e) = operand {
+                    self.expr(e, n)?;
+                }
+                for when in conditions {
+                    self.expr(&when.condition, n)?;
+                    self.expr(&when.result, n)?;
+                }
+                match else_result {
+                    Some(e) => self.expr(e, n),
+                    None => Ok(()),
+                }
+            }
+            Expr::Function(func) => {
+                record_call(func, self.cx, self.out);
+                self.function(func, n)
+            }
+            // Every other kind: the generic visit, from this expression.
+            _ => self.rest(expr, nesting),
+        }
+    }
+
+    /// The children of a call, `nesting` deep (the call itself counted).
+    fn function(&mut self, func: &sqlparser::ast::Function, nesting: usize) -> Result<()> {
+        let sqlparser::ast::Function {
+            name,
+            uses_odbc_syntax: _,
+            parameters,
+            args,
+            within_group,
+            filter,
+            null_treatment: _,
+            over,
+        } = func;
+        self.name(name, nesting)?;
+        self.arguments(parameters, nesting)?;
+        self.arguments(args, nesting)?;
+        if !within_group.is_empty() {
+            self.rest(within_group, nesting)?;
+        }
+        if let Some(e) = filter {
+            self.expr(e, nesting)?;
+        }
+        match over {
+            Some(window) => self.rest(window, nesting),
+            None => Ok(()),
+        }
+    }
+
+    fn arguments(&mut self, args: &FunctionArguments, nesting: usize) -> Result<()> {
+        use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArgumentList};
+        match args {
+            FunctionArguments::None => Ok(()),
+            FunctionArguments::Subquery(query) => self.query(query, nesting),
+            FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: _,
+                args,
+                clauses,
+            }) => {
+                for arg in args {
+                    match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => self.expr(e, nesting)?,
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {}
+                        other => self.rest(other, nesting)?,
+                    }
+                }
+                if clauses.is_empty() {
+                    Ok(())
+                } else {
+                    self.rest(clauses, nesting)
+                }
+            }
+        }
+    }
+
+    /// A `FROM` item. `relation_walked` / `joins_walked`: whether the
+    /// structural walk already walked a derived table there.
+    fn table_with_joins(
+        &mut self,
+        twj: &TableWithJoins,
+        relation_walked: bool,
+        joins_walked: bool,
+    ) -> Result<()> {
+        let TableWithJoins { relation, joins } = twj;
+        self.table_factor(relation, relation_walked)?;
+        for join in joins {
+            let sqlparser::ast::Join {
+                relation,
+                global: _,
+                join_operator,
+            } = join;
+            self.table_factor(relation, joins_walked)?;
+            self.rest(join_operator, 0)?;
+        }
+        Ok(())
+    }
+
+    fn table_factor(&mut self, factor: &TableFactor, derived_walked: bool) -> Result<()> {
+        match factor {
+            TableFactor::Table {
+                name,
+                alias,
+                args,
+                with_hints,
+                version,
+                with_ordinality: _,
+                partitions: _,
+                json_path,
+                sample,
+                index_hints,
+            } => {
+                self.name(name, 0)?;
+                self.table_alias(alias.as_ref())?;
+                self.rest_opt(args.as_ref())?;
+                with_hints.iter().try_for_each(|e| self.expr(e, 0))?;
+                self.rest_opt(version.as_ref())?;
+                self.rest_opt(json_path.as_ref())?;
+                self.rest_opt(sample.as_ref())?;
+                self.rest_list(index_hints)
+            }
+            TableFactor::Derived {
+                lateral: _,
+                subquery,
+                alias,
+                sample,
+            } => {
+                if !derived_walked {
+                    self.query(subquery, 0)?;
+                }
+                self.table_alias(alias.as_ref())?;
+                self.rest_opt(sample.as_ref())
+            }
+            other => self.rest(other, 0),
+        }
+    }
+
+    /// An alias: only its column definitions (their types) can hold an
+    /// expression.
+    fn table_alias(&mut self, alias: Option<&sqlparser::ast::TableAlias>) -> Result<()> {
+        match alias {
+            Some(sqlparser::ast::TableAlias {
+                explicit: _,
+                name: _,
+                columns,
+                at: _,
+            }) if !columns.is_empty() => self.rest_list(columns),
+            _ => Ok(()),
+        }
+    }
+
+    fn assignment(&mut self, assignment: &sqlparser::ast::Assignment) -> Result<()> {
+        use sqlparser::ast::AssignmentTarget;
+        let sqlparser::ast::Assignment { target, value } = assignment;
+        match target {
+            AssignmentTarget::ColumnName(name) => self.name(name, 0)?,
+            AssignmentTarget::Tuple(names) => names.iter().try_for_each(|n| self.name(n, 0))?,
+        }
+        self.expr(value, 0)
+    }
+
+    #[inline]
+    fn opt_expr(&mut self, expr: Option<&Expr>) -> Result<()> {
+        match expr {
+            Some(e) => self.expr(e, 0),
+            None => Ok(()),
+        }
+    }
+
+    /// What `walk_rest(select, Walked { WHERE, projection, [QUALIFY], FROM
+    /// subqueries })` walks: everything else the SELECT evaluates.
+    fn select(&mut self, select: &sqlparser::ast::Select) -> Result<()> {
+        use sqlparser::ast::GroupByExpr;
+        let sqlparser::ast::Select {
+            select_token: _,
+            optimizer_hints,
+            distinct,
+            select_modifiers: _,
+            top,
+            top_before_distinct: _,
+            projection,
+            exclude,
+            into,
+            from,
+            lateral_views,
+            prewhere,
+            selection: _,
+            connect_by,
+            group_by,
+            cluster_by,
+            distribute_by,
+            sort_by,
+            having,
+            named_window,
+            qualify,
+            window_before_qualify: _,
+            value_table_mode: _,
+            flavor: _,
+        } = select;
+        self.rest_list(optimizer_hints)?;
+        self.rest_opt(distinct.as_ref())?;
+        self.rest_opt(top.as_ref())?;
+        for item in projection {
+            match item {
+                SelectItem::UnnamedExpr(_)
+                | SelectItem::ExprWithAlias { .. }
+                | SelectItem::ExprWithAliases { .. } => {}
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                    self.rest(item, 0)?
+                }
+            }
+        }
+        self.rest_opt(exclude.as_ref())?;
+        self.rest_opt(into.as_ref())?;
+        for twj in from {
+            self.table_with_joins(twj, true, true)?;
+        }
+        self.rest_list(lateral_views)?;
+        self.opt_expr(prewhere.as_ref())?;
+        self.rest_list(connect_by)?;
+        match group_by {
+            GroupByExpr::Expressions(exprs, modifiers) => {
+                exprs.iter().try_for_each(|e| self.expr(e, 0))?;
+                self.rest_list(modifiers)?;
+            }
+            GroupByExpr::All(_) => self.rest(group_by, 0)?,
+        }
+        cluster_by.iter().try_for_each(|e| self.expr(e, 0))?;
+        distribute_by.iter().try_for_each(|e| self.expr(e, 0))?;
+        self.rest_list(sort_by)?;
+        self.opt_expr(having.as_ref())?;
+        self.rest_list(named_window)?;
+        if !self.cx.snowflake() {
+            self.opt_expr(qualify.as_ref())?;
+        }
+        Ok(())
+    }
+
+    /// What `walk_rest(update, Walked { WHERE })` walks.
+    fn update(&mut self, update: &sqlparser::ast::Update) -> Result<()> {
+        let sqlparser::ast::Update {
+            update_token: _,
+            optimizer_hints,
+            table,
+            assignments,
+            from,
+            selection: _,
+            returning,
+            output,
+            or,
+            order_by,
+            limit,
+        } = update;
+        self.rest_list(optimizer_hints)?;
+        self.table_with_joins(table, false, false)?;
+        assignments.iter().try_for_each(|a| self.assignment(a))?;
+        self.rest_opt(from.as_ref())?;
+        self.rest_opt(returning.as_ref())?;
+        self.rest_opt(output.as_ref())?;
+        self.rest_opt(or.as_ref())?;
+        self.rest_list(order_by)?;
+        self.opt_expr(limit.as_ref())
+    }
+
+    /// What `walk_rest(delete, Walked { WHERE, FROM subqueries })` walks.
+    fn delete(&mut self, delete: &sqlparser::ast::Delete) -> Result<()> {
+        let sqlparser::ast::Delete {
+            delete_token: _,
+            optimizer_hints,
+            tables,
+            from,
+            using,
+            selection: _,
+            returning,
+            output,
+            order_by,
+            limit,
+        } = delete;
+        self.rest_list(optimizer_hints)?;
+        tables.iter().try_for_each(|n| self.name(n, 0))?;
+        match from {
+            FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
+                for twj in tables {
+                    self.table_with_joins(twj, true, false)?;
+                }
+            }
+        }
+        if let Some(using) = using {
+            for twj in using {
+                self.table_with_joins(twj, false, false)?;
+            }
+        }
+        self.rest_opt(returning.as_ref())?;
+        self.rest_opt(output.as_ref())?;
+        self.rest_list(order_by)?;
+        self.opt_expr(limit.as_ref())
+    }
+
+    /// What `walk_rest(insert, Walked { source })` walks.
+    fn insert(&mut self, insert: &sqlparser::ast::Insert) -> Result<()> {
+        use sqlparser::ast::TableObject;
+        let sqlparser::ast::Insert {
+            insert_token: _,
+            optimizer_hints,
+            or,
+            ignore: _,
+            into: _,
+            table,
+            table_alias,
+            columns,
+            overwrite: _,
+            source: _,
+            assignments,
+            partitioned,
+            after_columns: _,
+            has_table_keyword: _,
+            on,
+            returning,
+            output,
+            replace_into: _,
+            priority,
+            insert_alias,
+            settings,
+            format_clause,
+            multi_table_insert_type,
+            multi_table_into_clauses,
+            multi_table_when_clauses,
+            multi_table_else_clause,
+        } = insert;
+        self.rest_list(optimizer_hints)?;
+        self.rest_opt(or.as_ref())?;
+        match table {
+            TableObject::TableName(name) => self.name(name, 0)?,
+            TableObject::TableFunction(_) | TableObject::TableQuery(_) => self.rest(table, 0)?,
+        }
+        self.rest_opt(table_alias.as_ref())?;
+        columns.iter().try_for_each(|n| self.name(n, 0))?;
+        assignments.iter().try_for_each(|a| self.assignment(a))?;
+        self.rest_opt(partitioned.as_ref())?;
+        self.rest_opt(on.as_ref())?;
+        self.rest_opt(returning.as_ref())?;
+        self.rest_opt(output.as_ref())?;
+        self.rest_opt(priority.as_ref())?;
+        self.rest_opt(insert_alias.as_ref())?;
+        self.rest_opt(settings.as_ref())?;
+        self.rest_opt(format_clause.as_ref())?;
+        self.rest_opt(multi_table_insert_type.as_ref())?;
+        self.rest_list(multi_table_into_clauses)?;
+        self.rest_list(multi_table_when_clauses)?;
+        self.rest_opt(multi_table_else_clause.as_ref())
+    }
+
+    /// `VALUES (…), (…)`: every expression of every row.
+    fn values(&mut self, values: &sqlparser::ast::Values) -> Result<()> {
+        let sqlparser::ast::Values {
+            explicit_row: _,
+            value_keyword: _,
+            rows,
+        } = values;
+        for row in rows {
+            let sqlparser::ast::Parens {
+                opening_token: _,
+                content,
+                closing_token: _,
+            } = row;
+            content.iter().try_for_each(|e| self.expr(e, 0))?;
+        }
+        Ok(())
+    }
+
+    /// A query's `ORDER BY`.
+    fn order_by(&mut self, order_by: &sqlparser::ast::OrderBy) -> Result<()> {
+        use sqlparser::ast::{OrderByExpr, OrderByKind};
+        let sqlparser::ast::OrderBy { kind, interpolate } = order_by;
+        match kind {
+            OrderByKind::Expressions(list) => {
+                for item in list {
+                    let OrderByExpr {
+                        expr,
+                        options: _,
+                        with_fill,
+                    } = item;
+                    self.expr(expr, 0)?;
+                    self.rest_opt(with_fill.as_ref())?;
+                }
+            }
+            OrderByKind::All(_) => {}
+        }
+        self.rest_opt(interpolate.as_ref())
+    }
+
+    /// A query's `LIMIT` / `OFFSET`.
+    fn limit_clause(&mut self, limit_clause: &LimitClause) -> Result<()> {
+        match limit_clause {
+            LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            } => {
+                self.opt_expr(limit.as_ref())?;
+                if let Some(sqlparser::ast::Offset { value, rows: _ }) = offset {
+                    self.expr(value, 0)?;
+                }
+                limit_by.iter().try_for_each(|e| self.expr(e, 0))
+            }
+            LimitClause::OffsetCommaLimit { offset, limit } => {
+                self.expr(offset, 0)?;
+                self.expr(limit, 0)
+            }
+        }
     }
 }
 
@@ -2037,35 +2707,42 @@ fn truth(expr: &Expr, dialect: Dialect) -> Truth {
                 }
                 _ => return Truth::Unknown,
             };
-            match (
-                constant_for_dialect(left, dialect),
-                constant_for_dialect(right, dialect),
-            ) {
-                (Some(a), Some(b)) => compare(&a, cmp, &b),
-                _ => Truth::Unknown,
+            // A column on the left decides it: the right side is not read
+            // (`constant_for_dialect` is pure).
+            let Some(a) = constant_for_dialect(left, dialect) else {
+                return Truth::Unknown;
+            };
+            match constant_for_dialect(right, dialect) {
+                Some(b) => compare(&a, cmp, &b),
+                None => Truth::Unknown,
             }
         }
         _ => Truth::Unknown,
     }
 }
 
-/// True when both expressions are the same (qualified) column identifier.
+/// True when both expressions are the same (qualified) column identifier:
+/// their parts, joined by `.`, are equal up to ASCII case. Compared in
+/// place, without building the two lowercase paths (as 4.7.0 did).
 fn same_column(left: &Expr, right: &Expr) -> bool {
-    fn path(e: &Expr) -> Option<String> {
+    fn parts(e: &Expr) -> Option<&[sqlparser::ast::Ident]> {
         match e {
-            Expr::Identifier(id) => Some(id.value.to_ascii_lowercase()),
-            Expr::CompoundIdentifier(ids) => Some(
-                ids.iter()
-                    .map(|i| i.value.to_ascii_lowercase())
-                    .collect::<Vec<_>>()
-                    .join("."),
-            ),
-            Expr::Nested(inner) => path(inner),
+            Expr::Identifier(id) => Some(std::slice::from_ref(id)),
+            Expr::CompoundIdentifier(ids) => Some(ids),
+            Expr::Nested(inner) => parts(inner),
             _ => None,
         }
     }
-    match (path(left), path(right)) {
-        (Some(a), Some(b)) => a == b,
+    fn path(ids: &[sqlparser::ast::Ident]) -> impl Iterator<Item = u8> + '_ {
+        ids.iter().enumerate().flat_map(|(i, id)| {
+            (i > 0)
+                .then_some(b'.')
+                .into_iter()
+                .chain(id.value.bytes().map(|b| b.to_ascii_lowercase()))
+        })
+    }
+    match (parts(left), parts(right)) {
+        (Some(a), Some(b)) => path(a).eq(path(b)),
         _ => false,
     }
 }
