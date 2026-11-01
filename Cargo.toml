@@ -47,7 +47,7 @@ proptest = "1"
 # expressions. Pinned exactly; a bump re-runs that suite.
 cel = { version = "=0.15.0", default-features = false, features = ["regex"] }
 # The policy-evaluation micro-benchmark and its budget gate (benches/policy.rs).
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "policy"
