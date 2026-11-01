@@ -33,7 +33,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.7.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.7.1" }
 ```
 
 ### Quick example
@@ -98,8 +98,8 @@ severity to, and `engine_driven` for VERICTO-085, 086 and 087, which the policy
 drives and the rules slice neither enables nor disables. A test keeps the table
 equal to the catalogue below.
 
-`ENGINE_VERSION` is this crate's version (`"4.7.0"`) and
-`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@4.7.0"`):
+`ENGINE_VERSION` is this crate's version (`"4.7.1"`) and
+`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@4.7.1"`):
 a built-in rule's predicate lives in the engine, so what the standard ruleset
 detects changes with the engine version. Print them with a verdict to say what
 it was evaluated with.

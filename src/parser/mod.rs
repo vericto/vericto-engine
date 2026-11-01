@@ -592,6 +592,67 @@ pub(crate) struct SqlNumber {
 
 impl SqlNumber {
     fn parse(text: &str) -> Option<Self> {
+        // The 4.7.0 grammar, read in one pass with a single allocation (the
+        // significant digits).
+        let (negative, unsigned) = match text.as_bytes().first() {
+            Some(b'-') => (true, &text[1..]),
+            Some(b'+') => (false, &text[1..]),
+            _ => (false, text),
+        };
+        let is_e = |b: u8| b == b'e' || b == b'E';
+        let (mantissa, exponent) = match unsigned.bytes().position(is_e) {
+            // A second `e` fails the integer parse.
+            Some(at) => (&unsigned[..at], unsigned[at + 1..].parse::<i128>().ok()?),
+            None => (unsigned, 0),
+        };
+        if !(-(MAX_QUERY_SIZE_BYTES as i128)..=MAX_QUERY_SIZE_BYTES as i128).contains(&exponent) {
+            return None;
+        }
+
+        let (whole, fraction) = match mantissa.bytes().position(|b| b == b'.') {
+            Some(at) => (&mantissa[..at], &mantissa[at + 1..]),
+            None => (mantissa, ""),
+        };
+        if (whole.is_empty() && fraction.is_empty())
+            || !whole
+                .bytes()
+                .chain(fraction.bytes())
+                .all(|b| b.is_ascii_digit())
+        {
+            // A second `.` is not a digit either.
+            return None;
+        }
+
+        let significant = whole
+            .bytes()
+            .chain(fraction.bytes())
+            .skip_while(|&b| b == b'0');
+        let mut digits = String::with_capacity(whole.len() + fraction.len());
+        digits.extend(significant.map(char::from));
+        if digits.is_empty() {
+            return Some(Self {
+                negative: false,
+                digits: "0".to_string(),
+                scale: 0,
+            });
+        }
+
+        let mut scale = i128::try_from(fraction.len()).ok()?.checked_sub(exponent)?;
+        while digits.ends_with('0') {
+            digits.pop();
+            scale = scale.checked_sub(1)?;
+        }
+        Some(Self {
+            negative,
+            digits,
+            scale,
+        })
+    }
+
+    /// The 4.7.0 reading, which [`SqlNumber::parse`] must reproduce exactly
+    /// (checked by `sql_number_parse_matches_reference`).
+    #[cfg(test)]
+    fn parse_reference(text: &str) -> Option<Self> {
         let (negative, unsigned) = match text.as_bytes().first() {
             Some(b'-') => (true, &text[1..]),
             Some(b'+') => (false, &text[1..]),

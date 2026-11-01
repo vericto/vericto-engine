@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 46eee4dd48132edf7379a3f8a47b93a6e8beaf22b698cb2f88b5048b00718fb7 # shrinks to src = "uint(-(0.5))"
+cc e7aef6d82d008df92ead755d3000abd0a86a88082aeb4d83fad58101eccad78d # shrinks to src = "([1, 2] + [3] + [{'k': 1, 'j': 2}, 1][0])"
+cc 9284849b2c89fe133023222876feeaeb156e677999b55b0439d7dafa65f02726 # shrinks to src = "([1, 2, 3].map(x, x + 0) in [{'k': 1, 'j': 2}, 1][0])"
