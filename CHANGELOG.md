@@ -9,12 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.7.1] — 2026-10-31
 
-**Performance only: the per-statement cost 4.7.0 added on the sqlparser path
-(MySQL, SQL Server, Oracle, Snowflake, SQLite) is recovered.** No rule, verdict,
-severity, policy default or rule coverage changes: every statement produces the
-same records, in the same order, as in 4.7.0, and fails the same depth guard
-(`MAX_AST_DEPTH`, `AstTooDeep`) at the same point. `STANDARD_RULESET_VERSION`
-reads `standard@4.7.1`; its predicates are those of 4.7.0.
+**The per-statement cost 4.7.0 added on the sqlparser path (MySQL, SQL Server,
+Oracle, Snowflake, SQLite) is recovered, and one CEL conversion is fixed.** No
+rule, severity, policy default or rule coverage changes: every statement
+produces the same records, in the same order, as in 4.7.0, and fails the same
+depth guard (`MAX_AST_DEPTH`, `AstTooDeep`) at the same point.
+`STANDARD_RULESET_VERSION` reads `standard@4.7.1`; its predicates are those of
+4.7.0. The only behavior change is `uint()` of a negative double in business
+policies (CEL, a preview feature), below.
+
+### Fixed
+
+- **CEL `uint()` of a negative double is a range error.** `uint(-0.5)` (any
+  double in (-1, 0)) returned `0u` from 4.4.0 to 4.7.0, because the range was
+  checked after truncation toward zero; it is now an evaluation error, as
+  `uint(-1.0)` already was. The accepted range is [0, 2^64): `uint(-0.0)` is
+  still `0u`, NaN and infinities are errors as before. This matches cel-go
+  (`doubleToUint64Checked`), cel-cpp (`CheckedDoubleToUint64`) and cel-rust
+  (`uint_from_double`). A business policy whose `when` / `deny_if` /
+  `require` reached `uint()` on such a value (and did not have `&&` / `||`
+  absorb it) is now inconclusive: `on_unknown` decides, and
+  `outcome.unknowns` reports it with `error: true`, instead of the condition
+  comparing `0u`.
+  `int()` and `double()` were checked for the same class of bug (NaN, ±Inf,
+  both ends of the range, -0.0) and already matched; deterministic tests now
+  pin all three, and the generated case is kept in
+  `proptest-regressions/policy/cel/conformance.txt`. This was the intermittent
+  failure of `policy::cel::conformance::prop_subset_agrees_with_cel_rust`.
 
 ### Performance
 
@@ -70,6 +91,13 @@ The PostgreSQL remainder over 4.6.0 is 4.7.0's libpg_query walk, unchanged here.
   boundary. The new number parser and column comparison are checked against
   their 4.7.0 forms on generated and edge inputs. No existing test or golden
   file changes.
+- Depth-guard sweeps for the targeted walk's hand-over to the generic visit:
+  32 expression forms it does not model (`CAST`, `SUBSTRING`, `TRIM`,
+  `EXTRACT`, `COLLATE`, `INTERVAL`, `ANY`, JSON and field access, …) in 59
+  clauses, on all six dialects, each just below, at and just above
+  `MAX_AST_DEPTH`; the boundary sweep now runs on every dialect and on the
+  Snowflake-specific shapes (`QUALIFY`, `SAMPLE (n ROWS)`, `RESULT_SCAN`,
+  scripting blocks). Both walks agree everywhere.
 
 ## [4.7.0] — 2026-10-31
 

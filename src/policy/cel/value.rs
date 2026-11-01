@@ -502,7 +502,14 @@ pub(crate) fn to_uint<'a>(v: &Value<'a>) -> R<'a> {
         Value::Uint(u) => *u,
         Value::Int(i) => u64::try_from(*i).map_err(|_| range())?,
         Value::Double(d) => {
-            if !(d.is_finite() && *d > -1.0 && *d < 1.844_674_407_370_955_2e19) {
+            // The range is checked before truncation: [0, 2^64), so a
+            // negative double (even -0.5, which would truncate to 0) is out
+            // of range, while -0.0 compares equal to 0 and converts to 0u.
+            // NaN fails every comparison. This is what cel-go
+            // (`doubleToUint64Checked`), cel-cpp (`CheckedDoubleToUint64`)
+            // and cel-rust (`uint_from_double`) do; 4.4.0 to 4.7.0 returned
+            // 0u for a double in (-1, 0).
+            if !(*d >= 0.0 && *d < 1.844_674_407_370_955_2e19) {
                 return Err(range());
             }
             *d as u64
@@ -645,6 +652,90 @@ mod tests {
         assert!(to_int(&Value::Double(f64::NAN)).is_err());
         assert_eq!(to_int(&Value::Double(-1.9)).unwrap().type_name(), "int");
         assert!(to_uint(&Value::Int(-1)).is_err());
+    }
+
+    fn int_of(v: Value<'_>) -> Option<i64> {
+        match to_int(&v) {
+            Ok(Value::Int(i)) => Some(i),
+            Ok(other) => panic!("int() returned {}", other.type_name()),
+            Err(_) => None,
+        }
+    }
+
+    fn uint_of(v: Value<'_>) -> Option<u64> {
+        match to_uint(&v) {
+            Ok(Value::Uint(u)) => Some(u),
+            Ok(other) => panic!("uint() returned {}", other.type_name()),
+            Err(_) => None,
+        }
+    }
+
+    /// `uint(double)`: [0, 2^64), range checked before truncation (cel-go
+    /// `doubleToUint64Checked`, cel-cpp `CheckedDoubleToUint64`, cel-rust
+    /// `uint_from_double`).
+    #[test]
+    fn uint_of_double_edges() {
+        const TWO_TO_64: f64 = 18_446_744_073_709_551_616.0;
+        // A negative double is out of range, even one that truncates to 0.
+        for d in [-0.5, -0.1, -f64::MIN_POSITIVE, -1.0, -1.5, -1e300] {
+            assert_eq!(uint_of(Value::Double(d)), None, "uint({d:?})");
+        }
+        // -0.0 is zero, not negative.
+        assert_eq!(uint_of(Value::Double(-0.0)), Some(0));
+        assert_eq!(uint_of(Value::Double(0.0)), Some(0));
+        assert_eq!(uint_of(Value::Double(0.5)), Some(0));
+        assert_eq!(uint_of(Value::Double(1.9)), Some(1));
+        assert_eq!(uint_of(Value::Double(25.5)), Some(25));
+        // The largest double below 2^64 converts; 2^64 itself does not.
+        let below = f64::from_bits(TWO_TO_64.to_bits() - 1);
+        assert_eq!(uint_of(Value::Double(below)), Some(below as u64));
+        assert_eq!(uint_of(Value::Double(TWO_TO_64)), None);
+        assert_eq!(uint_of(Value::Double(6.022e23)), None);
+        for d in [f64::NAN, -f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(uint_of(Value::Double(d)), None, "uint({d:?})");
+        }
+        assert_eq!(uint_of(Value::Int(-1)), None);
+        assert_eq!(uint_of(Value::Int(i64::MAX)), Some(i64::MAX as u64));
+    }
+
+    /// `int(double)`: (-2^63, 2^63), both ends excluded, truncation toward
+    /// zero (cel-spec conversions `double_int_min_range`,
+    /// `double_int_max_range`, `double_truncate_neg`).
+    #[test]
+    fn int_of_double_edges() {
+        const TWO_TO_63: f64 = 9_223_372_036_854_775_808.0;
+        assert_eq!(int_of(Value::Double(-0.0)), Some(0));
+        assert_eq!(int_of(Value::Double(-0.5)), Some(0));
+        assert_eq!(int_of(Value::Double(-7.9)), Some(-7));
+        assert_eq!(int_of(Value::Double(-3.5)), Some(-3));
+        assert_eq!(int_of(Value::Double(11.5)), Some(11));
+        assert_eq!(int_of(Value::Double(TWO_TO_63)), None);
+        assert_eq!(int_of(Value::Double(-TWO_TO_63)), None);
+        let below = f64::from_bits(TWO_TO_63.to_bits() - 1);
+        assert_eq!(int_of(Value::Double(below)), Some(below as i64));
+        assert_eq!(int_of(Value::Double(-below)), Some(-below as i64));
+        assert_eq!(int_of(Value::Double(1e99)), None);
+        for d in [f64::NAN, -f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(int_of(Value::Double(d)), None, "int({d:?})");
+        }
+        assert_eq!(int_of(Value::Uint(i64::MAX as u64)), Some(i64::MAX));
+        assert_eq!(int_of(Value::Uint(i64::MAX as u64 + 1)), None);
+    }
+
+    /// `double()` of an int or a uint is total; of a double, the identity
+    /// (NaN, infinities and -0.0 kept as they are).
+    #[test]
+    fn double_conversion_edges() {
+        let d = |v: Value<'_>| match to_double(&v) {
+            Ok(Value::Double(d)) => d,
+            other => panic!("double() returned {other:?}"),
+        };
+        assert_eq!(d(Value::Int(i64::MIN)), -9_223_372_036_854_775_808.0);
+        assert_eq!(d(Value::Uint(u64::MAX)), 18_446_744_073_709_551_616.0);
+        assert!(d(Value::Double(f64::NAN)).is_nan());
+        assert_eq!(d(Value::Double(f64::INFINITY)), f64::INFINITY);
+        assert_eq!(d(Value::Double(f64::NEG_INFINITY)), f64::NEG_INFINITY);
+        assert!(d(Value::Double(-0.0)).is_sign_negative());
     }
 
     #[test]
