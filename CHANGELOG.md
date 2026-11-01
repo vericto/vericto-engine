@@ -34,8 +34,10 @@ policies (CEL, a preview feature), below.
   `int()` and `double()` were checked for the same class of bug (NaN, ±Inf,
   both ends of the range, -0.0) and already matched; deterministic tests now
   pin all three, and the generated case is kept in
-  `proptest-regressions/policy/cel/conformance.txt`. This was the intermittent
-  failure of `policy::cel::conformance::prop_subset_agrees_with_cel_rust`.
+  `proptest-regressions/policy/cel/conformance.txt`. This was one of the
+  intermittent failures of
+  `policy::cel::conformance::prop_subset_agrees_with_cel_rust` (the others are
+  cel-rust differences, under Tests).
 
 ### Performance
 
@@ -98,6 +100,12 @@ The PostgreSQL remainder over 4.6.0 is 4.7.0's libpg_query walk, unchanged here.
   `MAX_AST_DEPTH`; the boundary sweep now runs on every dialect and on the
   Snowflake-specific shapes (`QUALIFY`, `SAMPLE (n ROWS)`, `RESULT_SCAN`,
   scripting blocks). Both walks agree everywhere.
+- The CEL conformance property against cel-rust skips two known differences,
+  explicitly and only those: cel-rust 0.15.0 concatenates a map's keys onto a
+  list (`[1] + m`), where CEL defines only `list(A) + list(A)` and cel-go, like
+  the engine, reports no such overload; and it has no `@in` overload for a
+  list, map or `null` tested against a map (`dyn`), where the engine answers
+  `false` as cel-go does (cel-cpp errs like cel-rust). No engine change.
 
 ## [4.7.0] — 2026-10-31
 

@@ -17,20 +17,38 @@ use super::value::Value;
 use crate::policy::context::EvalContext;
 
 fn ours(src: &str) -> Option<Result<String, ()>> {
+    ours_detailed(src).map(|r| r.map_err(|_| ()))
+}
+
+/// [`ours`], keeping the error's detail (for [`diverges_by_design`]).
+fn ours_detailed(src: &str) -> Option<Result<String, String>> {
     let p = Program::compile(src, &BTreeMap::new()).ok()?;
     let ctx = EvalContext::new();
     let act = Activation::new(&ctx, None, "postgres");
     Some(
         super::eval::run(&p.compiled.node, &act, p.compiled.slots)
             .map(|v| render_ours(&v))
-            .map_err(|_| ()),
+            .map_err(|fault| fault.detail),
     )
 }
 
 fn theirs(src: &str) -> Result<String, ()> {
-    let p = cel::Program::compile(src).map_err(|_| ())?;
+    theirs_detailed(src).map_err(|_| ())
+}
+
+/// What went wrong on cel-rust's side (for [`diverges_by_design`]).
+enum TheirError {
+    Compile,
+    Execution(cel::ExecutionError),
+}
+
+/// [`theirs`], keeping cel-rust's error.
+fn theirs_detailed(src: &str) -> Result<String, TheirError> {
+    let p = cel::Program::compile(src).map_err(|_| TheirError::Compile)?;
     let ctx = cel::Context::default();
-    p.execute(&ctx).map(|v| render_theirs(&v)).map_err(|_| ())
+    p.execute(&ctx)
+        .map(|v| render_theirs(&v))
+        .map_err(TheirError::Execution)
 }
 
 fn num(d: f64) -> String {
@@ -187,11 +205,44 @@ fn expr() -> impl Strategy<Value = String> {
     })
 }
 
-/// Known, deliberate differences: none in the subset is accepted. A
-/// divergence found by the generator is a bug in one of the two, and is
-/// added below with its explanation once decided.
-fn diverges_by_design(_src: &str) -> bool {
-    false
+/// Known differences from cel-rust, each decided against the spec and the
+/// other implementations. A divergence the generator finds is a bug in one
+/// of the two, and is added here, as narrowly as it can be told apart, once
+/// decided.
+///
+/// - `list + map`: cel-rust 0.15.0 concatenates any iterable onto a list
+///   (`DefaultList::add` takes `rhs.as_iterable()`, so a map adds its
+///   keys: `[1] + [{'k': 1}, 1][0]` is `[1, 'k']`). The only list overload
+///   of `_+_` is `list(A) + list(A) -> list(A)` (cel-spec `doc/langdef.md`,
+///   "Standard definitions", `_+_`); cel-go (`baseList.Add`, which needs a
+///   `traits.Lister`) reports no such overload, as the engine does. Skipped
+///   only when the engine's error is exactly that one and cel-rust returns
+///   a value.
+/// - `x in map` where `x` cannot be a map key (a list, a map, `null`, only
+///   reachable through `dyn`): cel-rust 0.15.0 has no `@in` overload for it
+///   and fails with `NoSuchOverload`. The engine answers `false`, as cel-go
+///   does (`baseMap.Contains` returns `Find`'s `found`, which misses) and as
+///   the spec's parametric signature `A in map(A, B) -> bool` (cel-spec
+///   `doc/langdef.md`, "Standard definitions", `@in`) and its conformance
+///   data read a value that is no key type (`tests/simple/testdata/
+///   comparisons.textproto`, `nan_not_in_map`: `dyn(0.0/0.0) in {1: 'a',
+///   2u: 'b'}` is `false`). cel-cpp sides with cel-rust (it registers `@in`
+///   on maps for bool, int, uint, string and double keys only), so this one
+///   is a choice between the reference implementations; the engine keeps
+///   cel-go's. Skipped only when cel-rust's error is that missing `@in`
+///   overload on (list | map | null, map) and the engine returns a value.
+fn diverges_by_design(mine: &Result<String, String>, theirs: &Result<String, TheirError>) -> bool {
+    match (mine, theirs) {
+        (Err(detail), Ok(_)) => detail == "no overload for `+` on list and map",
+        (Ok(_), Err(TheirError::Execution(cel::ExecutionError::NoSuchOverload(e)))) => {
+            e.function() == "@in"
+                && matches!(
+                    e.argument_types(),
+                    [key, map] if map == "map" && matches!(key.as_str(), "list" | "map" | "null_type")
+                )
+        }
+        _ => false,
+    }
 }
 
 proptest! {
@@ -199,12 +250,59 @@ proptest! {
 
     #[test]
     fn prop_subset_agrees_with_cel_rust(src in expr()) {
-        if let Some(mine) = ours(&src) {
-            if !diverges_by_design(&src) {
-                let other = theirs(&src);
-                prop_assert_eq!(mine, other, "{}", src);
+        if let Some(mine) = ours_detailed(&src) {
+            let other = theirs_detailed(&src);
+            if !diverges_by_design(&mine, &other) {
+                prop_assert_eq!(mine.map_err(|_| ()), other.map_err(|_| ()), "{}", src);
             }
         }
+    }
+}
+
+/// The known divergences stay what they are: cel-rust still differs (a
+/// cel-rust fix makes this fail, and the skip is removed), the engine still
+/// answers as cel-go does, and nothing else is skipped.
+#[test]
+fn known_divergences_are_exactly_these() {
+    // A mixed list's element is `dyn` to the checker, which refuses
+    // `[1] + {'k': 1}` itself.
+    for (src, engine) in [
+        ("[1] + [{'k': 1}, 1][0]", Err(())),
+        ("([1, 2] + [3] + [{'k': 1, 'j': 2}, 1][0])", Err(())),
+        ("[1, 2] in [{'k': 1}, 1][0]", Ok("bool:false".to_string())),
+        (
+            "([1, 2, 3].map(x, x + 0) in [{'k': 1, 'j': 2}, 1][0])",
+            Ok("bool:false".to_string()),
+        ),
+        ("{'k': 1} in [{'k': 1}, 1][0]", Ok("bool:false".to_string())),
+        ("null in [{'k': 1}, 1][0]", Ok("bool:false".to_string())),
+        ("!([1] in [{'k': 1}, 1][0])", Ok("bool:true".to_string())),
+    ] {
+        let mine = ours_detailed(src).expect("compiles");
+        let other = theirs_detailed(src);
+        assert_eq!(mine.clone().map_err(|_| ()), engine, "{src}");
+        assert!(
+            diverges_by_design(&mine, &other),
+            "{src}: cel-rust now agrees: drop the skip"
+        );
+    }
+    // `list + list`, the other `+` errors and membership of a key type
+    // (or of a non-key type in a list) are still compared.
+    for src in [
+        "[1] + [[2], 1][0]",
+        "[{'k': 1}, 1][0] + [1]",
+        "[1] + [1, 'a'][0]",
+        "[1, 'a'][0] + [1]",
+        "'k' in [{'k': 1}, 1][0]",
+        "1.5 in [{'k': 1}, 1][0]",
+        "true in [{'k': 1}, 1][0]",
+        "[1] in [[1], 1]",
+        "null in [1, 'a']",
+    ] {
+        let mine = ours_detailed(src).expect("compiles");
+        let other = theirs_detailed(src);
+        assert!(!diverges_by_design(&mine, &other), "{src}");
+        assert_eq!(mine.map_err(|_| ()), other.map_err(|_| ()), "{src}");
     }
 }
 
