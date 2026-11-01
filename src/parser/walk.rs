@@ -2747,6 +2747,27 @@ fn same_column(left: &Expr, right: &Expr) -> bool {
     }
 }
 
+#[cfg(test)]
+fn same_column_reference(left: &Expr, right: &Expr) -> bool {
+    fn path(e: &Expr) -> Option<String> {
+        match e {
+            Expr::Identifier(id) => Some(id.value.to_ascii_lowercase()),
+            Expr::CompoundIdentifier(ids) => Some(
+                ids.iter()
+                    .map(|i| i.value.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            ),
+            Expr::Nested(inner) => path(inner),
+            _ => None,
+        }
+    }
+    match (path(left), path(right)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 fn unwrap_nested(expr: &Expr) -> &Expr {
     match expr {
         Expr::Nested(inner) => unwrap_nested(inner),
@@ -3261,3 +3282,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod equivalence;

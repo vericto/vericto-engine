@@ -649,6 +649,65 @@ impl SqlNumber {
         })
     }
 
+    /// The 4.7.0 reading, which [`SqlNumber::parse`] must reproduce exactly
+    /// (checked by `sql_number_parse_matches_reference`).
+    #[cfg(test)]
+    fn parse_reference(text: &str) -> Option<Self> {
+        let (negative, unsigned) = match text.as_bytes().first() {
+            Some(b'-') => (true, &text[1..]),
+            Some(b'+') => (false, &text[1..]),
+            _ => (false, text),
+        };
+        let mut exponent_parts = unsigned.split(['e', 'E']);
+        let mantissa = exponent_parts.next()?;
+        let exponent = exponent_parts
+            .next()
+            .map(|value| value.parse::<i128>())
+            .transpose()
+            .ok()?
+            .unwrap_or(0);
+        if exponent_parts.next().is_some()
+            || !(-(MAX_QUERY_SIZE_BYTES as i128)..=MAX_QUERY_SIZE_BYTES as i128).contains(&exponent)
+        {
+            return None;
+        }
+
+        let mut decimal_parts = mantissa.split('.');
+        let whole = decimal_parts.next()?;
+        let fraction = decimal_parts.next().unwrap_or_default();
+        if decimal_parts.next().is_some()
+            || (whole.is_empty() && fraction.is_empty())
+            || !whole
+                .bytes()
+                .chain(fraction.bytes())
+                .all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+
+        let combined = format!("{whole}{fraction}");
+        let significant = combined.trim_start_matches('0');
+        if significant.is_empty() {
+            return Some(Self {
+                negative: false,
+                digits: "0".to_string(),
+                scale: 0,
+            });
+        }
+
+        let mut digits = significant.to_string();
+        let mut scale = i128::try_from(fraction.len()).ok()?.checked_sub(exponent)?;
+        while digits.ends_with('0') {
+            digits.pop();
+            scale = scale.checked_sub(1)?;
+        }
+        Some(Self {
+            negative,
+            digits,
+            scale,
+        })
+    }
+
     fn negated(mut self) -> Self {
         if !self.is_zero() {
             self.negative = !self.negative;
