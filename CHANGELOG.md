@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.7.1] — 2026-10-31
+
+**Performance only: the per-statement cost 4.7.0 added on the sqlparser path
+(MySQL, SQL Server, Oracle, Snowflake, SQLite) is recovered.** No rule, verdict,
+severity, policy default or rule coverage changes: every statement produces the
+same records, in the same order, as in 4.7.0, and fails the same depth guard
+(`MAX_AST_DEPTH`, `AstTooDeep`) at the same point. `STANDARD_RULESET_VERSION`
+reads `standard@4.7.1`; its predicates are those of 4.7.0.
+
+### Performance
+
+- **The complete expression walk no longer runs sqlparser's generic traversal
+  over every node.** 4.7.0 walked each executed clause through the derived
+  `Visitor`, which visits every field (spans, tokens, identifiers, literals),
+  passes over the `WHERE`, the projection and `FROM` subqueries a second time
+  (already walked, then skipped) and builds the skip lists on every SELECT,
+  UPDATE, DELETE and INSERT. A targeted walk now visits the clauses and
+  expression kinds statements are made of (columns, literals, operators, `IN`,
+  `BETWEEN`, `LIKE`, `CASE`, calls and their arguments, subqueries, `VALUES`,
+  assignments, `JOIN`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT` / `OFFSET`)
+  in the generic traversal's order with its depth accounting, and hands every
+  other node to that traversal, so the coverage is unchanged. The SELECT,
+  UPDATE, DELETE and INSERT structs are destructured field by field: a field a
+  sqlparser upgrade adds fails to compile until it is classified.
+- **Fewer allocations reading constants.** An exact number literal is parsed in
+  one pass with one allocation (it built the digits twice), a comparison whose
+  left side is not a constant no longer reads its right side, `id = id` is
+  compared without building lowercase paths, and a call's record path is
+  built without `format!`. Shared with the PostgreSQL walker.
+
+Instructions per `evaluate` (standard ruleset, default policy; callgrind Ir,
+valgrind 3.19 on aarch64 Linux, the difference between 448 and 1,344
+evaluations, so setup is excluded), on the statements of the proxy's perf gate:
+
+| workload | 4.6.0 | 4.7.0 | 4.7.1 | 4.7.1 vs 4.7.0 |
+|---|---:|---:|---:|---:|
+| MySQL TPC-B (`BEGIN`, 3 × `UPDATE`, `SELECT`, `INSERT`, `COMMIT`) | 76,606 | 80,513 (+5.10%) | 76,392 (−0.28%) | −5.12% |
+| MySQL 2,000-row-result `SELECT` | 108,930 | 114,923 (+5.50%) | 108,960 (+0.03%) | −5.19% |
+| MySQL policy mix | 100,302 | 105,731 (+5.41%) | 99,062 (−1.24%) | −6.31% |
+| MySQL `SELECT 1` | 53,651 | 55,828 (+4.06%) | 53,804 (+0.29%) | −3.63% |
+| PostgreSQL TPC-B | 156,341 | 159,035 (+1.72%) | 158,565 (+1.42%) | −0.30% |
+| PostgreSQL 2,000-row-result `SELECT` | 289,149 | 294,768 (+1.94%) | 294,314 (+1.79%) | −0.15% |
+| PostgreSQL policy mix | 225,745 | 229,447 (+1.64%) | 228,995 (+1.44%) | −0.20% |
+
+Wall time on an Apple M3 Pro (median of 5 interleaved runs × 11 rounds of
+20,000 evaluations; run-to-run spread about ±3%), µs per statement: MySQL TPC-B
+6.94 / 7.33 / 7.06, 2,000-row `SELECT` 9.39 / 9.90 / 9.46, policy mix 8.85 /
+9.44 / 8.98; PostgreSQL TPC-B 11.79 / 11.88 / 11.82 (4.6.0 / 4.7.0 / 4.7.1).
+The PostgreSQL remainder over 4.6.0 is 4.7.0's libpg_query walk, unchanged here.
+
+### Tests
+
+- `parser::walk::equivalence`: the 4.7.0 walk stays in the test build as the
+  reference (`walk_rest` alone on every clause), and both walks must produce
+  identical `StatementInfo` records, `unread` note or error over the Snowflake
+  and SQLite corpora and every SQL string literal of the test suites, on all
+  six sqlparser dialects (6,276 and 9,706 statement × dialect pairs that
+  parse), 2,048 generated statements (expressions nested five deep
+  in every clause of SELECT, UPDATE, DELETE, INSERT, MERGE, SET, CTAS,
+  `EXPLAIN ANALYZE`), and depth sweeps that reach `AstTooDeep` at its exact
+  boundary. The new number parser and column comparison are checked against
+  their 4.7.0 forms on generated and edge inputs. No existing test or golden
+  file changes.
+
 ## [4.7.0] — 2026-10-31
 
 **Existing rules see the same destructive operation through more equivalent SQL
@@ -2216,7 +2280,8 @@ false positive (ENG-001) or a missed detection.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.7.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-engine/compare/v4.7.1...HEAD
+[4.7.1]: https://github.com/vericto/vericto-engine/compare/v4.7.0...v4.7.1
 [4.7.0]: https://github.com/vericto/vericto-engine/compare/v4.6.0...v4.7.0
 [4.6.0]: https://github.com/vericto/vericto-engine/compare/v4.5.0...v4.6.0
 [4.5.0]: https://github.com/vericto/vericto-engine/compare/v4.4.0...v4.5.0
