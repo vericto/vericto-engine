@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! `vericto-engine` — Deterministic SQL AST evaluation engine.
 //!
-//! This crate is the source-available core of Vericto (FSL-1.1-ALv2): it
+//! This crate is the open-source core of Vericto (AGPL-3.0-only, with a
+//! commercial license available from Vericto S.A.S.; see `LICENSING.md`): it
 //! parses SQL queries into an Abstract Syntax Tree using `pg_query`
 //! (PostgreSQL's own parser) and `sqlparser-rs`, then evaluates them against a
 //! ruleset deterministically — the same input always produces the same result,
@@ -15,7 +16,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.7.1" }
+//! vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v5.0.0" }
 //! ```
 //!
 //! ```rust

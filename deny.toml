@@ -29,10 +29,13 @@ allow = [
     "Unicode-3.0",
 ]
 confidence-threshold = 0.9
-# This crate's own license (FSL-1.1-ALv2 since 4.3.0) is allowed for this crate
-# only, so a dependency under a source-available license still fails the check.
+# This crate's own license is AGPL-3.0-only beginning with version 5.0.0;
+# earlier release terms are recorded in LICENSE_HISTORY.md. The exception is
+# limited to this crate. A dependency under copyleft or source-available terms
+# still fails: Vericto also distributes the engine commercially, so every
+# dependency must permit both distribution models.
 exceptions = [
-    { allow = ["FSL-1.1-ALv2"], crate = "vericto-engine" },
+    { allow = ["AGPL-3.0-only"], crate = "vericto-engine" },
 ]
 
 [bans]

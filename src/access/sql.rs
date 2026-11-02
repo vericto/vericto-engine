@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Access analysis over the `sqlparser` AST (MySQL, Oracle, SQL Server,
 //! Snowflake, SQLite): which statements are analysed, allowed or denied

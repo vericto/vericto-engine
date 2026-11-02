@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The targeted walk (`Fast`, 4.7.1) against the 4.7.0 walk it replaces.
 //!

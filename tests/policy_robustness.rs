@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Robustness of the policy language (in-suite, alongside the cargo-fuzz
 //! target `fuzz/fuzz_targets/policy.rs`): arbitrary expressions, documents

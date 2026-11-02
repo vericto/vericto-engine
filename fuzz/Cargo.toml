@@ -7,7 +7,7 @@ name = "vericto-engine-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
-license = "FSL-1.1-ALv2"
+license = "AGPL-3.0-only"
 
 [package.metadata]
 cargo-fuzz = true

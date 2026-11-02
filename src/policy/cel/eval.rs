@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The interpreter: runs a checked expression over one statement's facts
 //! and the host's context. A pure function of its inputs: no clock, no I/O,
