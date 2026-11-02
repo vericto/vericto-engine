@@ -160,8 +160,7 @@ jobs:
           path-to-signatures: signatures/v1.1/cla.json
           branch: cla-signatures
           # Exact logins, no wildcards: the maintainers and the bots that commit here.
-          allowlist: dependabot[bot],github-actions[bot]
-          custom-pr-sign-comment: I have read the CLA Document and I hereby sign the CLA
+          allowlist: vericto,donkan168,vericto-bot[bot],dependabot[bot],github-actions[bot]
           custom-notsigned-prcomment: >-
             Thank you for your pull request. Before it can be merged, $you need to sign the
             [Vericto Individual Contributor License Agreement](https://github.com/${{ github.repository }}/blob/main/legal/cla/1.1.md),
