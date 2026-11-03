@@ -40,10 +40,10 @@ of GitHub repository `vericto/vericto-engine`. Because the repository is
 public, the signature record may be publicly visible. GitHub also stores the
 pull request and signature comment under its own terms and privacy statement.
 
-The workflow runs in GitHub Actions using the open-source Contributor Assistant
-GitHub Action pinned to a reviewed commit. Vericto does not send this signature
-record to the hosted CLA Assistant service, SAP or Microsoft Azure. GitHub may
-process data outside Colombia, including in the United States.
+The workflow runs in GitHub Actions using a pinned version of
+`actions/github-script` and base-branch JavaScript. Vericto does not send this
+signature record to the hosted CLA Assistant service, SAP or Microsoft Azure.
+GitHub may process data outside Colombia, including in the United States.
 
 ## Retention and rights
 
