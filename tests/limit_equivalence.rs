@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Equivalence of the `rewrite_limit` rewrite (design "Business policy
 //! rules" §8.1, test 2) against real databases: for every case and every cap

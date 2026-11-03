@@ -7,7 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [4.7.1] — 2026-10-31
+### Changed
+
+- **License and major version.** Version 5.0.0 and later is available under the
+  GNU Affero General Public License, version 3 only (`AGPL-3.0-only`), or under
+  a separate commercial license from Vericto S.A.S. `LICENSE` is the official
+  AGPL text, unmodified. Versions 4.3.0 through 4.7.1 retain FSL-1.1-ALv2 and
+  its future Apache-2.0 grant; versions 4.2.0 and earlier retain Elastic-2.0.
+- `LICENSE_HISTORY.md` records the tag and SHA of the last FSL release and the
+  documented public dates used for the FSL future-license schedule. Tag
+  `v5.0.0` will identify the first AGPL release.
+- `Cargo.toml`, the fuzz crate and source headers declare `AGPL-3.0-only`.
+  `NOTICE`, `LICENSING.md`, README, CONTRIBUTING and TRADEMARKS describe the
+  new license without changing the AGPL text.
+- CLA 1.1 aligns the contribution grant with dual licensing, the actual GitHub
+  comment-signature workflow, moral-right consent, enforcement cooperation,
+  employer authorization and AI-assisted contributions. CLA 1.0 is preserved;
+  new signatures use a separate v1.1 record.
+- `THIRD_PARTY_NOTICES.md` documents direct dependencies and the release
+  procedure for binary attribution. `AI_POLICY.md` requires disclosure and
+  human review of generated material.
+- `deny.toml` permits `AGPL-3.0-only` for this crate only. Dependencies must
+  remain under reviewed permissive licenses that allow public and commercial
+  distribution.
+
+## [4.7.1] — 2026-11-01
 
 **The per-statement cost 4.7.0 added on the sqlparser path (MySQL, SQL Server,
 Oracle, Snowflake, SQLite) is recovered, and one CEL conversion is fixed.** No

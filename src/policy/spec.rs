@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The policy document: the custom-rule YAML with the policy keys (design
 //! §4.4), parsed and validated into a [`PolicySpec`].

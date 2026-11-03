@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Statement facts for policies (`stmt.*`, design §4.2): what a top-level
 //! statement reads and writes, the values it assigns, and the values its

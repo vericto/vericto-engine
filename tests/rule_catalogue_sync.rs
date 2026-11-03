@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Guard: the README's standard-rule catalogue must stay in sync with the rule
 //! codes actually implemented in `src/rules/evaluator.rs`.

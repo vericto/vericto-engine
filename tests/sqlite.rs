@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! SQLite (4.1.0, design "SQLite and Snowflake support" §3.1, §4 and §8): the
 //! dialect and what its walker reads, the 31 standard rules on SQLite (design

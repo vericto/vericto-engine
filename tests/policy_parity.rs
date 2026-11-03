@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Parity of the policy facts across parser front ends (design §17): on SQL
 //! the four dialects share, the libpg_query front end (Postgres) and the

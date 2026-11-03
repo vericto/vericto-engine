@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Authoring support (design §4.8): the save-time check of a policy
 //! document and the runner of its `tests:` fixtures. Hosts expose them

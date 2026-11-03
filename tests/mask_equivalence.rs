@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Equivalence of the VERICTO-085 mask rewrite (design §12): run the original
 //! and the rewritten query against the same Postgres fixture and require that

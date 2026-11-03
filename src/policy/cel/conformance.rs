@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Conformance of the CEL subset against cel-rust (`cel` =0.15.0, a
 //! test-only dependency): generated context-free expressions over the

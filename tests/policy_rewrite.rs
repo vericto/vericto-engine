@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! `rewrite_limit` end to end (design "Business policy rules" §8.1, runtime
 //! controls VERICTO-102): the outcome hosts see, its composition with the
