@@ -33,7 +33,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v5.0.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v5.1.0" }
 ```
 
 ### Quick example
@@ -98,8 +98,8 @@ severity to, and `engine_driven` for VERICTO-085, 086 and 087, which the policy
 drives and the rules slice neither enables nor disables. A test keeps the table
 equal to the catalogue below.
 
-`ENGINE_VERSION` is this crate's version (`"5.0.0"`) and
-`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@5.0.0"`):
+`ENGINE_VERSION` is this crate's version (`"5.1.0"`) and
+`STANDARD_RULESET_VERSION` is `standard@<engine version>` (`"standard@5.1.0"`):
 a built-in rule's predicate lives in the engine, so what the standard ruleset
 detects changes with the engine version. Print them with a verdict to say what
 it was evaluated with.
@@ -171,6 +171,17 @@ already ran every rule and simply discarded the rest.
 | Snowflake  | `sqlparser-rs` 0.63 (`SnowflakeDialect`) + keyword pre-classifier and allowlist | host's `parse_error` (fail-open: flag); see [Snowflake](#snowflake) |
 | SQLite     | `sqlparser-rs` 0.63 (`SQLiteDialect`) + `PRAGMA` grammar, keyword pre-classifier and allowlist | host's `parse_error` (fail-open: flag); see [SQLite](#sqlite) |
 
+**SQL Server `DELETE TOP (n)` / `UPDATE TOP (n)`.** sqlparser does not read
+`TOP` after `DELETE` / `UPDATE`, so since 5.1.0 the SQL Server parser reads the
+clause itself and parses the rest of the statement: `DELETE TOP (10) FROM t`
+was a parse error, and `UPDATE TOP (10) t SET …` was read as an update of a
+table function named `TOP`. A bound is not a filter, so
+`DELETE TOP (10) FROM t` with no `WHERE` is VERICTO-001, exactly like
+`DELETE FROM t LIMIT 10` on MySQL; `DELETE TOP (0)` is VERICTO-002, like
+`LIMIT 0`. The parentheses are required (as in T-SQL): `DELETE TOP 10` stays
+a parse error. T-SQL's optional `FROM` is read only after a `TOP` clause:
+`DELETE t WHERE …` is still a parse error.
+
 `Dialect::parse_dialect` accepts `postgres`/`postgresql`, `mysql`, `oracle`,
 `mssql`/`sqlserver`/`tsql`, `snowflake` and `sqlite`/`sqlite3`.
 
@@ -204,12 +215,12 @@ Low/Informational → Monitor).
 | Code | Name | What it detects |
 |---|---|---|
 | VERICTO-001 | DELETE without WHERE | A `DELETE` with no `WHERE` — removes every row of the table. |
-| VERICTO-003 | DELETE with always-true WHERE | A `DELETE` whose `WHERE` is trivially true (`1=1`, `id = id`, `NOT FALSE`, `WHERE 1`, `NULL IS NULL`, `1 IS NOT NULL`, `TRUE IS TRUE`, `1 IS DISTINCT FROM NULL`, `1 IN (1,NULL)`, `1 BETWEEN 0 AND 2`, `'x' LIKE '%'`) — semantically WHERE-less. See [what counts as always-true](#what-counts-as-always-true). |
+| VERICTO-003 | DELETE with always-true WHERE | A `DELETE` whose `WHERE` is trivially true (`1=1`, `id = id`, `NOT FALSE`, `WHERE 1`, `NULL IS NULL`, `1 IS NOT NULL`, `TRUE IS TRUE`, `1 IS DISTINCT FROM NULL`, `1 IN (1,NULL)`, `1 BETWEEN 0 AND 2`, `'x' LIKE '%'`) or keeps every row of its own table (`id IN (SELECT id FROM <same table>)`, `EXISTS (SELECT 1 FROM <same table>)`, `x IS NULL OR x IS NOT NULL`) — semantically WHERE-less. See [what counts as always-true](#what-counts-as-always-true). |
 | VERICTO-010 | DROP TABLE / DATABASE | `DROP TABLE` or `DROP DATABASE` — irreversible loss of a relation/database. Excludes `INDEX` (VERICTO-013) and `SCHEMA` (VERICTO-012). |
-| VERICTO-011 | TRUNCATE TABLE | `TRUNCATE` — empties a table, non-transactional/unfiltered by design. |
-| VERICTO-012 | DROP SCHEMA | `DROP SCHEMA` — drops a whole namespace and everything in it. |
-| VERICTO-030 | UPDATE without WHERE (primary tables) | An `UPDATE` with no effective `WHERE`. Same predicate as VERICTO-042; separate code so a workspace can scope/severity it independently. |
-| VERICTO-042 | UPDATE without WHERE | An `UPDATE` with no `WHERE` (or an always-true one) — rewrites every row. |
+| VERICTO-011 | TRUNCATE TABLE | `TRUNCATE` — empties a table, non-transactional/unfiltered by design. DataMutation since 5.1.0: a CI channel's `schema_migration_cap` no longer softens it. |
+| VERICTO-012 | DROP SCHEMA / DATABASE | `DROP SCHEMA` or `DROP DATABASE` — drops a whole namespace and everything in it. `DROP DATABASE` since 5.1.0 (it also still matches VERICTO-010). DataMutation since 5.1.0: a CI channel's `schema_migration_cap` no longer softens it. |
+| VERICTO-030 | UPDATE without WHERE (primary tables) | An `UPDATE` with no effective `WHERE` (none, an always-true one, or one that keeps every row of its own table). Same predicate as VERICTO-042; separate code so a workspace can scope/severity it independently. |
+| VERICTO-042 | UPDATE without WHERE | An `UPDATE` with no `WHERE` (or an always-true one, or one that keeps every row of its own table) — rewrites every row. |
 | VERICTO-080 | COPY … TO/FROM PROGRAM | `COPY … PROGRAM '…'` runs a shell command on the database host — remote code execution / data-exfiltration channel. (PostgreSQL.) |
 | VERICTO-081 | DO anonymous code block | `DO $$ … $$` runs an arbitrary PL/pgSQL body that can hide any DML/DDL; opaque to the SQL parser. (PostgreSQL.) |
 | VERICTO-086 | SQL text MySQL and the engine would read differently | MySQL text the engine cannot resolve to one statement with certainty, because of differences between MySQL's and the engine's reading of comments and string escapes. Every rule is evaluated on the statement MySQL executes (comments read by MySQL's rules, string literals under both string-escape modes, the strictest outcome kept); this blocks what that cannot settle. Not enabled through the rules slice, not a parse error: always blocks (flags under `monitor_mode`). (MySQL.) |
@@ -223,7 +234,7 @@ Low/Informational → Monitor).
 
 | Code | Name | What it detects |
 |---|---|---|
-| VERICTO-002 | DELETE with LIMIT 0 | A `DELETE … LIMIT 0` — deletes nothing, usually a misconfigured scope. (MySQL/SQLite; no `DELETE … LIMIT` syntax on PostgreSQL.) |
+| VERICTO-002 | DELETE with LIMIT 0 | A `DELETE … LIMIT 0` (SQL Server: `DELETE TOP (0)`) — deletes nothing, usually a misconfigured scope. (MySQL/SQLite/SQL Server; no `DELETE … LIMIT` syntax on PostgreSQL.) |
 | VERICTO-013 | DROP INDEX without IF EXISTS | `DROP INDEX` lacking `IF EXISTS` — errors if the index is missing, breaking scripts. |
 | VERICTO-015 | ALTER TABLE DROP COLUMN | Drops a column — irreversible data loss. |
 | VERICTO-016 | ALTER TABLE RENAME | Renames a table or column — breaks any code referencing the old name. |
@@ -294,6 +305,43 @@ constant makes the OR true even if another item is a column or `NULL`.
 Plus one deliberate exception: the column self-comparison `id = id`, the canonical
 trick for neutralising a `WHERE`, which has no legitimate use.
 
+### Whole-table predicates (DELETE / UPDATE, since 5.1.0)
+
+A `DELETE` or `UPDATE` `WHERE` can also keep every row through the statement's
+own table. VERICTO-003/030/042 read these as always-true too (the
+`ast_node_path` says `WhereClause = ALWAYS_TRUE`); VERICTO-090 and VERICTO-040
+do not, since they have no target to compare with.
+
+| Form | Example | Why every row |
+|---|---|---|
+| membership in the same table's unfiltered column | `DELETE FROM users WHERE id IN (SELECT id FROM users)`, `= ANY (…)` | every row is in its own table; a NULL `id` is not matched, as with `id = id` |
+| `EXISTS` over the same table, unfiltered | `DELETE FROM users WHERE EXISTS (SELECT 1 FROM users)` | the table has a row whenever there is one to delete |
+| a column's complementary `IS` tests | `WHERE email IS NOT NULL OR email IS NULL`, `flag IS TRUE OR flag IS NOT TRUE` | `IS` tests are two-valued: one of the pair holds for every row |
+| `AND` of such operands, `OR` with any | `WHERE 1 = 1 AND id IN (SELECT id FROM users)` | |
+
+It is decided only for a statement with one plain target and no other source:
+no `USING` (`DELETE`), no `FROM` (`UPDATE`), no multi-table form, no `WITH`
+of its own and not nested in a CTE (a CTE can shadow the table name). The
+subquery must read the same table (same schema, same `ONLY` on PostgreSQL)
+with nothing that drops rows: no `WHERE`, `GROUP BY`, `HAVING`, window,
+`LIMIT` / `OFFSET` / `TOP` / `FETCH`, join, set operation, CTE, `DISTINCT ON`,
+lock clause (`SKIP LOCKED`), sample, partition selection or time travel; the
+`IN` side projects exactly the same column, unqualified or qualified by the
+table's visible name, and an `EXISTS` projects only `*`, literals or columns
+(a set-returning function can produce no row). Identifiers compare as the
+dialect folds them: unquoted ones up to ASCII case (exactly on MySQL, whose
+table names can be case-sensitive), quoted ones exactly, and a quoted name
+never equals an unquoted one. So these stay real filters:
+
+```sql
+DELETE FROM users WHERE id IN (SELECT id FROM users WHERE banned)   -- filtered subquery
+DELETE FROM users WHERE id IN (SELECT user_id FROM orders)          -- another table
+DELETE FROM users WHERE id IN (SELECT manager_id FROM users)        -- another column
+DELETE FROM users u WHERE id IN (SELECT id FROM users x WHERE x.id = u.id)  -- correlated
+DELETE FROM users WHERE id NOT IN (SELECT id FROM users)            -- deletes nothing
+DELETE FROM users WHERE a IS NULL OR b IS NOT NULL                  -- two columns
+```
+
 **SQLite** reads a text value as a number in a boolean context (its numeric
 prefix: `'1abc'` is 1), so on SQLite a string literal with a non-zero numeric
 prefix is always-true too (`WHERE '1abc'`, `OR '1'`), and so is a double-quoted
@@ -358,8 +406,8 @@ Every built-in code carries a static [`RuleClass`](src/rules/engine.rs) — the
 
 | Class | Codes | What it covers |
 |---|---|---|
-| `SchemaMigration` | 010–019, 094, 099 | DROP TABLE/DATABASE/SCHEMA, TRUNCATE, ALTER TABLE, DROP INDEX, DROP TRIGGER, Snowflake recovery reduced, SQLite safety pragmas. Destructive against a live database, but normal in a versioned migration. |
-| `DataMutation` | 001, 002, 003, 030, 031, 033, 040, 042, 083, 084 | Data mutation without adequate scope. Dangerous on *any* channel — a WHERE-less DELETE is never intended, even in a migration. |
+| `SchemaMigration` | 010, 013, 015–019, 094, 099 | DROP TABLE, ALTER TABLE, DROP INDEX, DROP TRIGGER, Snowflake recovery reduced, SQLite safety pragmas. Destructive against a live database, but normal in a versioned migration. |
+| `DataMutation` | 001, 002, 003, 011, 012, 030, 031, 033, 040, 042, 083, 084 | Data mutation without adequate scope, TRUNCATE and DROP SCHEMA / DATABASE included. Dangerous on *any* channel — a WHERE-less DELETE is never intended, even in a migration, and neither is its TRUNCATE equivalent or the drop of a whole namespace. |
 | `Security` | 070, 080, 081, 082, 085, 086, 087, 090, 091–093, 096–098, 100, 101 | Injection tautologies, `COPY … PROGRAM`, `DO` blocks, GRANT/REVOKE, sleep-based probing, reads of sensitive columns, MySQL text read differently, access outside an agent's allowlist, Snowflake unloads, external access, shares, persistent code and role switches, SQLite `ATTACH`, native-code functions and `VACUUM INTO`. |
 | `Performance` | 050, 051, 060, 061, 095 | Best-practice / performance hints, Snowflake warehouse cost. Advisory. |
 
@@ -383,7 +431,20 @@ let ci = EnforcementPolicy {
 ```
 
 Under that policy `DROP TABLE users` resolves to `Flag` while
-`DELETE FROM users` still resolves to `Block`. The cap is applied as
+`DELETE FROM users` still resolves to `Block`, and so do `TRUNCATE users` and
+`DROP SCHEMA` / `DROP DATABASE` since 5.1.0.
+
+**Why TRUNCATE and DROP SCHEMA / DATABASE left the class (5.1.0).** Until
+5.0.0 VERICTO-011 and VERICTO-012 were `SchemaMigration`, so every CI channel
+let them pass as a Flag (exit 0 in `vericto check`). The cap exists because a
+versioned migration legitimately creates, alters and drops *tables*. A
+`TRUNCATE` is not a schema change: it is a `DELETE` without `WHERE`
+(VERICTO-001, which the cap never softened) that most engines cannot roll back,
+and dropping a schema or a database destroys every table in it at once. A
+migration that really does either is an explicit, reviewable exception — an
+inline ignore in the file, a workspace severity override — rather than
+something every CI check lets through. A host that wants the 5.0 behaviour
+back sets VERICTO-011 / 012 to a non-blocking severity in its catalogue. The cap is applied as
 `action.min(cap)` — a **ceiling, never a floor**, so it can only ever *lower* an
 action and can never make a channel more aggressive than the base policy. Left
 as `None` (the default) it has no effect at all, which is also how older

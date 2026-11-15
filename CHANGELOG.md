@@ -7,6 +7,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.0] — 2026-11-15
+
+**Statements that empty, drop or rewrite every row with no scope are caught in
+three more forms, and CI channels no longer let TRUNCATE and DROP SCHEMA /
+DATABASE through.** A minor release, as 3.3.0 and 4.2.0 were: no API changes,
+but enforcement changes. `STANDARD_RULESET_VERSION` reads `standard@5.1.0`.
+
+### Behaviour changes
+
+- **This release blocks statements that 5.0.0 allowed or only flagged.**
+  Nothing 5.0.0 blocked is allowed now.
+  - Under a CI channel's `schema_migration_cap` (`vericto check` online and
+    offline, the `ci` profile of `vericto serve`, vericto-dbt), `TRUNCATE`,
+    `DROP SCHEMA` and `DROP DATABASE` resolve to Block instead of Flag: a CI
+    check that contained one and exited `0` now exits `1`. Without a cap
+    (runtime channels, the proxy) they already blocked.
+  - On every channel, a `DELETE` / `UPDATE` whose `WHERE` keeps every row of
+    its own table (below) blocks like one with no `WHERE`.
+  - On SQL Server, `DELETE TOP (n)` was a parse error (allowed and reported
+    under the default `parse_error`); it is now evaluated, so without `WHERE`
+    it blocks (VERICTO-001).
+  - Escape hatches: a host gives VERICTO-011 / 012 a non-blocking severity in
+    its catalogue; in `vericto check`, an inline
+    `-- vericto:ignore[VERICTO-011] <reason>` in the migration file.
+
+### Changed
+
+- **TRUNCATE (VERICTO-011) and DROP SCHEMA (VERICTO-012) are `DataMutation`,
+  no longer `SchemaMigration`.** A CI channel's `schema_migration_cap` softens
+  `SchemaMigration` rules to a Flag because versioned migrations create, alter
+  and drop tables. TRUNCATE is not a schema change: it is a `DELETE` without
+  `WHERE` (VERICTO-001, which the cap never softened) that most engines cannot
+  roll back, and DROP SCHEMA destroys every table of a namespace at once. Under
+  `schema_migration_cap: Some(Flag)` both now resolve to Block. DROP TABLE
+  (VERICTO-010), ALTER TABLE, DROP INDEX, DROP TRIGGER and the Snowflake /
+  SQLite schema rules stay `SchemaMigration`. A host that wants the 5.0
+  behaviour back gives VERICTO-011 / 012 a non-blocking severity in its
+  catalogue; a migration that really truncates is an explicit, reviewable
+  exception (an inline ignore in `vericto check`). Without a cap (runtime
+  channels, the proxy) nothing changes: both already blocked.
+- **VERICTO-012 also covers DROP DATABASE** ("DROP SCHEMA / DATABASE"), on
+  PostgreSQL, MySQL, SQL Server and Snowflake. DROP DATABASE was VERICTO-010's
+  only, so a CI cap softened it like a DROP TABLE. It still matches
+  VERICTO-010 as well, so a catalogue that enables only 010 keeps seeing it;
+  under a CI cap the evaluation blocks with 012 and lists the softened 010
+  after it, and without a cap the reported rule stays 010 (same action and
+  severity, lowest code). MySQL reads `DROP SCHEMA` and `DROP DATABASE` as
+  the same statement.
+
+### Added
+
+- **Whole-table `WHERE` clauses are always-true for VERICTO-003 / 030 / 042.**
+  A `DELETE` / `UPDATE` whose `WHERE` keeps every row of its own target was
+  allowed:
+  - `id IN (SELECT id FROM users)` / `id = ANY (SELECT id FROM users)` on
+    `users` itself, with no filter in the subquery (every row is a member of
+    its own table; a NULL `id` is not matched, exactly as with the `id = id`
+    already reported);
+  - `EXISTS (SELECT 1 FROM users)` on `users` itself;
+  - complementary `IS` tests on one column, anywhere in an `OR`:
+    `email IS NOT NULL OR email IS NULL`, `flag IS TRUE OR flag IS NOT TRUE`
+    (the `IS [NOT] FALSE` / `UNKNOWN` pairs too);
+  - `AND` of such operands (and constant tautologies), `OR` with any.
+  They report `WhereClause = ALWAYS_TRUE`, and a CI cap does not soften them
+  (`DataMutation`). Decided from the statement alone, on both walkers (all six
+  dialects), and only where nothing else can change the rows: one plain
+  target, no `USING` / `FROM` source, no `WITH` of its own and not nested in a
+  CTE (a CTE can shadow the table name); a subquery over the same table and
+  schema (same `ONLY` on PostgreSQL) with no `WHERE`, `GROUP BY`, `HAVING`,
+  window, `LIMIT` / `OFFSET` / `TOP` / `FETCH`, join, set operation, CTE,
+  `DISTINCT ON`, lock clause (`SKIP LOCKED`), sample, partition selection or
+  time travel, projecting the same column. Identifiers compare as the dialect
+  folds them (exactly on MySQL, whose table names can be case-sensitive; a
+  quoted name never equals an unquoted one). A filtered or correlated
+  subquery, another table, another column, `NOT IN` / `NOT EXISTS`, and
+  `a IS NULL OR b IS NOT NULL` stay real filters; tests pin each.
+  VERICTO-090, VERICTO-040 and the CEL fact `stmt.where_always_true` are
+  unchanged (they have no target to compare with).
+
+### Fixed
+
+- **SQL Server `DELETE TOP (n)` and `UPDATE TOP (n)` parse.** sqlparser (0.63,
+  and 0.64) does not read `TOP` after `DELETE` / `UPDATE`:
+  `DELETE TOP (10) FROM t` was a parse error (allowed and reported under the
+  default `parse_error`), and `UPDATE TOP (10) t SET …` parsed as an update of
+  a table function named `TOP`, so agent allowlists (VERICTO-087), sensitive
+  columns and the suggested fix read a table `TOP` instead of `t`. The SQL
+  Server parser now finds the clause with the T-SQL tokenizer (never inside a
+  string, comment or quoted name), blanks it out with as many spaces (so every
+  location is unchanged; `FROM` takes its place when the optional `FROM` was
+  left out) and parses the rest. The row count is recorded as `DELETE … LIMIT
+  n` is on MySQL: a bound is not a filter, so `DELETE TOP (10) FROM t` with no
+  `WHERE` is VERICTO-001, and `DELETE TOP (0)` is VERICTO-002. `TOP (n)
+  PERCENT` and a non-literal count record no row count. `DELETE TOP 10`
+  (without the parentheses T-SQL requires) stays a parse error, and so does
+  `DELETE t WHERE …` without `TOP` (T-SQL's optional `FROM`).
+
+### Tests
+
+- `tests/unscoped_destruction.rs`: the CI cap and 011 / 012 / DROP DATABASE on
+  every dialect, the whole-table forms and the filters that must stay allowed
+  on every dialect, and `DELETE TOP` against MySQL's `DELETE … LIMIT`.
+  Walker-level tests in `parser/walk/whole_table.rs`,
+  `parser/pg_ast/whole_table.rs` and `parser/mssql.rs`. `tests/audit.rs`'s
+  ENG-004 lock now expects VERICTO-010 and 012 for DROP DATABASE.
+
+## [5.0.0] — 2026-11-03
+
 ### Changed
 
 - **License and major version.** Version 5.0.0 and later is available under the

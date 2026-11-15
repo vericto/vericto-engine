@@ -125,10 +125,19 @@ fn evaluate_builtin(rule: &Rule, parsed: &ParsedQuery) -> Option<Violation> {
         "VERICTO-011" => find(stmts, |s| s.kind == StatementKind::Truncate)
             .map(|s| violation(rule, s, suggest_truncate(s))),
 
-        // VERICTO-012: DROP SCHEMA specifically.
+        // VERICTO-012: DROP SCHEMA / DROP DATABASE — a whole namespace and
+        // every table in it. DROP DATABASE was VERICTO-010's alone until 5.1.0;
+        // it still matches VERICTO-010 (a workspace that enables only 010 keeps
+        // seeing it), and now also this rule, whose class (DataMutation) no CI
+        // cap softens. MySQL reads `DROP SCHEMA` and `DROP DATABASE` as the
+        // same statement, so the two belonging to one rule is also MySQL's
+        // reading.
         "VERICTO-012" => find(stmts, |s| {
             s.kind == StatementKind::Drop
-                && matches!(s.drop_object, Some(DropObjectKind::Schema))
+                && matches!(
+                    s.drop_object,
+                    Some(DropObjectKind::Schema) | Some(DropObjectKind::Database)
+                )
         })
         .map(|s| violation(rule, s, Some(suggest_migration()))),
 
@@ -1056,6 +1065,36 @@ mod tests {
     fn vericto_012_blocks_drop_schema() {
         let p = parse("DROP SCHEMA analytics CASCADE", Dialect::Postgres);
         assert!(evaluate_rule(&make_rule("VERICTO-012"), &p).is_some());
+    }
+
+    /// Since 5.1.0 VERICTO-012 also covers DROP DATABASE, on every dialect
+    /// that has it, and VERICTO-010 keeps matching it as before.
+    #[test]
+    fn vericto_012_blocks_drop_database_and_010_still_matches() {
+        for (sql, d) in [
+            ("DROP DATABASE prod", Dialect::Postgres),
+            ("DROP DATABASE IF EXISTS prod", Dialect::Postgres),
+            ("DROP DATABASE prod", Dialect::Mysql),
+            ("DROP SCHEMA prod", Dialect::Mysql),
+            ("DROP DATABASE prod", Dialect::MsSql),
+            ("DROP DATABASE prod", Dialect::Snowflake),
+        ] {
+            let p = parse(sql, d);
+            assert!(
+                evaluate_rule(&make_rule("VERICTO-012"), &p).is_some(),
+                "{d:?}: {sql}"
+            );
+        }
+        let p = parse("DROP DATABASE prod", Dialect::Postgres);
+        assert!(evaluate_rule(&make_rule("VERICTO-010"), &p).is_some());
+        // Neither a table nor an index is a namespace.
+        for sql in ["DROP TABLE users", "DROP INDEX idx", "DROP VIEW v"] {
+            let p = parse(sql, Dialect::Postgres);
+            assert!(
+                evaluate_rule(&make_rule("VERICTO-012"), &p).is_none(),
+                "{sql}"
+            );
+        }
     }
 
     // ── VERICTO-013 ──────────────────────────────────────────────────────────

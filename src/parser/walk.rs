@@ -44,6 +44,28 @@ pub(crate) fn parse_text<D: SqlDialect>(
     sql: &str,
     original: &str,
 ) -> Result<ParsedQuery> {
+    parse_text_bounded(dialect, which, sql, original, &[])
+}
+
+/// A row bound the text carried in a form sqlparser does not read, removed
+/// before parsing: SQL Server's `DELETE TOP (n)` (`parser::mssql`). `keyword`
+/// is where the statement's `DELETE` starts, as the tokenizer locates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowBound {
+    pub(crate) keyword: sqlparser::tokenizer::Location,
+    pub(crate) rows: i64,
+}
+
+/// [`parse_text`], recording each `bounds` entry as the row bound of the
+/// top-level `DELETE` that starts at its `keyword` (as `DELETE … LIMIT n`
+/// is recorded: VERICTO-002 reads it).
+pub(crate) fn parse_text_bounded<D: SqlDialect>(
+    dialect: &D,
+    which: crate::parser::Dialect,
+    sql: &str,
+    original: &str,
+    bounds: &[RowBound],
+) -> Result<ParsedQuery> {
     // Before the parser recurses on this string. `parse_sql` descends recursively,
     // so deeply nested input overflows the stack inside sqlparser — which aborts the
     // process rather than returning an error we could map. See
@@ -56,7 +78,7 @@ pub(crate) fn parse_text<D: SqlDialect>(
         // Temporary, until sqlparser reads it (see the function).
         crate::parser::resolve_snowflake_order_by_all(&mut statements);
     }
-    from_statements(statements, which, original)
+    from_statements_bounded(statements, which, original, bounds)
 }
 
 /// Walks statements already parsed (or, for the SQLite `PRAGMA` forms
@@ -67,6 +89,15 @@ pub(crate) fn from_statements(
     which: crate::parser::Dialect,
     original: &str,
 ) -> Result<ParsedQuery> {
+    from_statements_bounded(statements, which, original, &[])
+}
+
+fn from_statements_bounded(
+    statements: Vec<Statement>,
+    which: crate::parser::Dialect,
+    original: &str,
+    bounds: &[RowBound],
+) -> Result<ParsedQuery> {
     // A statement kind sqlparser 0.52 rejected still resolves as the parse
     // error it was (see `not_analysed`).
     if let Some(kind) = statements.iter().find_map(|s| not_analysed(s, which)) {
@@ -75,15 +106,30 @@ pub(crate) fn from_statements(
         )));
     }
 
-    from_statements_cx(statements, Cx::new(which), original)
+    from_statements_cx(statements, Cx::new(which), original, bounds)
 }
 
 /// [`from_statements`] under a given walk configuration.
-fn from_statements_cx(statements: Vec<Statement>, cx: Cx, original: &str) -> Result<ParsedQuery> {
+fn from_statements_cx(
+    statements: Vec<Statement>,
+    cx: Cx,
+    original: &str,
+    bounds: &[RowBound],
+) -> Result<ParsedQuery> {
     let which = cx.dialect;
     let mut collected: Vec<StatementInfo> = Vec::new();
     for stmt in &statements {
+        let first = collected.len();
         walk_statement(stmt, false, 0, cx, &mut collected)?;
+        // The statement's own record is the first one its walk pushes.
+        if let (Statement::Delete(d), Some(info)) = (stmt, collected.get_mut(first)) {
+            let at = d.delete_token.0.span.start;
+            if let Some(b) = bounds.iter().find(|b| b.keyword == at) {
+                if info.kind == StatementKind::Delete && !info.is_nested {
+                    info.delete_limit = Some(b.rows);
+                }
+            }
+        }
     }
     let unread = if cx.snowflake() {
         statements
@@ -517,7 +563,12 @@ fn walk_statement(
     match stmt {
         // ── DELETE ─────────────────────────────────────────────────────────
         Statement::Delete(delete) => {
-            let presence = where_presence(delete.selection.as_ref(), cx.dialect);
+            let presence = dml_where_presence(
+                delete.selection.as_ref(),
+                whole_table::delete_target(delete),
+                is_nested,
+                cx.dialect,
+            );
             let relation = relation_from_delete(delete);
             let delete_limit = delete.limit.as_ref().and_then(expr_as_i64);
             let tautology = delete
@@ -562,7 +613,12 @@ fn walk_statement(
             let sqlparser::ast::Update {
                 selection, table, ..
             } = update;
-            let presence = where_presence(selection.as_ref(), cx.dialect);
+            let presence = dml_where_presence(
+                selection.as_ref(),
+                whole_table::update_target(update),
+                is_nested,
+                cx.dialect,
+            );
             let relation = relation_from_table_with_joins(table);
             let tautology = selection
                 .as_ref()
@@ -2568,6 +2624,30 @@ fn walk_with_from_ctes(
     Ok(())
 }
 
+/// [`where_presence`] of a `DELETE` / `UPDATE`, which also reads a `WHERE`
+/// that keeps every row of the statement's own target as always-true
+/// ([`whole_table`]). Decided only for a top-level statement with one plain
+/// target and no other source (`target` is `None` otherwise): inside a CTE an
+/// enclosing `WITH` can shadow the table name.
+fn dml_where_presence(
+    selection: Option<&Expr>,
+    target: Option<whole_table::Target<'_>>,
+    is_nested: bool,
+    dialect: Dialect,
+) -> WherePresence {
+    match where_presence(selection, dialect) {
+        WherePresence::Present
+            if !is_nested
+                && target.is_some_and(|t| {
+                    selection.is_some_and(|w| whole_table::covers_every_row(w, &t, dialect))
+                }) =>
+        {
+            WherePresence::AlwaysTrue
+        }
+        presence => presence,
+    }
+}
+
 pub(crate) fn where_presence(selection: Option<&Expr>, dialect: Dialect) -> WherePresence {
     match selection {
         None => WherePresence::Absent,
@@ -3285,3 +3365,5 @@ mod tests {
 
 #[cfg(test)]
 mod equivalence;
+
+mod whole_table;

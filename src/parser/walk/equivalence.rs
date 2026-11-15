@@ -42,7 +42,7 @@ fn dialects() -> [(Box<dyn SqlDialect>, Dialect); 6] {
 /// unread note, or the error.
 fn walk(statements: Vec<Statement>, dialect: Dialect, sql: &str, reference: bool) -> String {
     let cx = Cx { dialect, reference };
-    match from_statements_cx(statements, cx, sql) {
+    match from_statements_cx(statements, cx, sql, &[]) {
         Ok(parsed) => format!("{:?} unread={:?}", parsed.statements, parsed.unread),
         Err(e) => format!("error: {e:?}"),
     }
