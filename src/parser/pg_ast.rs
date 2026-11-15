@@ -63,7 +63,11 @@ fn walk_node(
 
     match node {
         NodeEnum::DeleteStmt(stmt) => {
-            let presence = where_presence(stmt.where_clause.as_deref());
+            let presence = dml_where_presence(
+                stmt.where_clause.as_deref(),
+                stmt.relation.as_ref(),
+                is_nested || stmt.with_clause.is_some() || !stmt.using_clause.is_empty(),
+            );
             out.push(StatementInfo {
                 kind: StatementKind::Delete,
                 relation: relname(stmt.relation.as_ref()),
@@ -83,7 +87,11 @@ fn walk_node(
         }
 
         NodeEnum::UpdateStmt(stmt) => {
-            let presence = where_presence(stmt.where_clause.as_deref());
+            let presence = dml_where_presence(
+                stmt.where_clause.as_deref(),
+                stmt.relation.as_ref(),
+                is_nested || stmt.with_clause.is_some() || !stmt.from_clause.is_empty(),
+            );
             out.push(StatementInfo {
                 kind: StatementKind::Update,
                 relation: relname(stmt.relation.as_ref()),
@@ -742,6 +750,33 @@ fn func_call_name(funcname: &[Node]) -> Option<String> {
         _ => None,
     })
 }
+
+/// [`where_presence`] of a `DELETE` / `UPDATE`, which also reads a `WHERE`
+/// that keeps every row of the statement's own target as always-true
+/// ([`whole_table`]). Not decided (`undecided`) for a statement nested in a
+/// CTE or carrying its own `WITH` (a CTE can shadow the table name), or
+/// reading another source through `USING` / `FROM`.
+fn dml_where_presence(
+    where_clause: Option<&Node>,
+    target: Option<&pg_query::protobuf::RangeVar>,
+    undecided: bool,
+) -> WherePresence {
+    match where_presence(where_clause) {
+        WherePresence::Present
+            if !undecided
+                && target.is_some_and(|t| {
+                    where_clause
+                        .and_then(|w| w.node.as_ref())
+                        .is_some_and(|w| whole_table::covers_every_row(w, t))
+                }) =>
+        {
+            WherePresence::AlwaysTrue
+        }
+        presence => presence,
+    }
+}
+
+mod whole_table;
 
 /// Determine WHERE clause state from a protobuf node.
 pub(crate) fn where_presence(where_clause: Option<&Node>) -> WherePresence {

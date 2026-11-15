@@ -74,13 +74,16 @@ impl Severity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleClass {
-    /// Schema/DDL changes: DROP TABLE/DATABASE/SCHEMA, TRUNCATE, ALTER TABLE,
-    /// DROP INDEX, DROP TRIGGER. Destructive against a live DB, but normal in a
-    /// versioned migration — the class a CI channel may want to soften to Flag.
+    /// Schema/DDL changes: DROP TABLE, ALTER TABLE, DROP INDEX, DROP TRIGGER.
+    /// Destructive against a live DB, but normal in a versioned migration — the
+    /// class a CI channel may want to soften to Flag.
     SchemaMigration,
     /// Data mutation without adequate scope: DELETE/UPDATE without WHERE,
-    /// INSERT..SELECT / CREATE TABLE AS with no filter, MERGE. Dangerous on
-    /// *any* channel — a WHERE-less DELETE is never intended, even in a migration.
+    /// INSERT..SELECT / CREATE TABLE AS with no filter, MERGE, and the
+    /// statements that empty or destroy more than one table's rows at once
+    /// with no scope at all: TRUNCATE and DROP SCHEMA / DATABASE (since 5.1.0).
+    /// Dangerous on *any* channel — a WHERE-less DELETE is never intended, even
+    /// in a migration, and neither is its TRUNCATE equivalent.
     DataMutation,
     /// Security-sensitive: SQL-injection tautologies, COPY..PROGRAM, DO blocks,
     /// GRANT/REVOKE, sleep-based probing. Never softened by channel.
@@ -97,15 +100,22 @@ impl RuleClass {
     pub fn for_code(code: &str) -> RuleClass {
         match code {
             // Schema / DDL
-            "VERICTO-010" | "VERICTO-011" | "VERICTO-012" | "VERICTO-013" | "VERICTO-015"
-            | "VERICTO-016" | "VERICTO-017" | "VERICTO-018" | "VERICTO-019" => {
-                RuleClass::SchemaMigration
-            }
+            "VERICTO-010" | "VERICTO-013" | "VERICTO-015" | "VERICTO-016" | "VERICTO-017"
+            | "VERICTO-018" | "VERICTO-019" => RuleClass::SchemaMigration,
             // Data mutation (destructive DML)
             "VERICTO-001" | "VERICTO-002" | "VERICTO-003" | "VERICTO-030" | "VERICTO-031"
             | "VERICTO-033" | "VERICTO-040" | "VERICTO-042" | "VERICTO-083" | "VERICTO-084" => {
                 RuleClass::DataMutation
             }
+            // TRUNCATE (VERICTO-011) and DROP SCHEMA / DATABASE (VERICTO-012)
+            // were SchemaMigration until 5.1.0, so a CI channel's cap let them
+            // pass as a Flag. Neither is a schema change a migration needs:
+            // TRUNCATE is a DELETE without WHERE (VERICTO-001, never capped)
+            // that cannot be rolled back on most engines, and DROP SCHEMA /
+            // DATABASE destroys every table of a namespace at once. A
+            // migration that really means it is an explicit, reviewable
+            // exception (an inline ignore, a workspace override), not a cap.
+            "VERICTO-011" | "VERICTO-012" => RuleClass::DataMutation,
             // Snowflake: recovery reduced (retention 0, CREATE OR REPLACE,
             // INSERT OVERWRITE, UNDROP, ALTER ACCOUNT) is schema DDL, which a
             // CI channel may soften like DROP TABLE.
@@ -1690,8 +1700,6 @@ mod tests {
         // Schema/DDL
         for c in [
             "VERICTO-010",
-            "VERICTO-011",
-            "VERICTO-012",
             "VERICTO-013",
             "VERICTO-015",
             "VERICTO-016",
@@ -1706,6 +1714,9 @@ mod tests {
             "VERICTO-001",
             "VERICTO-002",
             "VERICTO-003",
+            // TRUNCATE and DROP SCHEMA / DATABASE: never softened (5.1.0).
+            "VERICTO-011",
+            "VERICTO-012",
             "VERICTO-030",
             "VERICTO-031",
             "VERICTO-033",

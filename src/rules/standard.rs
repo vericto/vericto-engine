@@ -115,8 +115,8 @@ pub const STANDARD_RULES: &[StandardRule] = &[
     std_rule!("VERICTO-002", High, DataMutation),     // DELETE with LIMIT 0
     std_rule!("VERICTO-003", Critical, DataMutation), // DELETE with always-true WHERE
     std_rule!("VERICTO-010", Critical, SchemaMigration), // DROP TABLE / DATABASE
-    std_rule!("VERICTO-011", Critical, SchemaMigration), // TRUNCATE TABLE
-    std_rule!("VERICTO-012", Critical, SchemaMigration), // DROP SCHEMA
+    std_rule!("VERICTO-011", Critical, DataMutation), // TRUNCATE TABLE
+    std_rule!("VERICTO-012", Critical, DataMutation), // DROP SCHEMA / DATABASE
     std_rule!("VERICTO-013", High, SchemaMigration),  // DROP INDEX without IF EXISTS
     std_rule!("VERICTO-015", High, SchemaMigration),  // ALTER TABLE DROP COLUMN
     std_rule!("VERICTO-016", High, SchemaMigration),  // ALTER TABLE RENAME

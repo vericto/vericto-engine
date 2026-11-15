@@ -1,6 +1,6 @@
 # Third-party notices
 
-This inventory describes the direct dependencies of `vericto-engine` 5.0.0 as
+This inventory describes the direct dependencies of `vericto-engine` 5.1.0 as
 resolved on 2026-11-02. It does not replace the controlling license text of a
 dependency or the complete dependency graph of a particular build.
 

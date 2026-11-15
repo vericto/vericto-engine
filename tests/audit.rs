@@ -366,7 +366,8 @@ fn eng_004_drop_database_pg() {
         "ENG-004 drop database",
         "DROP DATABASE prod",
         Dialect::Postgres,
-        vec!["VERICTO-010"],
+        // Since 5.1.0 also VERICTO-012 (DROP SCHEMA / DATABASE).
+        vec!["VERICTO-010", "VERICTO-012"],
     );
 }
 
